@@ -1,6 +1,10 @@
 """Sequence and sampling-parameter dataclasses for the paged engine."""
 
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    import torch
 
 
 @dataclass
@@ -44,6 +48,8 @@ class Sequence:
     block_table: list[int] = field(default_factory=list)
     num_cached_tokens: int = 0
     cum_logprob: float = 0.0
+    # Multimodal input (Florence-2): ``[3, H, W]`` for the request's image.
+    pixel_values: "torch.Tensor | None" = None
 
     def __post_init__(self):
         if not self.token_ids:

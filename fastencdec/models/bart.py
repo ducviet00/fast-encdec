@@ -218,8 +218,14 @@ class BartEncoder(nn.Module):
              for i in range(config.encoder_layers)])
         self.layernorm_embedding = nn.LayerNorm(embed_dim)
 
-    def forward(self, input_ids: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
-        hidden_states = self.embed_tokens(input_ids) + self.embed_positions(positions)
+    def forward(self, input_ids: torch.Tensor | None = None,
+                positions: torch.Tensor | None = None,
+                inputs_embeds: torch.Tensor | None = None) -> torch.Tensor:
+        # ``inputs_embeds`` is used by multimodal models (Florence-2) that mix
+        # projected image features into the token embeddings before encoding.
+        if inputs_embeds is None:
+            inputs_embeds = self.embed_tokens(input_ids)
+        hidden_states = inputs_embeds + self.embed_positions(positions)
         hidden_states = self.layernorm_embedding(hidden_states)
         for layer in self.layers:
             hidden_states = layer(hidden_states)
@@ -289,3 +295,13 @@ class BartForConditionalGeneration(nn.Module):
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         return self.lm_head(hidden_states) + self.final_logits_bias
+
+    @property
+    def decoder_layers(self):
+        """Decoder self-attention layers, read by the model runner."""
+        return self.model.decoder.layers
+
+    @property
+    def decoder(self):
+        """The paged decoder module, read by the model runner."""
+        return self.model.decoder

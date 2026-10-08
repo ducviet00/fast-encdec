@@ -5,9 +5,9 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "fast-encdec"
 version = "0.1.0"
-description = "Tiny CPU BART inference: paged KV cache, continuous batching, beam search"
+description = "Tiny CPU BART/Florence-2 inference: paged KV cache, continuous batching, beam search"
 requires-python = ">=3.10"
-dependencies = ["torch", "transformers"]
+dependencies = ["torch", "transformers", "Pillow"]
 
 [tool.setuptools.packages.find]
 include = ["fastencdec*"]

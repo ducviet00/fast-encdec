@@ -16,7 +16,9 @@ It implements the pieces that actually matter for seq2seq decoding:
   oneDNN's `avx512_core_bf16` path on modern x86.
 
 The model code is a near-verbatim copy of the HuggingFace BART reference; only
-the attention kernels are swapped.
+the attention kernels are swapped.  **Florence-2** is supported too: the same
+paged BART decoder is paired with the DaViT vision encoder and the multimodal
+projector imported verbatim from `transformers`.
 
 ## Layout
 
@@ -27,11 +29,12 @@ fastencdec/
   block_manager.py # paged blocks: allocate / fork / copy-on-write / free
   attention.py     # CPU paged self-attention + cached cross-attention
   models/bart.py   # BART model (encoder / decoder / cross-attn)
+  models/florence2.py # Florence-2 (DaViT + projector + BART language model)
   loader.py        # HuggingFace -> model weight loading
   model_runner.py  # batching, KV cache, encoder caching, forward
   engine.py        # scheduler (continuous batching) + beam search loop
   sampler.py       # greedy / temperature / top-p / n-gram banning
-  __init__.py      # LLM facade
+  __init__.py      # LLM facade (BART) and Florence2LLM facade
 ```
 
 ## Usage
@@ -75,12 +78,40 @@ EOS until enough tokens are produced, and `no_repeat_ngram_size` bans tokens
 that would repeat an n-gram. (`forced_bos_token_id` / `forced_eos_token_id` are
 not implemented.)
 
+## Florence-2
+
+Florence-2 combines a DaViT vision encoder with a BART language model.  The
+vision tower and the multimodal projector are imported from `transformers`, so
+the checkpoint loads 1:1; only the language model uses the paged decoder here.
+Images are encoded once per request and their visual tokens are spliced into the
+encoder input at the `<image>` placeholders.
+
+```python
+from PIL import Image
+from fastencdec import Florence2LLM, SamplingParams
+
+llm = Florence2LLM("florence-community/Florence-2-base",
+                   num_blocks=1024, block_size=16)
+
+image = Image.open("photo.jpg")
+print(llm.generate("<CAPTION>", image, SamplingParams(max_tokens=32)))
+
+# several tasks on one image (the image is broadcast), or several images:
+print(llm.generate(["<CAPTION>", "<OD>"], image, SamplingParams(max_tokens=32)))
+```
+
+Requires `Pillow` for image loading/processing.  The tiny
+`hf-tiny-v2/tiny-random-Florence2ForConditionalGeneration` checkpoint is only
+usable with hand-built inputs (see `tests/test_florence2.py`) because its
+processor and vision config disagree.
+
 ## How a step works
 
 ```
 scheduler.schedule()            -> all running sequences (+ admit waiting)
 model_runner.run(seqs)
-    _encode(fresh seqs)         batched encoder (grouped by length) -> cross-attn K/V per request
+    _encode(fresh seqs)         batched encoder (grouped by length/image shape)
+                                -> cross-attn K/V per request
     build input_ids/positions/slot_mapping
     decoder forward             self-attn reads/writes paged cache,
                                 cross-attn reads cached encoder K/V
@@ -96,6 +127,12 @@ Decoder self-attention is paged. **Cross-attention is dense**: each decoder
 layer keeps `encoder_kv_cache[request_id] -> (k, v)` of shape
 `[heads, enc_len, dim]`, computed once per request and shared by all of its
 beams.
+
+For Florence-2 the encoder input is not pure token embeddings: the DaViT tower
+and the multimodal projector produce one visual token per image patch (plus one
+summary token), which are scattered into the `<image>` placeholder positions
+before the BART encoder runs. The vision graph therefore runs in `_encode`,
+once per request.
 
 ## Beam search
 
@@ -114,6 +151,9 @@ is returned.
 
 - `tests/test_parity.py`: greedy and beam output matches HuggingFace
   token-for-token on a tiny random BART.
+- `tests/test_florence2.py`: image features, encoder hidden states, and
+  greedy/beam output match HuggingFace on a tiny random Florence-2, plus
+  batched-vs-single equivalence with mixed image sizes.
 - Greedy decoding matches HuggingFace on `facebook/bart-large-cnn` (the
   `bart-large-cnn` generation config — `forced_bos_token_id`,
   `forced_eos_token_id`, `min_length`, `no_repeat_ngram_size`,
@@ -149,6 +189,38 @@ at batch=8/beams=4); the speedup shrinks as the encoder grows (2.3× at
 enc=128 → 1.7× at enc=1000) because the encoder is GEMM-bound and both engines
 use the same oneDNN matmuls.
 
+### Florence-2
+
+`benchmarks/benchmark_florence2.py` mixes captioning (short), detection
+(medium) and segmentation (long) requests on a real photo, so the batch has a
+large output-length spread:
+
+```bash
+PYTHONPATH=. python benchmarks/benchmark_florence2.py --quick
+PYTHONPATH=. python benchmarks/benchmark_florence2.py --batches 3,6,12 --beams 1,3,5
+```
+
+`florence-community/Florence-2-base`, BF16, `<CAPTION>`/`<OD>`/`<REFERRING_EXPRESSION_SEGMENTATION>`,
+max 256 tokens, ~15/25/256 output tokens:
+
+| sweep | ours ms | hf ms | speedup |
+|---|---:|---:|---:|
+| greedy batch=3 | 3627 | 4518 | 1.25× |
+| greedy batch=6 | 5900 | 6923 | 1.17× |
+| greedy batch=12 | 10227 | 11994 | 1.17× |
+| beams=1 | 2458 | 2892 | 1.18× |
+| beams=3 | 2865 | 4520 | 1.58× |
+| beams=5 | 3209 | 5917 | 1.84× |
+| N=24, running window=12 | 18117 | 22849 | 1.26× |
+
+The win is real but smaller than BART's, for two reasons: the DaViT vision
+encoder is a large cost shared by both engines (~0.5 s/image here), and our CPU
+attention is a per-sequence Python loop, roughly 1.6× slower per decode step
+than HF's batched SDPA.  The no-padding / continuous-batching savings therefore
+only partly translate into wall-clock time.  Beam search benefits most, because
+the paged cache shares blocks instead of reordering a full beam cache each step;
+the decode-only advantage is ~1.6–1.8×.
+
 ## Limitations
 
 - The scheduler returns the whole running set each step; there is no token
@@ -156,5 +228,9 @@ use the same oneDNN matmuls.
   beams are always batched together.
 - No prefix caching, no preemption/recompute, no CUDA graphs, no quantization.
 - The cross-attention cache is dense and scales with `batch × enc_len`; it is
-  not counted against `num_blocks`.
+  not counted against `num_blocks`. For Florence-2 the projected visual tokens
+  are part of that encoder sequence (577 tokens for a 768px image at base), so
+  long image contexts are the dominant cost.
 - `num_blocks` is the total KV budget; the block manager raises if exhausted.
+- Attention is a Python per-sequence loop; a batched SDPA path would recover
+  most of the remaining Florence-2 gap (see the benchmark above).

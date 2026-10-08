@@ -50,7 +50,7 @@ class LLMEngine:
         self._next_request_id = 0
 
     def add_request(self, encoder_token_ids: list[int], decoder_token_ids: list[int],
-                    params) -> int:
+                    params, pixel_values=None) -> int:
         request_id = self._next_request_id
         self._next_request_id += 1
         seq = Sequence(
@@ -58,6 +58,7 @@ class LLMEngine:
             decoder_prompt_ids=decoder_token_ids,
             encoder_token_ids=encoder_token_ids,
             sampling=params,
+            pixel_values=pixel_values,
         )
         self.scheduler.add(seq)
         return request_id
@@ -104,6 +105,7 @@ class LLMEngine:
             decoder_prompt_ids=parent.decoder_prompt_ids,
             encoder_token_ids=parent.encoder_token_ids,
             sampling=parent.sampling,
+            pixel_values=parent.pixel_values,
         )
         child.token_ids = parent.token_ids + [token]
         child.num_cached_tokens = parent.num_cached_tokens

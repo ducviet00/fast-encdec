@@ -1,35 +1,42 @@
-"""Load HuggingFace BART weights into the paged-attention model."""
+"""Load HuggingFace checkpoint weights into a fast-encdec model.
+
+The fast-encdec modules deliberately mirror the HuggingFace parameter names
+(``model.encoder.*`` for BART, ``model.vision_tower.*`` /
+``model.language_model.*`` for Florence-2), so loading is a straight name
+match.  Tied weights are shared storage in both models, so copying every key is
+idempotent.
+"""
 
 import torch
 
 
-def load_hf_weights(model, model_path: str):
-    """Copy a HF ``*ForConditionalGeneration`` checkpoint into ``model``."""
-    from transformers import AutoModelForSeq2SeqLM
+def load_hf_weights(model, model_path: str, hf_model_cls=None):
+    """Copy a HF checkpoint into ``model``.
 
-    hf_model = AutoModelForSeq2SeqLM.from_pretrained(model_path, dtype=torch.float32)
+    Args:
+        model: fast-encdec model with HF-identical parameter names.
+        model_path: HF repo id or local path.
+        hf_model_cls: HF class to instantiate (defaults to
+            ``AutoModelForSeq2SeqLM``; pass ``Florence2ForConditionalGeneration``
+            for Florence-2).
+    """
+    if hf_model_cls is None:
+        from transformers import AutoModelForSeq2SeqLM
+        hf_model_cls = AutoModelForSeq2SeqLM
+
+    hf_model = hf_model_cls.from_pretrained(model_path, dtype=torch.float32)
     state_dict = hf_model.state_dict()
 
-    # Tied in our model (single shared embedding); loading `model.shared.weight`
-    # updates all of them because they share storage.
-    tied = {
-        "model.encoder.embed_tokens.weight",
-        "model.decoder.embed_tokens.weight",
-        "lm_head.weight",
-    }
-
-    params = dict(model.named_parameters())
-    buffers = dict(model.named_buffers())
+    # ``state_dict`` (unlike ``named_parameters``) keeps tied aliases, so every
+    # checkpoint key has a target even when weights share storage.
+    targets = dict(model.state_dict())
     unexpected = []
     for name, tensor in state_dict.items():
-        if name in tied:
-            continue
-        if name in params:
-            params[name].data.copy_(tensor)
-        elif name in buffers:
-            buffers[name].copy_(tensor)
-        else:
+        target = targets.get(name)
+        if target is None:
             unexpected.append(name)
+        else:
+            target.copy_(tensor)
     del hf_model
 
     if unexpected:

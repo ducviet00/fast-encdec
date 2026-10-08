@@ -11,10 +11,11 @@ class ModelRunner:
     def __init__(self, model, block_manager, dtype=torch.float32):
         self.model = model.eval()
         self.block_manager = block_manager
+        self.decoder_layers = list(model.decoder_layers)
 
         # One paged cache per decoder self-attention layer:
         # [num_blocks, block_size, num_heads, head_dim].
-        self.cache_layers = [layer.self_attn for layer in model.model.decoder.layers]
+        self.cache_layers = [layer.self_attn for layer in self.decoder_layers]
         for layer in self.cache_layers:
             shape = (block_manager.num_blocks, block_manager.block_size,
                      layer.num_heads, layer.head_dim)
@@ -27,18 +28,24 @@ class ModelRunner:
             layer.v_cache[dst].copy_(layer.v_cache[src])
 
     def _encode(self, seqs) -> None:
-        """Run the encoder once per distinct encoder length and cache cross-attn K/V.
+        """Run the encoder once per distinct input shape and cache cross-attn K/V.
 
-        Grouping by length lets every sequence in a group share one batched
-        forward (bigger, more efficient GEMMs) without any padding.
+        Grouping by (length, image shape) lets every sequence in a group share
+        one batched forward (bigger, more efficient GEMMs) without any padding.
         """
-        groups: dict[int, list] = {}
+        groups: dict[tuple, list] = {}
         for seq in seqs:
-            groups.setdefault(len(seq.encoder_token_ids), []).append(seq)
+            pixel_shape = (None if seq.pixel_values is None
+                           else tuple(seq.pixel_values.shape))
+            groups.setdefault((len(seq.encoder_token_ids), pixel_shape), []).append(seq)
         for group in groups.values():
             ids = torch.tensor([s.encoder_token_ids for s in group], dtype=torch.long)
-            hidden = self.model.encode(ids)  # [G, enc_len, dim]
-            for layer in self.model.model.decoder.layers:
+            if group[0].pixel_values is None:
+                hidden = self.model.encode(ids)
+            else:
+                pixel_values = torch.stack([s.pixel_values for s in group])
+                hidden = self.model.encode(ids, pixel_values=pixel_values)
+            for layer in self.decoder_layers:
                 attn = layer.encoder_attn
                 head = (len(group), ids.shape[1], attn.num_heads, attn.head_dim)
                 key = attn.k_proj(hidden).view(head)
@@ -50,7 +57,7 @@ class ModelRunner:
                     )
 
     def clear_request(self, request_id: int) -> None:
-        for layer in self.model.model.decoder.layers:
+        for layer in self.decoder_layers:
             layer.encoder_attn.encoder_kv_cache.pop(request_id, None)
 
     def _prepare(self, seqs):
@@ -101,7 +108,7 @@ class ModelRunner:
         )
         set_context(context)
 
-        hidden = self.model.model.decoder(input_ids, positions)
+        hidden = self.model.decoder(input_ids, positions)
         last = torch.tensor([qsl[i + 1] - 1 for i in range(len(seqs))],
                             dtype=torch.long)
         return self.model.compute_logits(hidden.index_select(0, last))

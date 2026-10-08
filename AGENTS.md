@@ -19,6 +19,12 @@ encoder-decoder decoding:
 The model (`fastencdec/models/bart.py`) is a near-verbatim copy of the
 HuggingFace BART reference; only the attention kernels differ.
 
+**Florence-2** (`fastencdec/models/florence2.py`) reuses that paged BART as its
+language model and pairs it with the DaViT vision encoder
+(`Florence2VisionBackbone`) and `Florence2MultiModalProjector`, both imported
+verbatim from `transformers`. Visual tokens are spliced into the encoder input
+at the `<image>` placeholders; the decoder is unchanged.
+
 ### Non-goals / do not add without discussion
 
 - No CUDA / GPU support, no flash-attn.
@@ -48,13 +54,16 @@ fastencdec/
   block_manager.py   paged blocks: allocate / fork / copy-on-write / free
   attention.py       CPU paged self-attention + cached cross-attention
   models/bart.py     BART model (encoder / decoder / cross-attn)
+  models/florence2.py Florence-2 (DaViT + projector + BART language model)
   loader.py          HF checkpoint -> model weight loading
   model_runner.py    batching, KV cache, encoder caching, forward
   engine.py          Scheduler (continuous batching) + beam search
   sampler.py         greedy / temperature / top-p / n-gram banning
 examples/summarize.py
+examples/florence2.py
 benchmarks/benchmark.py
 tests/test_parity.py
+tests/test_florence2.py
 ```
 
 ## 4. How a step works
@@ -63,7 +72,7 @@ tests/test_parity.py
 Scheduler.schedule()              # admit waiting up to max_num_seqs; return ALL running
 ModelRunner.run(seqs)
     fresh = [seq for seq in seqs if seq.num_cached_tokens == 0]
-    _encode(fresh)                # batched encoder (grouped by length), cache cross-attn K/V
+    _encode(fresh)                # batched encoder (grouped by length/image shape), cache cross-attn K/V
     _prepare(seqs)                # input_ids/positions/slot_mapping; ensure blocks/CoW
     set_context(Context(...))     # global read by attention
     decoder forward               # self-attn reads/writes paged cache, cross-attn reads cache
@@ -112,6 +121,12 @@ LLMEngine.run()                   # sample (greedy) or beam-expand; free finishe
    config when unset. Generation heuristics: `length_penalty` ranks finished
    beams, `min_length` masks EOS early, `no_repeat_ngram_size` bans repeated
    n-grams (`sampler.banned_tokens`).
+10. **Multimodal inputs (Florence-2).** `Sequence.pixel_values` carries the
+    request image `[3, H, W]`; `_encode` groups fresh sequences by
+    `(encoder length, image shape)` and the model scatters projected visual
+    tokens into the `image_token_id` slots. `ModelRunner` reaches the model
+    through `model.decoder`, `model.decoder_layers` and `model.encode(...)`,
+    which both BART and Florence-2 expose.
 
 ## 6. Running things
 
@@ -121,13 +136,21 @@ P=/home/ducviet00/.venvs/torch-cpu/bin/python
 # unit / parity (tiny random BART; greedy + beam vs HF)
 PYTHONPATH=. $P tests/test_parity.py
 
+# Florence-2 parity (tiny random Florence-2; image features + greedy/beam vs HF)
+PYTHONPATH=. $P tests/test_florence2.py
+
 # example
 PYTHONPATH=. $P examples/summarize.py
+PYTHONPATH=. $P examples/florence2.py
 
 # benchmark (sweeps batch / beams / dtype / encoder length vs HF)
 PYTHONPATH=. $P benchmarks/benchmark.py                 # full
 PYTHONPATH=. $P benchmarks/benchmark.py --quick         # fast smoke
 PYTHONPATH=. $P benchmarks/benchmark.py --json out.json
+
+# Florence-2 benchmark (caption/detection/segmentation mix vs HF)
+PYTHONPATH=. $P benchmarks/benchmark_florence2.py --quick
+PYTHONPATH=. $P benchmarks/benchmark_florence2.py --batches 3,6,12 --beams 1,3,5
 ```
 
 ## 7. Gotchas
@@ -153,6 +176,11 @@ PYTHONPATH=. $P benchmarks/benchmark.py --json out.json
   exhausted.
 - **BF16 vs FP32**: BF16 ≈ 2× on GEMM-heavy work via oneDNN; attention is
   FP32-accumulate in both.
+- **Florence-2 image input** needs `Pillow` (approved dependency) for
+  `AutoProcessor`. Use `florence-community/Florence-2-base` / `-large`; the
+  `hf-tiny-v2/...` tiny checkpoint is inconsistent (config `image_token_id=4`
+  vs tokenizer `51289`, and its vision 2D position embeddings overflow at the
+  processor's 768px), so `tests/test_florence2.py` builds inputs by hand.
 
 ## 8. Known limitations / TODO ideas
 
@@ -172,5 +200,7 @@ PYTHONPATH=. $P benchmarks/benchmark.py --json out.json
 - Keep it small and readable; match the existing file structure and naming.
 - Minimal comments; docstrings brief and direct. No dead code.
 - Pure PyTorch only. No new third-party dependencies without discussion.
+  (`Pillow` was approved for Florence-2 image processing; the DaViT vision
+  tower and projector are imported from `transformers` rather than copied.)
 - After changes: run `python -m compileall fastencdec`, `tests/test_parity.py`,
-  and a `benchmarks/benchmark.py --quick` smoke.
+  `tests/test_florence2.py`, and a `benchmarks/benchmark.py --quick` smoke.
