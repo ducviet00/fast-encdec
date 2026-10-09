@@ -39,6 +39,9 @@ class LLM:
         block_size: tokens per KV block.
         max_num_seqs: maximum sequences (beams) in flight at once.
         dtype: ``torch.float32`` or ``torch.bfloat16``.
+        attn_backend: ``"auto"`` (use the vendored vLLM CPU attention kernel
+            when it builds, else the PyTorch SDPA path), ``"vllm"`` (require
+            it) or ``"sdpa"`` (force the PyTorch path).
         compile_mm_encoder: ``torch.compile`` the Florence-2 vision tower +
             projector (~1.3-1.5x there).  Ignored for BART.  Off by default:
             it changes the BF16 outputs slightly and compiles once per batch
@@ -53,6 +56,7 @@ class LLM:
         block_size: int = 16,
         max_num_seqs: int = 32,
         dtype: torch.dtype = torch.float32,
+        attn_backend: str = "auto",
         compile_mm_encoder: bool = False,
     ):
         hf_config = AutoConfig.from_pretrained(model_path)
@@ -91,6 +95,7 @@ class LLM:
             block_size=block_size,
             max_num_seqs=max_num_seqs,
             dtype=dtype,
+            attn_backend=attn_backend,
         )
         self.engine = LLMEngine(self.model, config, eos_token_id=self.eos_token_id)
 

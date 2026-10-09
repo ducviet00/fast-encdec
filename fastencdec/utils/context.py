@@ -7,10 +7,6 @@ reference.
 """
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
-
-if TYPE_CHECKING:
-    import torch
 
 
 @dataclass
@@ -18,23 +14,36 @@ class Context:
     """Metadata for one model forward pass.
 
     Attributes:
-        slot_mapping: Physical cache slots for the new tokens, shape [T].
+        slot_mapping: Flat physical cache slots for the new tokens, ``[T]``.
         query_start_loc: Cumulative new-token counts, length num_seqs + 1.
         context_lens: Total cached length per sequence, length num_seqs.
-        key_slot_ids: Flat physical cache slots for every cached key, ordered by
-            sequence (seq 0's positions, then seq 1's, ...).  Attention gathers
-            all layers' K/V with one ``index_select`` per cache instead of one
-            per sequence.
         request_ids: Request id per sequence (used for cross-attn cache).
         num_seqs: Number of sequences in the batch.
+        attn_isa: Kernel ISA (``"vec"``/``"vec16"``) or ``None`` for SDPA.
+        block_table: int32 ``[num_seqs, max_blocks]`` paged block ids.
+        key_slot_ids: ``(block_ids, pos_in_block)`` for every cached key,
+            ordered by sequence (SDPA fallback gather).
+        cpu_query_start_loc / cpu_seq_lens / dynamic_causal / attn_metadata:
+            int32 inputs and scheduler metadata for the vendored kernel.
+        cross_block_table / cross_seq_lens / cross_metadata: the same for the
+            encoder (cross-attention) paged cache.
     """
 
-    slot_mapping: list
+    slot_mapping: object
     query_start_loc: list
     context_lens: list
-    key_slot_ids: "torch.Tensor"
     request_ids: list
     num_seqs: int
+    attn_isa: str | None = None
+    block_table: object | None = None
+    key_slot_ids: object | None = None
+    cpu_query_start_loc: object | None = None
+    cpu_seq_lens: object | None = None
+    dynamic_causal: object | None = None
+    attn_metadata: object | None = None
+    cross_block_table: object | None = None
+    cross_seq_lens: object | None = None
+    cross_metadata: object | None = None
 
 
 _CONTEXT: Context | None = None
@@ -44,20 +53,6 @@ def get_context() -> Context:
     return _CONTEXT
 
 
-def set_context(
-    slot_mapping,
-    query_start_loc,
-    context_lens,
-    key_slot_ids,
-    request_ids,
-    num_seqs,
-) -> None:
+def set_context(**fields) -> None:
     global _CONTEXT
-    _CONTEXT = Context(
-        slot_mapping,
-        query_start_loc,
-        context_lens,
-        key_slot_ids,
-        request_ids,
-        num_seqs,
-    )
+    _CONTEXT = Context(**fields)

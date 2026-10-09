@@ -1,3 +1,4 @@
+exclude: ^csrc/  # vendored vLLM sources (Apache-2.0): keep them pristine
 repos:
   - repo: https://github.com/pre-commit/pre-commit-hooks
     rev: v6.0.0

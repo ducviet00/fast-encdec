@@ -80,9 +80,13 @@ class BartEncoderSelfAttention(nn.Module):
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         # hidden_states: [batch, seq, dim] -> [batch, heads, seq, head_dim]
         shape = (*hidden_states.shape[:-1], -1, self.head_dim)
-        query = self.q_proj(hidden_states).view(shape).transpose(1, 2)
-        key = self.k_proj(hidden_states).view(shape).transpose(1, 2)
-        value = self.v_proj(hidden_states).view(shape).transpose(1, 2)
+        # ``.contiguous()`` matters: on aarch64, SDPA with BF16 *non-contiguous*
+        # (transposed) inputs falls into a path ~20x slower than the contiguous
+        # one (Graviton: 86 ms vs 4 ms for a BART-large encoder block), while x86
+        # is unaffected.  The copy is negligible next to the attention.
+        query = self.q_proj(hidden_states).view(shape).transpose(1, 2).contiguous()
+        key = self.k_proj(hidden_states).view(shape).transpose(1, 2).contiguous()
+        value = self.v_proj(hidden_states).view(shape).transpose(1, 2).contiguous()
         out = F.scaled_dot_product_attention(query, key, value, is_causal=False)
         out = out.transpose(1, 2).reshape(*hidden_states.shape[:-1], -1).contiguous()
         return self.out_proj(out)
@@ -158,6 +162,8 @@ class BartDecoderCrossAttention(nn.Module):
         # Dense per request (not paged); shared by all beams of the request.
         # Stored head-first so the flash kernel sees a contiguous key tensor.
         self.encoder_kv_cache: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+        # vLLM-kernel paged encoder K/V (set by the model runner when active).
+        self.encoder_paged_cache = None
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         num_tokens = hidden_states.shape[0]

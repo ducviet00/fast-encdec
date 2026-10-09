@@ -50,7 +50,12 @@ class LLMEngine:
         eos_token_id: int | None = None,
     ):
         self.block_manager = BlockManager(config.num_blocks, config.block_size)
-        self.runner = ModelRunner(model, self.block_manager, config.dtype)
+        self.runner = ModelRunner(
+            model,
+            self.block_manager,
+            config.dtype,
+            attn_backend=config.attn_backend,
+        )
         self.scheduler = Scheduler(config)
         self.sampler = Sampler()
         self.eos_token_id = eos_token_id

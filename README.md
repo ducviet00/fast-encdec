@@ -11,9 +11,11 @@ It implements the pieces that actually matter for seq2seq decoding:
   batches waste nothing.
 - **Beam search** — implemented on top of the same paged cache; beams share
   blocks and only copy a block when they write into a shared one.
-- **Pure PyTorch on CPU** — no flash-attn; attention is
-  `torch.nn.functional.scaled_dot_product_attention`, so BF16 GEMMs go through
-  oneDNN's `avx512_core_bf16` path on modern x86.
+- **One fused attention kernel per step** — the decoder self- and
+  cross-attention run on vLLM's hand-written CPU kernels (NEON BFMMLA on
+  aarch64, AVX-512 VEC/VEC16 on x86), vendored in `csrc/` and compiled on first
+  use. A pure PyTorch `scaled_dot_product_attention` path is the fallback
+  (`attn_backend="sdpa"`); BF16 GEMMs go through oneDNN.
 
 The model code is a near-verbatim copy of the HuggingFace BART reference; only
 the attention kernels are swapped.  **Florence-2** is supported too: the same
@@ -38,7 +40,8 @@ fastencdec/
     model_runner.py  # batching, KV cache, encoder caching, forward
     llm_engine.py    # LLMEngine: step loop, sampling, beam search
   layers/
-    attention.py     # CPU paged self-attention + cached cross-attention
+    attention.py     # paged self-attention + cached cross-attention dispatch
+    cpu_attn.py      # JIT build + wrapper for the vendored vLLM CPU kernels
     logits_processor.py # transformers LogitsProcessorList from SamplingParams
     sampler.py       # greedy / multinomial sampling (Sampler)
   models/
@@ -47,6 +50,7 @@ fastencdec/
   utils/
     context.py       # per-step metadata read by attention layers
     loader.py        # HuggingFace -> model weight loading
+csrc/                # vendored vLLM CPU attention kernels (+ bindings.cpp)
 ```
 
 ## Usage
@@ -80,6 +84,11 @@ for output in outputs:
 `dtype=torch.bfloat16` halves memory and speeds up the GEMMs on CPUs with
 `avx512_bf16` (e.g. AMD Zen 4, Intel Sapphire Rapids). Do **not** use
 `float16` on Zen 4 (no AVX512-FP16).
+
+Attention runs on the vendored vLLM CPU kernels by default; the first call
+compiles `csrc/` (1–3 min) and caches the `.so`. Pass `attn_backend="sdpa"` to
+force the pure-PyTorch path, or `attn_backend="vllm"` to require the kernel
+(raising instead of silently falling back).
 
 ### Generation heuristics
 
@@ -179,7 +188,9 @@ own block table, so there is no padding.
 Decoder self-attention is paged. **Cross-attention is dense**: each decoder
 layer keeps `encoder_kv_cache[request_id] -> (k, v)` of shape
 `[heads, enc_len, dim]`, computed once per request and shared by all of its
-beams.
+beams. With the vLLM backend that dense K/V is staged into a paged cache
+(`EncoderPagedCache`) so cross-attention uses the same kernel; the staging is
+rebuilt only when the set of active requests changes.
 
 For Florence-2 the encoder input is not pure token embeddings: the DaViT tower
 and the multimodal projector produce one visual token per image patch (plus one
@@ -217,70 +228,94 @@ is returned.
 ## Benchmark
 
 ```bash
-PYTHONPATH=. python benchmarks/benchmark.py            # full sweep
-PYTHONPATH=. python benchmarks/benchmark.py --quick    # fast smoke
+PYTHONPATH=. python benchmarks/benchmark.py --quick                 # BART, bf16
+PYTHONPATH=. python benchmarks/benchmark.py --dtype float32         # BART, fp32
+PYTHONPATH=. python benchmarks/benchmark_florence2.py --quick       # Florence-2, bf16
+PYTHONPATH=. python benchmarks/benchmark_florence2.py --quick --dtype float32
 ```
 
-It sweeps batch size, beam width, dtype and encoder length, comparing fast-encdec
-against HuggingFace `generate` on the same machine, at the **same dtype, same
-inputs and same decoding**, with a fixed output length (EOS suppressed) so both
-engines do identical work (latency, req/s, tok/s, speedup).
+It compares fast-encdec against HuggingFace `generate` on the same machine, at
+the **same dtype, same inputs and same output tokens**, so both engines do
+identical work (latency, req/s, tok/s, speedup).  BART decodes a fixed length
+(EOS suppressed via `min_length` / `min_new_tokens`); Florence-2 stops at EOS and
+the reported token totals confirm both engines emitted the same number.
 
-The same-precision comparison is the honest one. The paged cache and block
-sharing win on **beam search** (each step avoids HF's per-step cache reordering),
-while greedy decoding is near parity — HF's batched SDPA edges out our
-per-sequence attention when there is no padding or beam work to exploit.
+Attention runs on the vendored vLLM CPU kernel by default, so the whole batch's
+self- and cross-attention is one fused call per step instead of a per-sequence
+SDPA loop; the paged cache and block sharing keep the beam-search win (each step
+avoids HF's per-step cache reordering).
 
-Full sweep — `facebook/bart-large-cnn`, 8 threads, BF16 for both engines, 48
-tokens, encoder length 256:
+### Fairness
 
-| config | ours ms | hf ms | speedup |
-|---|---:|---:|---:|
-| batch=1, beams=1 | 1172 | 1157 | 0.99× |
-| batch=8, beams=1 | 2050 | 1912 | 0.93× |
-| batch=16, beams=1 | 3153 | 2848 | 0.90× |
-| batch=1, beams=4 | 1338 | 1531 | 1.14× |
-| batch=8, beams=4 | 3778 | 5175 | 1.37× |
-| batch=16, beams=4 | 6672 | 10832 | 1.62× |
-
-Other axes: at batch=8/beams=4 the same-precision speedup is ~1.4× in BF16 and
-~1.9× in FP32; HF gains more from BF16 than we do (it speeds up 2.6× going
-FP32→BF16, ours 1.8×). For greedy decoding (batch=8, beams=1) our per-sequence
-attention is ~9% slower than HF's batched SDPA (0.91× at enc=128), but the gap
-narrows as the encoder grows (0.95× at enc=1000) since the encoder is
-GEMM-bound and both engines share the same oneDNN matmuls.
-
-### Florence-2
-
-`benchmarks/benchmark_florence2.py` mixes captioning (short), detection
-(medium) and segmentation (long) requests on a real photo, so the batch has a
-large output-length spread:
+`benchmarks/verify_parity.py` compares the tokens directly:
 
 ```bash
-PYTHONPATH=. python benchmarks/benchmark_florence2.py --quick
-PYTHONPATH=. python benchmarks/benchmark_florence2.py --batches 3,6,12 --beams 1,3,5
+PYTHONPATH=. python benchmarks/verify_parity.py --dtype float32
+PYTHONPATH=. python benchmarks/verify_parity.py --dtype bfloat16
 ```
 
-`florence-community/Florence-2-base`, BF16 for both engines, `<CAPTION>`/`<OD>`/`<REFERRING_EXPRESSION_SEGMENTATION>`,
-max 256 tokens, ~13/22/256 output tokens:
+In **fp32** the engine reproduces HF's tokens exactly — BART and Florence-2,
+greedy and beam, token for token.  In **bf16** the output length always matches
+and the tokens agree except for occasional single-step differences: expected,
+since HF runs its own batched SDPA while fast-encdec runs the vLLM CPU kernel.
 
-| sweep | ours ms | hf ms | speedup |
-|---|---:|---:|---:|
-| greedy batch=3 | 3751 | 4357 | 1.16× |
-| greedy batch=6 | 5868 | 6634 | 1.13× |
-| greedy batch=12 | 10237 | 11734 | 1.15× |
-| beams=1 | 2558 | 2812 | 1.10× |
-| beams=3 | 2910 | 4554 | 1.56× |
-| beams=5 | 3240 | 5906 | 1.82× |
-| N=24, running window=12 | 18250 | 22314 | 1.22× |
+### Hardware
 
-The win comes from **not padding**: the mixed batch has a 13/22/256-token
-spread, and fast-encdec never decodes the padding positions HF carries.
-Beam search benefits most, because the paged cache shares blocks instead of
-reordering a full beam cache each step (up to 1.82×); greedy is a more modest
-1.1–1.2×, since the DaViT vision encoder (~0.5 s/image here) is a large cost
-shared by both engines and our per-sequence CPU attention can be slower than
-HF's batched SDPA.
+| box | CPU | threads | kernel |
+|---|---|---|---|
+| x86 dev | AMD Ryzen 7 7840H (Zen 4, AVX-512 + `avx512_bf16`, no AMX) | 8 | `vec16` |
+| Graviton 5 | AWS Graviton 5, 8× Arm Neoverse-V3 (BF16 / I8MM / SVE2) | 8 | `neon` |
+
+Both boxes run torch 2.14 CPU with `block_size=16` and the vendored kernel
+(`attn_backend="auto"`).
+
+### BART (`facebook/bart-large-cnn`)
+
+Speedup vs HuggingFace `generate` at the same dtype, 48 output tokens, encoder
+length 256 unless noted (`benchmark.py --quick`):
+
+| sweep | config | x86 bf16 | x86 fp32 | Graviton bf16 | Graviton fp32 |
+|---|---|---:|---:|---:|---:|
+| batch, beams=1 | batch=1 | 1.13× | 1.21× | 1.31× | 1.07× |
+| batch, beams=1 | batch=8 | 1.28× | 1.06× | 2.55× | 1.00× |
+| batch, beams=4 | batch=8 | 2.35× | 2.14× | 3.67× | 1.34× |
+| beams, batch=8 | beams=4 | 2.36× | 2.12× | 3.68× | 1.35× |
+| enc length, beams=1 | enc=128 | 1.19× | 1.07× | 2.10× | 1.01× |
+| enc length, beams=1 | enc=256 | 1.39× | 1.05× | 2.60× | 1.01× |
+
+Greedy is a modest win (HF's batched SDPA is already good and the encoder is
+GEMM-bound on both engines); beam search wins big, because the paged cache shares
+blocks instead of reordering a full beam cache each step.  FP32 leaves less
+headroom — HF is compute-bound there rather than kernel-bound — so the beam win
+is smaller than in BF16.
+
+**BF16 vs FP32.** On the x86 box BF16 is ~2.4× faster than FP32; on Graviton it
+was only ~1.2× until a fix. The cause was PyTorch's CPU SDPA, which on aarch64
+runs ~20× slower for BF16 *non-contiguous* inputs — and the encoder self-attention
+fed it transposed views. Calling `.contiguous()` there (and in the SDPA fallback)
+took the Graviton BF16 batch=8/beams=1 run from 2237 ms to 1207 ms, making BF16
+**~2.3× faster than FP32** on Graviton.  (The x86 box is a thermally-limited
+laptop, so its absolute fp32 numbers vary a few percent run-to-run.)
+
+### Florence-2 (`florence-community/Florence-2-base`)
+
+Mixed `<CAPTION>` / `<OD>` / `<REFERRING_EXPRESSION_SEGMENTATION>the car` on a
+real 640×480 photo, so the batch has a wide output-length spread
+(`benchmark_florence2.py --quick`).  `ours tok == hf tok` in every row, i.e. both
+engines emitted the same number of tokens:
+
+| sweep | config | x86 bf16 | x86 fp32 | Graviton bf16 | Graviton fp32 |
+|---|---|---:|---:|---:|---:|
+| greedy | batch=3 | 1.21× | 1.05× | 1.26× | 1.03× |
+| greedy | batch=6 | 1.19× | 1.25× | 1.37× | 1.02× |
+| beam | beams=1 | 1.19× | 1.05× | 1.25× | 1.00× |
+| beam | beams=3 | 1.51× | 1.37× | 1.44× | 1.10× |
+| continuous | window=6 | 1.21× | 1.25× | 1.37× | 1.02× |
+
+The win comes from **not padding**: the mixed batch has a 13/22/96-token spread,
+and fast-encdec never decodes the padding positions HF carries; beam search
+benefits most from paged block sharing.  The DaViT vision encoder (~0.5 s/image)
+is a large cost shared by both engines, which caps the end-to-end gain.
 
 `LLM(..., compile_mm_encoder=True)` compiles the shared vision tower
 (~1.3–1.5×, ≈1.15× end-to-end); it may change the decoded tokens, so it is off
@@ -297,5 +332,7 @@ by default.
   are part of that encoder sequence (577 tokens for a 768px image at base), so
   long image contexts are the dominant cost.
 - `num_blocks` is the total KV budget; the block manager raises if exhausted.
-- Attention is a Python per-sequence loop; a batched SDPA path would recover
-  most of the remaining Florence-2 gap (see the benchmark above).
+- Attention runs on the vendored vLLM CPU kernel by default (one fused call per
+  step); `attn_backend="sdpa"` selects the pure-PyTorch per-sequence loop, which
+  is the fallback when the kernel cannot be compiled or the head size is
+  unsupported.

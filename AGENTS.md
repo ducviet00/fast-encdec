@@ -29,10 +29,11 @@ at the `<image>` placeholders; the decoder is unchanged.
 
 - No CUDA / GPU support, no flash-attn.
 - No quantization, prefix caching, chunked prefill, or CUDA graphs.
-- **No vendored vLLM kernels.** An earlier revision copied vLLM's `csrc/cpu`
-  CPU_ATTN kernel in as an optional backend; it was removed by maintainer
-  decision. Do not re-add it (or any other external kernel dependency) without
-  explicit approval.
+- **Vendored vLLM CPU attention kernel.** `csrc/cpu` is a copy of vLLM's
+  `csrc/cpu` attention implementation (Apache-2.0, see `csrc/LICENSE`), built
+  on first use by `fastencdec/layers/cpu_attn.py`. It is the default decoder
+  self/cross-attention backend when it compiles; the pure-PyTorch SDPA loop is
+  the fallback. Do not add *other* external kernels without explicit approval.
 
 ## 2. Environment
 
@@ -62,7 +63,8 @@ fastencdec/
     model_runner.py    batching, KV cache, encoder caching, forward
     llm_engine.py      LLMEngine: step loop, greedy/sampling, beam search
   layers/
-    attention.py       CPU paged self-attention + cached cross-attention
+    attention.py       paged self-attention + cached cross-attention dispatch
+    cpu_attn.py        JIT build + wrapper for the vendored vLLM CPU kernels
     logits_processor.py transformers LogitsProcessorList from SamplingParams
     sampler.py         greedy / multinomial sampling (Sampler nn.Module)
   models/
@@ -71,10 +73,12 @@ fastencdec/
   utils/
     context.py         global per-step Context read by attention layers
     loader.py          HF checkpoint -> model weight loading
+csrc/                  vendored vLLM CPU attention kernels (+ bindings.cpp)
 examples/summarize.py
 examples/florence2.py
 benchmarks/benchmark.py
 tests/test_parity.py
+tests/test_attn_backend.py
 tests/test_florence2.py
 tests/test_beam.py
 ```
@@ -107,25 +111,32 @@ whole batch under a single `SamplingParams` and runs to completion.
    (fresh sequence) feeds the whole prompt at once.
 2. **Positions** are absolute indices into `token_ids` (0-based).
    `BartLearnedPositionalEmbedding` adds the `+2` BART offset internally.
-3. **Paged self-attn layout** is `[num_blocks, block_size, num_heads, head_dim]`.
-   A token at sequence position `p` lives at physical slot
-   `block_table[p // block_size] * block_size + (p % block_size)`.
-   `Context.context_lens[i]` is the total cached length *after* writing.
-   `Context.key_slot_ids` is the flat, per-step map of every cached key's slot
-   (ordered by sequence), so attention gathers each layer's cache with a single
-   `index_select` over the whole batch instead of one per sequence.
+3. **Paged self-attn layout** is `[num_blocks, num_heads, block_size, head_dim]`
+   (vLLM's, so the vendored kernel can read it directly). A token at sequence
+   position `p` lives in block `block_table[p // block_size]` at offset
+   `p % block_size`. `Context.context_lens[i]` is the total cached length
+   *after* writing. `Context.key_slot_ids` is `(block_ids, pos_in_block)` for
+   every cached key (ordered by sequence), so the SDPA fallback gathers each
+   layer's cache with one advanced-index instead of one slice per sequence.
+   The vLLM kernel instead writes K/V itself (`cpu_attn_reshape_and_cache`) and
+   reads the cache via `Context.block_table`; `Context.attn_isa` selects it.
 4. **Causal rule** (`paged_attention` in `layers/attention.py`): `is_causal = query_len ==
    context_len`. Prefill has `query_len == context_len` (fresh sequence);
    decode has `query_len == 1 < context_len` (attend to every cached key).
    This **assumes a sequence is prefilled exactly once, when its cache is
    empty**. Do not add chunked prefill or preemption/recompute without updating
-   the mask logic.
+   the mask logic. The kernel backend encodes the same rule as
+   `Context.dynamic_causal` (1 = prefill, 0 = decode), because one batch can mix
+   both.
 5. **Cross-attention is dense, not paged.** Each `BartDecoderCrossAttention`
    holds `encoder_kv_cache: dict[request_id -> (k, v)]`, each
    `[num_heads, enc_len, head_dim]` (head-first so the flash kernel reads a
    contiguous tensor). It is filled once in `_encode`, shared by all beams of a
    request (same `request_id`), and freed in `ModelRunner.clear_request`. It
-   does not count against `num_blocks`.
+   does not count against `num_blocks`. With the vLLM backend each layer's
+   `EncoderPagedCache` stages that K/V into a paged cache for the kernel,
+   rebuilt only when the set of active requests changes (once per offline
+   batch).
 6. **Beam search = sequences + block sharing.** Every beam is an ordinary
    `Sequence` with the request's `request_id`. `BlockManager.fork` shares the
    parent's blocks (refcount++); `BlockManager.ensure_capacity` copy-on-writes
@@ -164,6 +175,12 @@ P=/home/ducviet00/.venvs/torch-cpu/bin/python
 # unit / parity (tiny random BART; greedy + beam vs HF)
 PYTHONPATH=. $P tests/test_parity.py
 
+# vendored vLLM kernel vs the SDPA path (tiny BART with head_dim=32)
+PYTHONPATH=. $P tests/test_attn_backend.py
+
+# token-by-token parity vs HF on the real checkpoints (fp32 exact; bf16 same length)
+PYTHONPATH=. $P benchmarks/verify_parity.py --dtype float32
+
 # Florence-2 parity (tiny random Florence-2; image features + greedy/beam vs HF)
 PYTHONPATH=. $P tests/test_florence2.py
 
@@ -185,28 +202,29 @@ PYTHONPATH=. $P benchmarks/benchmark_florence2.py --batches 3,6,12 --beams 1,3,5
 
 Snapshot of `PYTHONPATH=. $P benchmarks/benchmark.py --quick`
 (`bart-large-cnn`, 8 threads, bfloat16 for **both** engines, `max_tokens=48`,
-`num_blocks=1024`, `block_size=16`, on the dev CPU). The HF baseline is loaded
-at the same dtype and both engines decode exactly `max_tokens`, so the speedup
-is engine-vs-engine. **Every commit must refresh this from a real run of the
+`num_blocks=1024`, `block_size=16`, on the dev CPU; attention on the vendored
+vLLM CPU kernel, i.e. `attn_backend="auto"`). The HF baseline is loaded at the
+same dtype and both engines decode exactly `max_tokens`, so the speedup is
+engine-vs-engine. **Every commit must refresh this from a real run of the
 script — replace the numbers with the actual `ours ms` / `speedup` output;
 never hand-edit or guess.**
 
 | sweep (bf16, enc=256 unless noted) | config | ours ms | speedup vs HF |
 |---|---|---:|---:|
-| batch, beams=1 | batch=1 | 1243 | 0.97x |
-| batch, beams=1 | batch=2 | 1320 | 0.99x |
-| batch, beams=1 | batch=4 | 1542 | 0.97x |
-| batch, beams=1 | batch=8 | 2079 | 0.94x |
-| batch, beams=4 | batch=1 | 1346 | 1.17x |
-| batch, beams=4 | batch=2 | 1692 | 1.29x |
-| batch, beams=4 | batch=4 | 2469 | 1.31x |
-| batch, beams=4 | batch=8 | 3962 | 1.37x |
-| beams, batch=8 | beams=1 | 2238 | 0.93x |
-| beams, batch=8 | beams=4 | 4023 | 1.36x |
-| dtype, batch=8, beams=4 | float32 | 6882 | 2.03x |
-| dtype, batch=8, beams=4 | bfloat16 | 3762 | 1.39x |
-| enc length, batch=8, beams=1 | enc=128 | 1679 | 0.93x |
-| enc length, batch=8, beams=1 | enc=256 | 2095 | 0.94x |
+| batch, beams=1 | batch=1 | 1059 | 1.13x |
+| batch, beams=1 | batch=2 | 1131 | 1.16x |
+| batch, beams=1 | batch=4 | 1151 | 1.29x |
+| batch, beams=1 | batch=8 | 1533 | 1.28x |
+| batch, beams=4 | batch=1 | 1112 | 1.37x |
+| batch, beams=4 | batch=2 | 1248 | 1.56x |
+| batch, beams=4 | batch=4 | 1532 | 1.94x |
+| batch, beams=4 | batch=8 | 2205 | 2.35x |
+| beams, batch=8 | beams=1 | 1540 | 1.27x |
+| beams, batch=8 | beams=4 | 2216 | 2.36x |
+| dtype, batch=8, beams=4 | float32 | 5924 | 2.34x |
+| dtype, batch=8, beams=4 | bfloat16 | 2175 | 2.39x |
+| enc length, batch=8, beams=1 | enc=128 | 1317 | 1.19x |
+| enc length, batch=8, beams=1 | enc=256 | 1539 | 1.39x |
 
 ## 7. Gotchas
 
@@ -220,8 +238,11 @@ never hand-edit or guess.**
 - **Fair benchmarks.** `benchmark.py` loads HF at the run's `--dtype` (never
   fp32-for-HF vs bf16-for-us) and both engines decode exactly `max_tokens` (EOS
   suppressed via `min_length=max_tokens+1` / HF `min_new_tokens`). Same
-  precision, the engine wins on beam search and is near parity (slightly
-  behind) for greedy.
+  precision, the engine now leads both greedy and beam search on the vendored
+  kernel (see the baseline table). `benchmarks/verify_parity.py` confirms the
+  fairness directly: fp32 is token-for-token identical to HF, bf16 matches the
+  output length (occasional single-step token differences come from the
+  different attention kernels).
 - **Comparing to HF.** To get a clean reference, disable the checkpoint's
   generation config (`forced_bos_token_id=None`, `forced_eos_token_id=None`,
   `min_length=0`, `no_repeat_ngram_size=0`, `length_penalty=1.0`,
@@ -253,6 +274,19 @@ never hand-edit or guess.**
   inductor's BF16 fusion shifts outputs (greedy tokens can diverge from HF) and
   it compiles once per batch size. `dynamic=True` compiles fast but gives no
   speedup; fp32 compile is exact but slower than plain BF16 eager.
+- **Attention backend.** `attn_backend="auto"` uses the vendored vLLM kernel
+  when it compiles (the default), else SDPA. The kernel only handles
+  `head_dim ∈ {32,48,64,80,96,112,128,160,192,224,256,512}`; other shapes (e.g.
+  the tiny-random-BART test model, `head_dim=4`) fall back to SDPA. The first
+  use compiles `csrc/` (~1-3 min) and caches the `.so` under torch's extensions
+  dir; a missing compiler downgrades `"auto"` to SDPA but makes `"vllm"` fail.
+- **BF16 SDPA needs contiguous inputs on aarch64.** PyTorch's CPU SDPA with BF16
+  *non-contiguous* (transposed) inputs takes a path ~20x slower than the
+  contiguous one (Graviton: 86 ms vs 4 ms for a BART-large encoder block); x86
+  is unaffected. The encoder self-attention builds q/k/v with
+  `view().transpose(1, 2)`, so it calls `.contiguous()` before SDPA (the SDPA
+  fallback in `layers/attention.py` does too). Without it, BF16 on Graviton ran
+  at fp32 speed; with it, BF16 is ~2.3x faster than fp32 there.
 
 ## 8. Known limitations / TODO ideas
 
@@ -274,10 +308,12 @@ never hand-edit or guess.**
 
 - Keep it small and readable; match the existing file structure and naming.
 - Minimal comments; docstrings brief and direct. No dead code.
-- Pure PyTorch only. No new third-party dependencies without discussion.
-  (`Pillow` was approved for Florence-2 image processing; the DaViT vision
-  tower and projector are imported from `transformers` rather than copied.)
-- After changes: run `python -m compileall fastencdec`, `tests/test_parity.py`,
+- Pure PyTorch plus the vendored vLLM CPU attention kernel in `csrc/` (approved;
+  Apache-2.0). No new third-party dependencies without discussion. (`Pillow` was
+  approved for Florence-2 image processing; the DaViT vision tower and projector
+  are imported from `transformers` rather than copied.)
+- After changes: run `python -m compileall fastencdec`,
+  `tests/test_parity.py`, `tests/test_attn_backend.py`,
   `tests/test_florence2.py`, `tests/test_beam.py`, `uvx ruff check` /
   `uvx ruff format --check`, and `benchmarks/benchmark.py --quick`.
 - Every commit must update the "Benchmark baseline" table above with the real
