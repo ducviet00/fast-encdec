@@ -5,20 +5,39 @@ sequence is about to write into a shared block (copy-on-write).  This mirrors
 vLLM's beam-search behaviour while staying tiny.
 """
 
+from collections import deque
+
+
+class Block:
+    def __init__(self, block_id: int):
+        self.block_id = block_id
+        self.ref_count = 0
+
 
 class BlockManager:
     def __init__(self, num_blocks: int, block_size: int):
         self.num_blocks = num_blocks
         self.block_size = block_size
-        self.free_blocks = list(range(num_blocks))
-        self.ref_count = [0] * num_blocks
+        self.blocks = [Block(i) for i in range(num_blocks)]
+        self.free_block_ids: deque[int] = deque(range(num_blocks))
+        self.used_block_ids: set[int] = set()
 
-    def _allocate(self) -> int:
-        if not self.free_blocks:
+    @property
+    def num_free_blocks(self) -> int:
+        return len(self.free_block_ids)
+
+    def _allocate_block(self) -> int:
+        if not self.free_block_ids:
             raise RuntimeError("KV cache is full; increase num_blocks")
-        block = self.free_blocks.pop()
-        self.ref_count[block] = 1
-        return block
+        block_id = self.free_block_ids.popleft()
+        self.blocks[block_id].ref_count = 1
+        self.used_block_ids.add(block_id)
+        return block_id
+
+    def _deallocate_block(self, block_id: int) -> None:
+        self.blocks[block_id].ref_count = 0
+        self.used_block_ids.discard(block_id)
+        self.free_block_ids.append(block_id)
 
     def required_new_blocks(self, seq, num_new_tokens: int) -> int:
         """Upper bound on the fresh blocks :meth:`ensure_capacity` allocates.
@@ -36,7 +55,7 @@ class BlockManager:
         old = len(seq.block_table)
         count = max(0, (end + bs - 1) // bs - old)
         for i in range(start // bs, (end - 1) // bs + 1):
-            if i < old and self.ref_count[seq.block_table[i]] > 1:
+            if i < old and self.blocks[seq.block_table[i]].ref_count > 1:
                 count += 1
         return count
 
@@ -47,24 +66,25 @@ class BlockManager:
         end = start + num_new_tokens
         needed = (end + bs - 1) // bs
         while len(seq.block_table) < needed:
-            seq.block_table.append(self._allocate())
+            seq.block_table.append(self._allocate_block())
         for i in range(start // bs, (end - 1) // bs + 1):
-            block = seq.block_table[i]
-            if self.ref_count[block] > 1:  # shared -> copy before writing
-                new_block = self._allocate()
-                copy_block(block, new_block)
-                self.ref_count[block] -= 1
-                seq.block_table[i] = new_block
+            block_id = seq.block_table[i]
+            if self.blocks[block_id].ref_count > 1:  # shared -> copy before writing
+                new_block_id = self._allocate_block()
+                copy_block(block_id, new_block_id)
+                self.blocks[block_id].ref_count -= 1
+                seq.block_table[i] = new_block_id
 
     def fork(self, parent, child) -> None:
         """Share ``parent``'s blocks with ``child`` (no data copy)."""
         child.block_table = list(parent.block_table)
-        for block in child.block_table:
-            self.ref_count[block] += 1
+        for block_id in child.block_table:
+            self.blocks[block_id].ref_count += 1
 
-    def free(self, seq) -> None:
-        for block in seq.block_table:
-            self.ref_count[block] -= 1
-            if self.ref_count[block] == 0:
-                self.free_blocks.append(block)
+    def deallocate(self, seq) -> None:
+        for block_id in reversed(seq.block_table):
+            block = self.blocks[block_id]
+            block.ref_count -= 1
+            if block.ref_count == 0:
+                self._deallocate_block(block_id)
         seq.block_table = []

@@ -35,7 +35,7 @@ os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
 import torch
 from PIL import Image
 
-from fastencdec import Florence2LLM, SamplingParams
+from fastencdec import LLM, SamplingParams
 
 DEFAULT_MODEL = "florence-community/Florence-2-base"
 IMAGE_URL = "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/transformers/tasks/car.jpg"
@@ -202,7 +202,7 @@ def main():
         f"max_tokens={args.max_tokens}  beam_tokens={args.beam_tokens}"
     )
 
-    llm = Florence2LLM(
+    llm = LLM(
         args.model,
         num_blocks=4096,
         block_size=16,

@@ -22,23 +22,37 @@ projector imported verbatim from `transformers`.
 
 ## Layout
 
+Mirrors nano-vllm's package layout (`engine/`, `layers/`, `models/`, `utils/`).
+
 ```
 fastencdec/
-  context.py       # per-step metadata read by attention layers
-  sequence.py      # Sequence / SamplingParams
-  block_manager.py # paged blocks: allocate / fork / copy-on-write / free
-  attention.py     # CPU paged self-attention + cached cross-attention
-  models/bart.py   # BART model (encoder / decoder / cross-attn)
-  models/florence2.py # Florence-2 (DaViT + projector + BART language model)
-  loader.py        # HuggingFace -> model weight loading
-  model_runner.py  # batching, KV cache, encoder caching, forward
-  engine.py        # scheduler (continuous batching) + beam search loop
-  logits_processor.py # transformers LogitsProcessorList from SamplingParams
-  sampler.py       # greedy / multinomial sampling on processed logits
-  __init__.py      # LLM facade (BART) and Florence2LLM facade
+  __init__.py        # package exports (LLM, SamplingParams, RequestOutput, ...)
+  config.py          # engine hyperparameters (Config)
+  llm.py             # unified LLM facade (BART + Florence-2, vLLM-style API)
+  outputs.py         # RequestOutput / CompletionOutput (vLLM-shaped)
+  sampling_params.py # SamplingParams
+  engine/
+    sequence.py      # Sequence / SequenceStatus
+    block_manager.py # paged blocks: allocate / fork / copy-on-write / free
+    scheduler.py     # continuous batching
+    model_runner.py  # batching, KV cache, encoder caching, forward
+    llm_engine.py    # LLMEngine: step loop, sampling, beam search
+  layers/
+    attention.py     # CPU paged self-attention + cached cross-attention
+    logits_processor.py # transformers LogitsProcessorList from SamplingParams
+    sampler.py       # greedy / multinomial sampling (Sampler)
+  models/
+    bart.py          # BART model (encoder / decoder / cross-attn)
+    florence2.py     # Florence-2 (DaViT + projector + BART language model)
+  utils/
+    context.py       # per-step metadata read by attention layers
+    loader.py        # HuggingFace -> model weight loading
 ```
 
 ## Usage
+
+`generate` mirrors the vLLM offline API: prompts plus optional `SamplingParams`,
+returning `RequestOutput` objects (text via `output.outputs[0].text`).
 
 ```python
 from fastencdec import LLM, SamplingParams
@@ -46,22 +60,21 @@ from fastencdec import LLM, SamplingParams
 llm = LLM("facebook/bart-large-cnn", num_blocks=256, block_size=16)
 
 # greedy
-print(llm.generate("The quick brown fox ...", SamplingParams(max_tokens=32)))
+output = llm.generate("The quick brown fox ...", SamplingParams(max_tokens=32))[0]
+print(output.outputs[0].text)
 
 # beam search
-print(
-    llm.generate(
-        "The quick brown fox ...",
-        SamplingParams(max_tokens=32, num_beams=4),
-    )
-)
+output = llm.generate(
+    "The quick brown fox ...", SamplingParams(max_tokens=32, num_beams=4)
+)[0]
+print(output.outputs[0].text)
 
 # batched (continuous batching): different-length inputs run together
-print(
-    llm.generate(
-        [article_a, article_b, article_c], SamplingParams(max_tokens=32, num_beams=4)
-    )
+outputs = llm.generate(
+    [article_a, article_b, article_c], SamplingParams(max_tokens=32, num_beams=4)
 )
+for output in outputs:
+    print(output.outputs[0].text)
 ```
 
 `dtype=torch.bfloat16` halves memory and speeds up the GEMMs on CPUs with
@@ -79,7 +92,7 @@ taken from the checkpoint's `generation_config.json`:
 
 ```python
 llm.generate(article)  # checkpoint defaults
-llm.generate(article, SamplingParams(max_tokens=48))  # explicit; neutral elsewhere
+llm.generate(article, sampling_params=SamplingParams(max_tokens=48))  # explicit
 ```
 
 For `bart-large-cnn` the default is `num_beams=4`, `length_penalty=2.0`,
@@ -107,15 +120,25 @@ encoder input at the `<image>` placeholders.
 
 ```python
 from PIL import Image
-from fastencdec import Florence2LLM, SamplingParams
+from fastencdec import LLM, SamplingParams
 
-llm = Florence2LLM("florence-community/Florence-2-base", num_blocks=1024, block_size=16)
+llm = LLM("florence-community/Florence-2-base", num_blocks=1024, block_size=16)
 
 image = Image.open("photo.jpg")
-print(llm.generate("<CAPTION>", image, SamplingParams(max_tokens=32)))
+output = llm.generate(
+    {"prompt": "<CAPTION>", "multi_modal_data": {"image": image}},
+    SamplingParams(max_tokens=32),
+)[0]
+print(output.outputs[0].text)
 
-# several tasks on one image (the image is broadcast), or several images:
-print(llm.generate(["<CAPTION>", "<OD>"], image, SamplingParams(max_tokens=32)))
+# several tasks on one image, or several images:
+tasks = ["<CAPTION>", "<OD>"]
+outputs = llm.generate(
+    [{"prompt": task, "multi_modal_data": {"image": image}} for task in tasks],
+    SamplingParams(max_tokens=32),
+)
+for output in outputs:
+    print(output.outputs[0].text)
 ```
 
 Requires `Pillow` for image loading/processing.  The tiny
@@ -129,7 +152,7 @@ inductor's BF16 fusion shifts the outputs slightly — greedy tokens can diverge
 from HuggingFace — and the first call compiles once per batch size:
 
 ```python
-llm = Florence2LLM("florence-community/Florence-2-base", compile_mm_encoder=True)
+llm = LLM("florence-community/Florence-2-base", compile_mm_encoder=True)
 ```
 
 ## How a step works
@@ -142,8 +165,11 @@ model_runner.run(seqs)
     build input_ids/positions/slot_mapping
     decoder forward             self-attn reads/writes paged cache,
                                 cross-attn reads cached encoder K/V
-    compute_logits(last token)  -> sample / beam-expand
+    set_context(...)            global metadata read by attention
+llm_engine.step()               compute logits -> sample / beam-expand -> free finished
 ```
+
+`LLMEngine.run()` loops `step()` until `is_finished()`.
 
 Each sequence only feeds the tokens not yet in the cache
 (`token_ids[num_cached_tokens:]`): the whole prompt on prefill, one token per
@@ -248,7 +274,7 @@ only partly translate into wall-clock time.  Beam search benefits most, because
 the paged cache shares blocks instead of reordering a full beam cache each step;
 the decode-only advantage is ~1.6–1.8×.
 
-`Florence2LLM(..., compile_mm_encoder=True)` compiles the shared vision tower
+`LLM(..., compile_mm_encoder=True)` compiles the shared vision tower
 (~1.3–1.5×, ≈1.15× end-to-end); it may change the decoded tokens, so it is off
 by default.
 

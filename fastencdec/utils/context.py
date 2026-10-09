@@ -1,13 +1,12 @@
 """Global step context read by the model's attention layers.
 
-The engine calls :func:`set_context` once per forward; attention layers read the
-metadata with :func:`get_context`.  This avoids threading a dozen arguments
-through every module and keeps the model code close to the HF reference.
+The model runner calls :func:`set_context` once per forward; attention layers
+read the metadata with :func:`get_context`.  This avoids threading a dozen
+arguments through every module and keeps the model code close to the HF
+reference.
 """
 
 from dataclasses import dataclass
-
-_context = None
 
 
 @dataclass
@@ -31,10 +30,27 @@ class Context:
     num_seqs: int
 
 
-def set_context(ctx: Context) -> None:
-    global _context
-    _context = ctx
+_CONTEXT: Context | None = None
 
 
 def get_context() -> Context:
-    return _context
+    return _CONTEXT
+
+
+def set_context(
+    slot_mapping,
+    query_start_loc,
+    context_lens,
+    block_tables,
+    request_ids,
+    num_seqs,
+) -> None:
+    global _CONTEXT
+    _CONTEXT = Context(
+        slot_mapping,
+        query_start_loc,
+        context_lens,
+        block_tables,
+        request_ids,
+        num_seqs,
+    )

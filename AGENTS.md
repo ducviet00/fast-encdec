@@ -46,25 +46,37 @@ at the `<image>` placeholders; the decoder is unchanged.
 
 ## 3. Layout
 
+Mirrors nano-vllm's package layout (`engine/`, `layers/`, `models/`, `utils/`).
+
 ```
 fastencdec/
-  __init__.py        LLM facade (load weights, tokenize, drive engine)
-  context.py         global per-step Context read by attention layers
-  sequence.py        Sequence / SamplingParams
-  block_manager.py   paged blocks: allocate / fork / copy-on-write / free
-  attention.py       CPU paged self-attention + cached cross-attention
-  models/bart.py     BART model (encoder / decoder / cross-attn)
-  models/florence2.py Florence-2 (DaViT + projector + BART language model)
-  loader.py          HF checkpoint -> model weight loading
-  model_runner.py    batching, KV cache, encoder caching, forward
-  engine.py          Scheduler (continuous batching) + beam search
-  logits_processor.py transformers LogitsProcessorList from SamplingParams
-  sampler.py         greedy / multinomial sampling on processed logits
+  __init__.py          package exports (LLM, SamplingParams, RequestOutput, ...)
+  config.py            Config (engine hyperparameters)
+  llm.py               unified LLM facade (BART + Florence-2, vLLM-style API)
+  outputs.py           RequestOutput / CompletionOutput (vLLM-shaped)
+  sampling_params.py   SamplingParams
+  engine/
+    sequence.py        Sequence / SequenceStatus
+    block_manager.py   paged blocks: allocate / fork / copy-on-write / free
+    scheduler.py       continuous batching
+    model_runner.py    batching, KV cache, encoder caching, forward
+    llm_engine.py      LLMEngine: step loop, greedy/sampling, beam search
+  layers/
+    attention.py       CPU paged self-attention + cached cross-attention
+    logits_processor.py transformers LogitsProcessorList from SamplingParams
+    sampler.py         greedy / multinomial sampling (Sampler nn.Module)
+  models/
+    bart.py            BART model (encoder / decoder / cross-attn)
+    florence2.py       Florence-2 (DaViT + projector + BART language model)
+  utils/
+    context.py         global per-step Context read by attention layers
+    loader.py          HF checkpoint -> model weight loading
 examples/summarize.py
 examples/florence2.py
 benchmarks/benchmark.py
 tests/test_parity.py
 tests/test_florence2.py
+tests/test_beam.py
 ```
 
 ## 4. How a step works
@@ -75,11 +87,13 @@ ModelRunner.run(seqs)
     fresh = [seq for seq in seqs if seq.num_cached_tokens == 0]
     _encode(fresh)                # batched encoder (grouped by length/image shape), cache cross-attn K/V
     _prepare(seqs)                # input_ids/positions/slot_mapping; ensure blocks/CoW
-    set_context(Context(...))     # global read by attention
+    set_context(...)              # global Context read by attention
     decoder forward               # self-attn reads/writes paged cache, cross-attn reads cache
     compute_logits(last token)    # [num_seqs, vocab]
-LLMEngine.run()                   # sample (greedy) or beam-expand; free finished
+LLMEngine.step()                  # sample (greedy) or beam-expand; append; free finished
 ```
+
+`LLMEngine.run()` loops `step()` until `is_finished()`.
 
 ## 5. Core invariants (read before changing anything)
 
@@ -95,7 +109,7 @@ LLMEngine.run()                   # sample (greedy) or beam-expand; free finishe
    A token at sequence position `p` lives at physical slot
    `block_table[p // block_size] * block_size + (p % block_size)`.
    `Context.context_lens[i]` is the total cached length *after* writing.
-4. **Causal rule** (`attention.paged_attention`): `is_causal = query_len ==
+4. **Causal rule** (`paged_attention` in `layers/attention.py`): `is_causal = query_len ==
    context_len`. Prefill has `query_len == context_len` (fresh sequence);
    decode has `query_len == 1 < context_len` (attend to every cached key).
    This **assumes a sequence is prefilled exactly once, when its cache is
@@ -115,12 +129,13 @@ LLMEngine.run()                   # sample (greedy) or beam-expand; free finishe
 7. **Scheduling.** `Scheduler.schedule()` returns *all* running sequences each
    step, so a request's beams are never split. Keep `max_num_seqs >=
    num_beams`.
-8. **Global context.** `context.set_context` is called once per forward;
-   attention layers read it via `context.get_context()`. It is not thread-safe
-   and assumes a single in-flight forward.
+8. **Global context.** `utils/context.set_context(...)` is called once per
+   forward; it builds the step's `Context` and attention layers read it via
+   `get_context()`. It is not thread-safe and assumes a single in-flight
+   forward.
 9. **EOS.** `LLMEngine.add_request` fills `SamplingParams.eos_token_id` from the
    model config when unset. Logits processing is delegated to `transformers`'
-   `LogitsProcessorList` (built in `logits_processor.build_logits_processor`),
+   `LogitsProcessorList` (built in `layers/logits_processor.build_logits_processor`),
    so `min_length`, `no_repeat_ngram_size`, `repetition_penalty`, forced BOS/EOS,
    suppressed tokens and the sampling warpers match `generate`. `LLM.generate`
    uses the checkpoint's `GenerationConfig` (via
@@ -169,20 +184,20 @@ output; never hand-edit or guess.**
 
 | sweep (bf16, enc=256 unless noted) | config | ours ms | speedup vs HF |
 |---|---|---:|---:|
-| batch, beams=1 | batch=1 | 800 | 2.07x |
-| batch, beams=1 | batch=2 | 919 | 1.55x |
-| batch, beams=1 | batch=4 | 1143 | 2.14x |
-| batch, beams=1 | batch=8 | 1632 | 2.48x |
-| batch, beams=4 | batch=1 | 1328 | 2.43x |
-| batch, beams=4 | batch=2 | 1697 | 3.07x |
-| batch, beams=4 | batch=4 | 2444 | 2.86x |
-| batch, beams=4 | batch=8 | 3992 | 3.06x |
-| beams, batch=8 | beams=1 | 1674 | 2.42x |
-| beams, batch=8 | beams=4 | 3963 | 3.10x |
-| dtype, batch=8, beams=4 | float32 | 7116 | 1.85x |
-| dtype, batch=8, beams=4 | bfloat16 | 3928 | 3.24x |
-| enc length, batch=8, beams=1 | enc=128 | 677 | 2.54x |
-| enc length, batch=8, beams=1 | enc=256 | 1659 | 2.39x |
+| batch, beams=1 | batch=1 | 796 | 2.09x |
+| batch, beams=1 | batch=2 | 916 | 1.57x |
+| batch, beams=1 | batch=4 | 1149 | 2.20x |
+| batch, beams=1 | batch=8 | 1650 | 2.47x |
+| batch, beams=4 | batch=1 | 1321 | 2.52x |
+| batch, beams=4 | batch=2 | 1673 | 3.16x |
+| batch, beams=4 | batch=4 | 2414 | 2.96x |
+| batch, beams=4 | batch=8 | 3968 | 3.19x |
+| beams, batch=8 | beams=1 | 1665 | 2.48x |
+| beams, batch=8 | beams=4 | 3988 | 3.20x |
+| dtype, batch=8, beams=4 | float32 | 7088 | 1.93x |
+| dtype, batch=8, beams=4 | bfloat16 | 3894 | 3.30x |
+| enc length, batch=8, beams=1 | enc=128 | 678 | 2.56x |
+| enc length, batch=8, beams=1 | enc=256 | 1649 | 2.44x |
 
 ## 7. Gotchas
 
@@ -210,7 +225,7 @@ output; never hand-edit or guess.**
   split in its `run` loop.
 - **Cross-attn memory** scales with `batch × enc_len` and lives outside
   `num_blocks` (BART-large ≈ 8 MB/layer/request at enc_len=1024 in fp32).
-- **`num_blocks` is a hard budget**; `BlockManager._allocate` raises when
+- **`num_blocks` is a hard budget**; `BlockManager._allocate_block` raises when
   exhausted.
 - **BF16 vs FP32**: BF16 ≈ 2× on GEMM-heavy work via oneDNN; attention is
   FP32-accumulate in both.
@@ -249,6 +264,7 @@ output; never hand-edit or guess.**
   (`Pillow` was approved for Florence-2 image processing; the DaViT vision
   tower and projector are imported from `transformers` rather than copied.)
 - After changes: run `python -m compileall fastencdec`, `tests/test_parity.py`,
-  `tests/test_florence2.py`, and `benchmarks/benchmark.py --quick`.
+  `tests/test_florence2.py`, `tests/test_beam.py`, `uvx ruff check` /
+  `uvx ruff format --check`, and `benchmarks/benchmark.py --quick`.
 - Every commit must update the "Benchmark baseline" table above with the real
   numbers from that `--quick` run (no stale or estimated values).

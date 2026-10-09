@@ -32,11 +32,11 @@ def main():
             min_length=8,
         )
         start = time.perf_counter()
-        outputs = llm.generate(ARTICLES, params)
+        outputs = llm.generate(ARTICLES, sampling_params=params)
         elapsed = time.perf_counter() - start
         print(f"\n=== num_beams={beams}  ({elapsed:.2f}s) ===")
-        for article, summary in zip(ARTICLES, outputs):
-            print(f"- {summary}")
+        for article, output in zip(ARTICLES, outputs):
+            print(f"- {output.outputs[0].text}")
 
 
 if __name__ == "__main__":

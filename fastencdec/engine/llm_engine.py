@@ -4,58 +4,21 @@ The scheduler keeps a ``running`` batch that requests join as soon as they
 arrive (continuous batching) and leave when they finish.  Beam search is
 implemented on top of the same paged cache: each beam is a normal
 :class:`Sequence`, blocks are shared by reference count and copy-on-write
-happens on the next append (see :mod:`fastencdec.block_manager`).
+happens on the next append (see :mod:`fastencdec.engine.block_manager`).
 """
 
-from collections import defaultdict, deque
+from collections import defaultdict
 from dataclasses import replace
 
 import torch
 
-from .logits_processor import build_logits_processor
+from ..config import Config
+from ..layers.logits_processor import build_logits_processor
+from ..layers.sampler import Sampler
+from .block_manager import BlockManager
 from .model_runner import ModelRunner
-from .sampler import sample_token
-from .sequence import Sequence
-
-
-class Scheduler:
-    def __init__(self, max_num_seqs: int = 32):
-        self.waiting = deque()
-        self.running: list[Sequence] = []
-        self.max_num_seqs = max_num_seqs
-
-    def add(self, seq: Sequence) -> None:
-        if seq.sampling.num_beams > self.max_num_seqs:
-            raise ValueError(
-                f"num_beams ({seq.sampling.num_beams}) exceeds "
-                f"max_num_seqs ({self.max_num_seqs})"
-            )
-        self.waiting.append(seq)
-
-    def add_running(self, seq: Sequence) -> None:
-        self.running.append(seq)
-
-    def remove(self, seq: Sequence) -> None:
-        self.running.remove(seq)
-
-    def has_work(self) -> bool:
-        return bool(self.waiting or self.running)
-
-    def schedule(self) -> list[Sequence]:
-        # A request expands to ``num_beams`` sequences once beam search starts,
-        # so charge every in-flight request its full beam width.  Counting
-        # sequences directly would admit ``max_num_seqs`` seeds and then
-        # overflow the batch on the following step.
-        widths = {seq.request_id: seq.sampling.num_beams for seq in self.running}
-        used = sum(widths.values())
-        while self.waiting:
-            seq = self.waiting[0]
-            if used + seq.sampling.num_beams > self.max_num_seqs:
-                break
-            self.waiting.popleft()
-            self.running.append(seq)
-            used += seq.sampling.num_beams
-        return list(self.running)
+from .scheduler import Scheduler
+from .sequence import Sequence, SequenceStatus
 
 
 def _length_penalized(seq: Sequence, length_penalty: float) -> float:
@@ -83,13 +46,14 @@ class LLMEngine:
     def __init__(
         self,
         model,
-        block_manager,
-        max_num_seqs: int = 32,
-        dtype=torch.float32,
+        config: Config,
         eos_token_id: int | None = None,
     ):
-        self.runner = ModelRunner(model, block_manager, dtype)
-        self.scheduler = Scheduler(max_num_seqs)
+        self.config = config
+        self.block_manager = BlockManager(config.num_blocks, config.block_size)
+        self.runner = ModelRunner(model, self.block_manager, config.dtype)
+        self.scheduler = Scheduler(config)
+        self.sampler = Sampler()
         self.eos_token_id = eos_token_id
         self.results: dict[int, list[int]] = {}
         self._finished_beams: dict[int, list[Sequence]] = defaultdict(list)
@@ -127,49 +91,56 @@ class LLMEngine:
         return request_id
 
     # ------------------------------------------------------------------ run
+    def is_finished(self) -> bool:
+        return self.scheduler.is_finished()
+
+    def step(self) -> None:
+        seqs = self.scheduler.schedule()
+        logits = self.runner.run(seqs)
+        self._postprocess(seqs, logits)
+
     def run(self) -> None:
-        while self.scheduler.has_work():
-            seqs = self.scheduler.schedule()
-            logits = self.runner.run(seqs)
+        while not self.is_finished():
+            self.step()
 
-            groups = defaultdict(list)
-            for index, seq in enumerate(seqs):
-                groups[seq.request_id].append(index)
+    def _postprocess(self, seqs, logits) -> None:
+        groups = defaultdict(list)
+        for index, seq in enumerate(seqs):
+            groups[seq.request_id].append(index)
 
-            for request_id, indices in groups.items():
-                params = seqs[indices[0]].sampling
-                input_ids = torch.tensor(
-                    [seqs[i].token_ids for i in indices], dtype=torch.long
-                )
-                logits_batch = logits[indices].float()
-                processor = self._logits_processors[request_id]
-                if params.num_beams > 1:
-                    # generate's beam search applies the processors to
-                    # log-probs, so a masking processor does not renormalize
-                    # the surviving scores (unlike the greedy path below).
-                    logprobs = processor(
-                        input_ids, torch.log_softmax(logits_batch, dim=-1)
-                    )
-                    beams = [seqs[i] for i in indices]
-                    self._beam_step(request_id, beams, params, logprobs)
-                else:
-                    scores = processor(input_ids, logits_batch)
-                    for i, score in zip(indices, scores):
-                        self._sample_step(seqs[i], params, score)
+        for request_id, indices in groups.items():
+            params = seqs[indices[0]].sampling
+            input_ids = torch.tensor(
+                [seqs[i].token_ids for i in indices], dtype=torch.long
+            )
+            logits_batch = logits[indices].float()
+            processor = self._logits_processors[request_id]
+            if params.num_beams > 1:
+                # generate's beam search applies the processors to log-probs,
+                # so a masking processor does not renormalize the surviving
+                # scores (unlike the greedy path below).
+                logprobs = processor(input_ids, torch.log_softmax(logits_batch, dim=-1))
+                beams = [seqs[i] for i in indices]
+                self._beam_step(request_id, beams, params, logprobs)
+            else:
+                scores = processor(input_ids, logits_batch)
+                for i, score in zip(indices, scores):
+                    self._sample(seqs[i], params, score)
 
     # -------------------------------------------------------------- sampling
     def _release(self, request_id: int) -> None:
         self.runner.clear_request(request_id)
         self._logits_processors.pop(request_id, None)
 
-    def _sample_step(self, seq: Sequence, params, logits) -> None:
-        token = sample_token(logits, params.temperature)
-        seq.token_ids.append(token)
-        if token in params.eos_ids() or seq.num_generated >= params.max_tokens:
+    def _sample(self, seq: Sequence, params, logits) -> None:
+        token = self.sampler(logits, params.temperature)
+        seq.append_token(token)
+        if token in params.eos_ids() or seq.num_completion_tokens >= params.max_tokens:
             self.scheduler.remove(seq)
-            self.runner.block_manager.free(seq)
+            seq.status = SequenceStatus.FINISHED
+            self.block_manager.deallocate(seq)
             self._release(seq.request_id)
-            self.results[seq.request_id] = seq.generated_ids()
+            self.results[seq.request_id] = seq.completion_token_ids
 
     # ------------------------------------------------------------ beam search
     def _fork(self, parent: Sequence, token: int, score: float) -> Sequence:
@@ -183,7 +154,7 @@ class LLMEngine:
         child.token_ids = parent.token_ids + [token]
         child.num_cached_tokens = parent.num_cached_tokens
         child.cum_logprob = score
-        self.runner.block_manager.fork(parent, child)
+        self.block_manager.fork(parent, child)
         return child
 
     def _beam_step(self, request_id: int, beams, params, logprobs) -> None:
@@ -214,14 +185,17 @@ class LLMEngine:
             self._fork(beams[parents[r]], tokens[r], top_scores[r].item())
             for r in live_ranks
         ]
+        for child in new_finished:
+            child.status = SequenceStatus.FINISHED
 
         for beam in beams:
             self.scheduler.remove(beam)
-            self.runner.block_manager.free(beam)
+            self.block_manager.deallocate(beam)
 
         self._finished_beams[request_id].extend(new_finished)
         self._prune_finished(request_id, params)
         for child in live:
+            child.status = SequenceStatus.RUNNING
             self.scheduler.add_running(child)
 
         if not live or self._should_stop(request_id, params, live):
@@ -236,7 +210,7 @@ class LLMEngine:
             key=lambda seq: _length_penalized(seq, params.length_penalty), reverse=True
         )
         for seq in finished[params.num_beams :]:
-            self.runner.block_manager.free(seq)
+            self.block_manager.deallocate(seq)
         del finished[params.num_beams :]
 
     def _should_stop(self, request_id: int, params, live) -> bool:
@@ -270,6 +244,7 @@ class LLMEngine:
         for seq in live:
             self.scheduler.remove(seq)
         for seq in finished + live:
-            self.runner.block_manager.free(seq)
+            seq.status = SequenceStatus.FINISHED
+            self.block_manager.deallocate(seq)
         self._release(request_id)
-        self.results[request_id] = best.generated_ids() if best else []
+        self.results[request_id] = best.completion_token_ids if best else []

@@ -8,7 +8,7 @@ K/V blocks from the paged cache.
 import torch
 import torch.nn.functional as F
 
-from .context import get_context
+from ..utils.context import get_context
 
 
 def store_kvcache(

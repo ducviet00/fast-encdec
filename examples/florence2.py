@@ -4,7 +4,7 @@ import time
 
 from PIL import Image, ImageDraw
 
-from fastencdec import Florence2LLM, SamplingParams
+from fastencdec import LLM, SamplingParams
 
 
 def make_image() -> Image.Image:
@@ -19,20 +19,21 @@ def make_image() -> Image.Image:
 
 def main():
     image = make_image()
-    llm = Florence2LLM(
-        "florence-community/Florence-2-base", num_blocks=1024, block_size=16
-    )
+    llm = LLM("florence-community/Florence-2-base", num_blocks=1024, block_size=16)
 
     # One image, several tasks: the image is encoded once per request and the
     # results are decoded greedily.
     tasks = ["<CAPTION>", "<MORE_DETAILED_CAPTION>", "<OD>"]
     params = SamplingParams(max_tokens=32, num_beams=1)
+    requests = [
+        {"prompt": task, "multi_modal_data": {"image": image}} for task in tasks
+    ]
     start = time.perf_counter()
-    outputs = llm.generate(tasks, image, params)
+    outputs = llm.generate(requests, params)
     elapsed = time.perf_counter() - start
     print(f"({elapsed:.2f}s)")
     for task, output in zip(tasks, outputs):
-        print(f"{task:>26}  {output}")
+        print(f"{task:>26}  {output.outputs[0].text}")
 
 
 if __name__ == "__main__":

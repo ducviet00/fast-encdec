@@ -2,7 +2,7 @@
 
 import torch
 
-from .context import Context, set_context
+from ..utils.context import set_context
 
 
 class ModelRunner:
@@ -75,7 +75,7 @@ class ModelRunner:
             )
             for seq in seqs
         )
-        if required > len(self.block_manager.free_blocks):
+        if required > self.block_manager.num_free_blocks:
             raise RuntimeError("KV cache is full; increase num_blocks")
         input_ids, positions, slot_mapping = [], [], []
         query_start_loc = [0]
@@ -114,7 +114,7 @@ class ModelRunner:
             self._prepare(seqs)
         )
 
-        context = Context(
+        set_context(
             slot_mapping=slot_mapping,
             query_start_loc=qsl,
             context_lens=context_lens,
@@ -122,7 +122,6 @@ class ModelRunner:
             request_ids=[seq.request_id for seq in seqs],
             num_seqs=len(seqs),
         )
-        set_context(context)
 
         hidden = self.model.decoder(input_ids, positions)
         last = torch.tensor(

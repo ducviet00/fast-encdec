@@ -77,7 +77,9 @@ def timed(fn, warmup: int, repeats: int):
 
 
 def bench_ours(llm, prompts, params, warmup, repeats):
-    dt, _ = timed(lambda: llm.generate(prompts, params), warmup, repeats)
+    dt, _ = timed(
+        lambda: llm.generate(prompts, sampling_params=params), warmup, repeats
+    )
     ids = [llm.engine.results[r] for r in sorted(llm.engine.results)[-len(prompts) :]]
     return dt, sum(len(x) for x in ids)
 

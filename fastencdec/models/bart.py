@@ -6,7 +6,7 @@ only swaps the attention kernels:
 * encoder self-attention stays a plain non-causal SDPA (it runs once and holds
   no cache),
 * decoder self-attention reads/writes the paged KV cache through the global
-  :class:`~fastencdec.context.Context`,
+  :class:`~fastencdec.utils.context.Context`,
 * decoder cross-attention uses encoder K/V cached per request on the layer.
 
 Everything else (projections, LayerNorms, embeddings, residual layout, the
@@ -20,7 +20,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from ..attention import cached_cross_attention, paged_attention
+from ..layers.attention import cached_cross_attention, paged_attention
 
 ACT2FN = {"gelu": F.gelu}
 
