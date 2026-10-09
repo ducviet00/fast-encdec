@@ -159,6 +159,31 @@ PYTHONPATH=. $P benchmarks/benchmark_florence2.py --quick
 PYTHONPATH=. $P benchmarks/benchmark_florence2.py --batches 3,6,12 --beams 1,3,5
 ```
 
+### Benchmark baseline
+
+Snapshot of `PYTHONPATH=. $P benchmarks/benchmark.py --quick`
+(`bart-large-cnn`, 8 threads, bfloat16, `max_tokens=48`, `num_blocks=1024`,
+`block_size=16`, on the dev CPU). **Every commit must refresh this from a real
+run of the script — replace the numbers with the actual `ours ms` / `speedup`
+output; never hand-edit or guess.**
+
+| sweep (bf16, enc=256 unless noted) | config | ours ms | speedup vs HF |
+|---|---|---:|---:|
+| batch, beams=1 | batch=1 | 800 | 2.07x |
+| batch, beams=1 | batch=2 | 919 | 1.55x |
+| batch, beams=1 | batch=4 | 1143 | 2.14x |
+| batch, beams=1 | batch=8 | 1632 | 2.48x |
+| batch, beams=4 | batch=1 | 1328 | 2.43x |
+| batch, beams=4 | batch=2 | 1697 | 3.07x |
+| batch, beams=4 | batch=4 | 2444 | 2.86x |
+| batch, beams=4 | batch=8 | 3992 | 3.06x |
+| beams, batch=8 | beams=1 | 1674 | 2.42x |
+| beams, batch=8 | beams=4 | 3963 | 3.10x |
+| dtype, batch=8, beams=4 | float32 | 7116 | 1.85x |
+| dtype, batch=8, beams=4 | bfloat16 | 3928 | 3.24x |
+| enc length, batch=8, beams=1 | enc=128 | 677 | 2.54x |
+| enc length, batch=8, beams=1 | enc=256 | 1659 | 2.39x |
+
 ## 7. Gotchas
 
 - **`bart-large-cnn` needs decoding heuristics.** Without `length_penalty=2.0`,
@@ -221,4 +246,6 @@ PYTHONPATH=. $P benchmarks/benchmark_florence2.py --batches 3,6,12 --beams 1,3,5
   (`Pillow` was approved for Florence-2 image processing; the DaViT vision
   tower and projector are imported from `transformers` rather than copied.)
 - After changes: run `python -m compileall fastencdec`, `tests/test_parity.py`,
-  `tests/test_florence2.py`, and a `benchmarks/benchmark.py --quick` smoke.
+  `tests/test_florence2.py`, and `benchmarks/benchmark.py --quick`.
+- Every commit must update the "Benchmark baseline" table above with the real
+  numbers from that `--quick` run (no stale or estimated values).
