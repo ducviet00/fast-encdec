@@ -1,10 +1,10 @@
 """Logits processors from ``transformers`` for the paged engine.
 
-The engine applies one :class:`~transformers.LogitsProcessorList` per request to
-the whole step's logits before sampling, so the decoding heuristics (repetition
-penalty, no-repeat n-grams, min-length, forced BOS/EOS, suppressed tokens and
-the sampling warpers) match HuggingFace ``generate`` exactly.  The processors
-are built in the same order as ``GenerationMixin._get_logits_processor``.
+The engine builds one :class:`~transformers.LogitsProcessorList` per request
+(see :func:`build_logits_processor`) in the same order as
+``GenerationMixin._get_logits_processor``.  Greedy/sampling apply it to the step
+logits and beam search to the log-probs, matching where ``GenerationMixin``
+invokes the processors (``_sample`` vs ``_beam_search``).
 """
 
 import torch

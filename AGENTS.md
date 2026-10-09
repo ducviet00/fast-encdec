@@ -175,15 +175,14 @@ PYTHONPATH=. $P benchmarks/benchmark_florence2.py --batches 3,6,12 --beams 1,3,5
   back to the config's `num_beams=4`). `GenerationConfig` assignment of
   `forced_bos_token_id=None` is unreliable; passing it as a `generate()` kwarg
   works.
-- **Beam parity.** Beam search ranks all continuations globally and finalizes
-  an EOS / max-length candidate only if it lands in the top `num_beams`; the
-  finished set is pruned to the best `num_beams` by length-normalized score and
-  stopping uses HF's `early_stopping=False` improvement heuristic (greedy is
-  exact, and beam is exact for `length_penalty=1.0`). With
-  `no_repeat_ngram_size>0` and `length_penalty!=1.0`, long beams can still
-  diverge from `generate`: the per-candidate *scores* differ there for the same
-  beam, which is a pre-existing issue in the forward/cache rather than the
-  finalization/stop logic.
+- **Beam parity.** Beam search ranks all continuations globally, finalizes an
+  EOS / max-length candidate only if it lands in the top `num_beams`, prunes the
+  finished set to the best `num_beams` by length-normalized score, and stops
+  with HF's `early_stopping=False` improvement heuristic; greedy is exact and
+  beam matches `generate` in fp32. Note `_beam_search` applies the logits
+  processors to the log-probs (whereas `_sample` applies them to the logits),
+  so n-gram masking does not renormalize the scores — the engine mirrors this
+  split in its `run` loop.
 - **Cross-attn memory** scales with `batch × enc_len` and lives outside
   `num_blocks` (BART-large ≈ 8 MB/layer/request at enc_len=1024 in fp32).
 - **`num_blocks` is a hard budget**; `BlockManager._allocate` raises when

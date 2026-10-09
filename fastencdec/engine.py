@@ -141,13 +141,19 @@ class LLMEngine:
                 input_ids = torch.tensor(
                     [seqs[i].token_ids for i in indices], dtype=torch.long
                 )
-                scores = self._logits_processors[request_id](
-                    input_ids, logits[indices].float()
-                )
+                logits_batch = logits[indices].float()
+                processor = self._logits_processors[request_id]
                 if params.num_beams > 1:
+                    # generate's beam search applies the processors to
+                    # log-probs, so a masking processor does not renormalize
+                    # the surviving scores (unlike the greedy path below).
+                    logprobs = processor(
+                        input_ids, torch.log_softmax(logits_batch, dim=-1)
+                    )
                     beams = [seqs[i] for i in indices]
-                    self._beam_step(request_id, beams, params, scores)
+                    self._beam_step(request_id, beams, params, logprobs)
                 else:
+                    scores = processor(input_ids, logits_batch)
                     for i, score in zip(indices, scores):
                         self._sample_step(seqs[i], params, score)
 
@@ -180,11 +186,10 @@ class LLMEngine:
         self.runner.block_manager.fork(parent, child)
         return child
 
-    def _beam_step(self, request_id: int, beams, params, logits) -> None:
+    def _beam_step(self, request_id: int, beams, params, logprobs) -> None:
         num_beams = params.num_beams
         eos_ids = params.eos_ids()
-        vocab = logits.shape[-1]
-        logprobs = torch.log_softmax(logits, dim=-1)
+        vocab = logprobs.shape[-1]
 
         # Rank every continuation globally, like HF's beam search.
         cumulative = torch.tensor([beam.cum_logprob for beam in beams]).unsqueeze(1)
