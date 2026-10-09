@@ -230,9 +230,12 @@ output; never hand-edit or guess.**
 - No token budget / chunked prefill: every running sequence is processed each
   step, so a long prefill blocks decode.
 - No prefix caching, no preemption/recompute, no quantization.
-- Beam search: `num_beams` is per request; no length-normalized stopping
-  heuristic beyond `length_penalty`.
-- Missing samplers: top-k, repetition penalty, forced BOS/EOS.
+- Beam search: `num_beams` is per request; stopping uses HF's
+  `early_stopping=False` improvement heuristic only (no `early_stopping=True`
+  / `"never"` modes, no beam sampling).
+- Sampling: `SamplingParams` exposes temperature, top-p, top-k, repetition
+  penalty, forced BOS/EOS and suppressed tokens via `transformers`' processors;
+  no typical-p / min-p / epsilon / eta / bad-words / prefix-constrained.
 - Cross-attention could be paged to count against `num_blocks` (dense is
   intentional for simplicity).
 - Attention is a Python per-sequence loop; a batched SDPA path could help
