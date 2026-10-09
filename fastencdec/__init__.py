@@ -90,11 +90,15 @@ class Florence2LLM:
         block_size: tokens per KV block.
         max_num_seqs: maximum sequences (beams) in flight at once.
         dtype: ``torch.float32`` or ``torch.bfloat16``.
+        compile_mm_encoder: ``torch.compile`` the vision tower + projector
+            (~1.3-1.5x on that part).  Off by default: it changes the BF16
+            outputs slightly and compiles once per batch size on first use.
     """
 
     def __init__(self, model_path: str, *, num_blocks: int = 512,
                  block_size: int = 16, max_num_seqs: int = 32,
-                 dtype: torch.dtype = torch.float32):
+                 dtype: torch.dtype = torch.float32,
+                 compile_mm_encoder: bool = False):
         from transformers import AutoProcessor, Florence2ForConditionalGeneration as HFFlorence2
 
         self.processor = AutoProcessor.from_pretrained(model_path)
@@ -102,6 +106,8 @@ class Florence2LLM:
         self.model = Florence2ForConditionalGeneration(config)
         load_hf_weights(self.model, model_path, hf_model_cls=HFFlorence2)
         self.model.to(dtype)
+        if compile_mm_encoder:
+            self.model.compile_mm_encoder()
 
         self.engine = LLMEngine(
             self.model, BlockManager(num_blocks, block_size),

@@ -57,6 +57,16 @@ class Florence2ForConditionalGeneration(nn.Module):
         image_outputs = self.model.vision_tower(pixel_values)
         return self.model.multi_modal_projector(image_outputs.last_hidden_state)
 
+    def compile_mm_encoder(self, mode: str = "default", dynamic: bool = False) -> None:
+        """Opt in to ``torch.compile`` for the vision tower + projector.
+
+        Inductor fuses/reorders the BF16 graph, so outputs can shift slightly and
+        the first call compiles once per input shape (batch size).  Off by
+        default; the decoder is untouched.
+        """
+        self.get_image_features = torch.compile(
+            self.get_image_features, mode=mode, dynamic=dynamic)
+
     @torch.no_grad()
     def encode(self, encoder_input_ids: torch.Tensor,
                pixel_values: torch.Tensor | None = None) -> torch.Tensor:

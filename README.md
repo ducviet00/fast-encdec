@@ -105,6 +105,15 @@ Requires `Pillow` for image loading/processing.  The tiny
 usable with hand-built inputs (see `tests/test_florence2.py`) because its
 processor and vision config disagree.
 
+Pass `compile_mm_encoder=True` to `torch.compile` the DaViT tower + projector
+(≈1.3–1.5× on the encoder, ≈1.15× end-to-end). It is off by default because
+inductor's BF16 fusion shifts the outputs slightly — greedy tokens can diverge
+from HuggingFace — and the first call compiles once per batch size:
+
+```python
+llm = Florence2LLM("florence-community/Florence-2-base", compile_mm_encoder=True)
+```
+
 ## How a step works
 
 ```
@@ -220,6 +229,10 @@ than HF's batched SDPA.  The no-padding / continuous-batching savings therefore
 only partly translate into wall-clock time.  Beam search benefits most, because
 the paged cache shares blocks instead of reordering a full beam cache each step;
 the decode-only advantage is ~1.6–1.8×.
+
+`Florence2LLM(..., compile_mm_encoder=True)` compiles the shared vision tower
+(~1.3–1.5×, ≈1.15× end-to-end); it may change the decoded tokens, so it is off
+by default.
 
 ## Limitations
 

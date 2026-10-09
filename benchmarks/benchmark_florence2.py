@@ -152,6 +152,8 @@ def main():
     parser.add_argument("--warmup", type=int, default=1)
     parser.add_argument("--repeats", type=int, default=2)
     parser.add_argument("--quick", action="store_true")
+    parser.add_argument("--compile-mm-encoder", action="store_true",
+                        help="torch.compile the vision tower + projector (opt-in)")
     parser.add_argument("--json", default=None)
     args = parser.parse_args()
 
@@ -175,7 +177,8 @@ def main():
           f"max_tokens={args.max_tokens}  beam_tokens={args.beam_tokens}")
 
     llm = Florence2LLM(args.model, num_blocks=4096, block_size=16,
-                       max_num_seqs=max_seqs, dtype=dtype)
+                       max_num_seqs=max_seqs, dtype=dtype,
+                       compile_mm_encoder=args.compile_mm_encoder)
     processor = AutoProcessor.from_pretrained(args.model)
     hf = HFFlorence2.from_pretrained(args.model, dtype=dtype).eval()
     results = []

@@ -181,6 +181,11 @@ PYTHONPATH=. $P benchmarks/benchmark_florence2.py --batches 3,6,12 --beams 1,3,5
   `hf-tiny-v2/...` tiny checkpoint is inconsistent (config `image_token_id=4`
   vs tokenizer `51289`, and its vision 2D position embeddings overflow at the
   processor's 768px), so `tests/test_florence2.py` builds inputs by hand.
+- **`compile_mm_encoder=True`** (opt-in) `torch.compile`s the vision tower +
+  projector (~1.3-1.5x there, ~1.15x end-to-end). It is off by default because
+  inductor's BF16 fusion shifts outputs (greedy tokens can diverge from HF) and
+  it compiles once per batch size. `dynamic=True` compiles fast but gives no
+  speedup; fp32 compile is exact but slower than plain BF16 eager.
 
 ## 8. Known limitations / TODO ideas
 
