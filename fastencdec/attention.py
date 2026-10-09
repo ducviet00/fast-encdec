@@ -95,12 +95,12 @@ def paged_attention(
         start, end = ctx.query_start_loc[i], ctx.query_start_loc[i + 1]
         query_i = query[start:end]
         length = ctx.context_lens[i]
-        key = _gather(k_cache, ctx.block_tables[i], length, block_size)
-        value = _gather(v_cache, ctx.block_tables[i], length, block_size)
+        key_i = _gather(k_cache, ctx.block_tables[i], length, block_size)
+        value_i = _gather(v_cache, ctx.block_tables[i], length, block_size)
         # Prefill feeds the whole sequence (queries == keys, causal);
         # decode feeds a single token that may attend to every cached key.
         causal = query_i.shape[0] == length
-        outputs.append(_sdpa(query_i, key, value, causal, scale))
+        outputs.append(_sdpa(query_i, key_i, value_i, causal, scale))
     return torch.cat(outputs, dim=0)
 
 
