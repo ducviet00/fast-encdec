@@ -72,16 +72,17 @@ def main():
     # Greedy/beam generation parity through the paged engine.
     for beams in (1, 2, 4):
         params = SamplingParams(max_tokens=6, num_beams=beams, temperature=0.0)
-        engine = LLMEngine(
-            ours, Config(MODEL, num_blocks=64, block_size=16, max_num_seqs=8)
-        )
-        request = engine.add_request(
-            encoder_ids,
-            [config.text_config.decoder_start_token_id],
+        engine = LLMEngine(ours, Config(num_blocks=64, block_size=16, max_num_seqs=8))
+        (request,) = engine.generate(
+            [
+                (
+                    encoder_ids,
+                    [config.text_config.decoder_start_token_id],
+                    pixel_values[0],
+                )
+            ],
             params,
-            pixel_values=pixel_values[0],
         )
-        engine.run()
         our_tokens = [config.text_config.decoder_start_token_id] + engine.results[
             request
         ]
@@ -108,35 +109,25 @@ def main():
             n_img = ours.get_image_features(image.unsqueeze(0)).shape[1]
         ids = build_encoder_ids(config, tokenizer, n_img)
         params = SamplingParams(max_tokens=6, num_beams=1, temperature=0.0)
-        engine = LLMEngine(
-            ours, Config(MODEL, num_blocks=64, block_size=16, max_num_seqs=8)
+        engine = LLMEngine(ours, Config(num_blocks=64, block_size=16, max_num_seqs=8))
+        (request,) = engine.generate(
+            [(ids, [config.text_config.decoder_start_token_id], image)], params
         )
-        request = engine.add_request(
-            ids, [config.text_config.decoder_start_token_id], params, pixel_values=image
-        )
-        engine.run()
         singles.append(
             [config.text_config.decoder_start_token_id] + engine.results[request]
         )
 
     params = SamplingParams(max_tokens=6, num_beams=1, temperature=0.0)
-    engine = LLMEngine(
-        ours, Config(MODEL, num_blocks=64, block_size=16, max_num_seqs=8)
-    )
-    requests = []
+    engine = LLMEngine(ours, Config(num_blocks=64, block_size=16, max_num_seqs=8))
+    engine_requests = []
     for image, _ in batch:
         with torch.no_grad():
             n_img = ours.get_image_features(image.unsqueeze(0)).shape[1]
         ids = build_encoder_ids(config, tokenizer, n_img)
-        requests.append(
-            engine.add_request(
-                ids,
-                [config.text_config.decoder_start_token_id],
-                params,
-                pixel_values=image,
-            )
+        engine_requests.append(
+            (ids, [config.text_config.decoder_start_token_id], image)
         )
-    engine.run()
+    requests = engine.generate(engine_requests, params)
     for i, request in enumerate(requests):
         batched = [config.text_config.decoder_start_token_id] + engine.results[request]
         status = "OK" if batched == singles[i] else "MISMATCH"

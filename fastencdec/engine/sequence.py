@@ -1,18 +1,11 @@
-"""One decoder hypothesis per beam, plus its lifecycle status."""
+"""One decoder hypothesis, plus its KV-cache bookkeeping."""
 
-from enum import Enum, auto
 from typing import TYPE_CHECKING
 
 from ..sampling_params import SamplingParams
 
 if TYPE_CHECKING:
     import torch
-
-
-class SequenceStatus(Enum):
-    WAITING = auto()
-    RUNNING = auto()
-    FINISHED = auto()
 
 
 class Sequence:
@@ -44,10 +37,6 @@ class Sequence:
         self.block_table: list[int] = []
         self.num_cached_tokens = 0
         self.cum_logprob = 0.0
-        self.status = SequenceStatus.WAITING
-
-    def __len__(self) -> int:
-        return len(self.token_ids)
 
     def append_token(self, token_id: int) -> None:
         self.token_ids.append(token_id)
@@ -61,13 +50,5 @@ class Sequence:
         return self.num_generated
 
     @property
-    def prompt_token_ids(self) -> list[int]:
-        return self.token_ids[: len(self.decoder_prompt_ids)]
-
-    @property
     def completion_token_ids(self) -> list[int]:
         return self.token_ids[len(self.decoder_prompt_ids) :]
-
-    @property
-    def is_finished(self) -> bool:
-        return self.status is SequenceStatus.FINISHED

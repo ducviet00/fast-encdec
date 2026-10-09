@@ -10,7 +10,7 @@ reference count and copy-on-write happens on the next append (see
 from collections import deque
 
 from ..config import Config
-from .sequence import Sequence, SequenceStatus
+from .sequence import Sequence
 
 
 class Scheduler:
@@ -48,7 +48,6 @@ class Scheduler:
             if used + seq.sampling.num_beams > self.max_num_seqs:
                 break
             self.waiting.popleft()
-            seq.status = SequenceStatus.RUNNING
             self.running.append(seq)
             used += seq.sampling.num_beams
         return list(self.running)

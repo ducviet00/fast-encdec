@@ -32,7 +32,7 @@ fastencdec/
   outputs.py         # RequestOutput / CompletionOutput (vLLM-shaped)
   sampling_params.py # SamplingParams
   engine/
-    sequence.py      # Sequence / SequenceStatus
+    sequence.py      # Sequence
     block_manager.py # paged blocks: allocate / fork / copy-on-write / free
     scheduler.py     # continuous batching
     model_runner.py  # batching, KV cache, encoder caching, forward

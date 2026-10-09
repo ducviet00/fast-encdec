@@ -1,10 +1,10 @@
 """Continuous-batching engine with greedy/sampling and beam search.
 
-The scheduler keeps a ``running`` batch that requests join as soon as they
-arrive (continuous batching) and leave when they finish.  Beam search is
-implemented on top of the same paged cache: each beam is a normal
-:class:`Sequence`, blocks are shared by reference count and copy-on-write
-happens on the next append (see :mod:`fastencdec.engine.block_manager`).
+The engine is offline: :meth:`LLMEngine.generate` adds a whole batch with a
+single :class:`SamplingParams` and runs to completion.  Beam search is built on
+the same paged cache: each beam is a normal :class:`Sequence`, blocks are shared
+by reference count and copy-on-write happens on the next append (see
+:mod:`fastencdec.engine.block_manager`).
 """
 
 from collections import defaultdict
@@ -18,27 +18,7 @@ from ..layers.sampler import Sampler
 from .block_manager import BlockManager
 from .model_runner import ModelRunner
 from .scheduler import Scheduler
-from .sequence import Sequence, SequenceStatus
-
-
-def _params_key(params) -> tuple:
-    """Value-based key so requests with equal ``SamplingParams`` share a processor."""
-    return (
-        params.max_tokens,
-        params.num_beams,
-        params.temperature,
-        params.top_p,
-        params.top_k,
-        params.repetition_penalty,
-        tuple(sorted(params.eos_ids())),
-        params.length_penalty,
-        params.no_repeat_ngram_size,
-        params.min_length,
-        params.forced_bos_token_id,
-        params.forced_eos_token_id,
-        tuple(params.suppress_tokens or ()),
-        tuple(params.begin_suppress_tokens or ()),
-    )
+from .sequence import Sequence
 
 
 def _length_penalized(seq: Sequence, length_penalty: float) -> float:
@@ -69,7 +49,6 @@ class LLMEngine:
         config: Config,
         eos_token_id: int | None = None,
     ):
-        self.config = config
         self.block_manager = BlockManager(config.num_blocks, config.block_size)
         self.runner = ModelRunner(model, self.block_manager, config.dtype)
         self.scheduler = Scheduler(config)
@@ -77,48 +56,52 @@ class LLMEngine:
         self.eos_token_id = eos_token_id
         self.results: dict[int, list[int]] = {}
         self._finished_beams: dict[int, list[Sequence]] = defaultdict(list)
-        self._logits_processors: dict[int, object] = {}
-        self._processor_cache: dict[tuple, object] = {}
+        self._logits_processor = None
         self._next_request_id = 0
 
-    def add_request(
-        self,
-        encoder_token_ids: list[int],
-        decoder_token_ids: list[int],
-        params,
-        pixel_values=None,
-    ) -> int:
-        request_id = self._next_request_id
-        self._next_request_id += 1
+    def generate(self, requests, params) -> list[int]:
+        """Offline entrypoint: add every request, run, return the request ids.
+
+        ``requests`` is an iterable of ``(encoder_token_ids, decoder_token_ids,
+        pixel_values)``; ``params`` is a single :class:`SamplingParams` shared by
+        the whole batch.  The decoder prompt length must be uniform (the facades
+        always use a single decoder-start token).
+        """
+        requests = list(requests)
+        if not requests:
+            return []
         if params.eos_token_id is None and self.eos_token_id is not None:
             params = replace(params, eos_token_id=self.eos_token_id)
-        seq = Sequence(
-            request_id=request_id,
-            decoder_prompt_ids=decoder_token_ids,
-            encoder_token_ids=encoder_token_ids,
-            sampling=params,
-            pixel_values=pixel_values,
+
+        prompt_len = len(requests[0][1])
+        if any(len(decoder_ids) != prompt_len for _, decoder_ids, _ in requests):
+            raise ValueError("decoder prompt length must be uniform across the batch")
+        begin_index = prompt_len + int(
+            params.forced_bos_token_id is not None and prompt_len == 1
         )
-        begin_index = len(decoder_token_ids) + int(
-            params.forced_bos_token_id is not None and len(decoder_token_ids) == 1
+        self._logits_processor = build_logits_processor(
+            params,
+            max_length=prompt_len + params.max_tokens,
+            begin_index=begin_index,
+            is_beam=params.num_beams > 1,
         )
-        max_length = len(decoder_token_ids) + params.max_tokens
-        is_beam = params.num_beams > 1
-        # Requests with equal params share one (stateless) ``LogitsProcessorList``
-        # so the greedy path can apply it to the whole batch in one call.
-        key = (is_beam, max_length, begin_index, _params_key(params))
-        processor = self._processor_cache.get(key)
-        if processor is None:
-            processor = build_logits_processor(
-                params,
-                max_length=max_length,
-                begin_index=begin_index,
-                is_beam=is_beam,
+
+        request_ids = []
+        for encoder_token_ids, decoder_token_ids, pixel_values in requests:
+            request_id = self._next_request_id
+            self._next_request_id += 1
+            self.scheduler.add(
+                Sequence(
+                    request_id=request_id,
+                    decoder_prompt_ids=decoder_token_ids,
+                    encoder_token_ids=encoder_token_ids,
+                    sampling=params,
+                    pixel_values=pixel_values,
+                )
             )
-            self._processor_cache[key] = processor
-        self._logits_processors[request_id] = processor
-        self.scheduler.add(seq)
-        return request_id
+            request_ids.append(request_id)
+        self.run()
+        return request_ids
 
     # ------------------------------------------------------------------ run
     def is_finished(self) -> bool:
@@ -134,40 +117,31 @@ class LLMEngine:
             self.step()
 
     def _postprocess(self, seqs, logits) -> None:
+        processor = self._logits_processor
         groups = defaultdict(list)
         for index, seq in enumerate(seqs):
             groups[seq.request_id].append(index)
 
-        beam_units = []
-        greedy_units = []
+        # Greedy rows are independent, so requests at the same decoder length
+        # are served by one processor call; beam needs the per-request ranking.
+        buckets: dict[int, list[int]] = {}
         for request_id, indices in groups.items():
             params = seqs[indices[0]].sampling
-            processor = self._logits_processors[request_id]
             if params.num_beams > 1:
-                beam_units.append((request_id, indices, params, processor))
+                input_ids = torch.tensor(
+                    [seqs[i].token_ids for i in indices], dtype=torch.long
+                )
+                logprobs = processor(
+                    input_ids, torch.log_softmax(logits[indices].float(), dim=-1)
+                )
+                self._beam_step(
+                    request_id, [seqs[i] for i in indices], params, logprobs
+                )
             else:
-                greedy_units.append((indices, processor))
+                length = len(seqs[indices[0]].token_ids)
+                buckets.setdefault(length, []).extend(indices)
 
-        for request_id, indices, params, processor in beam_units:
-            input_ids = torch.tensor(
-                [seqs[i].token_ids for i in indices], dtype=torch.long
-            )
-            # generate's beam search applies the processors to log-probs, so a
-            # masking processor does not renormalize the surviving scores
-            # (unlike the greedy path below).
-            logprobs = processor(
-                input_ids, torch.log_softmax(logits[indices].float(), dim=-1)
-            )
-            self._beam_step(request_id, [seqs[i] for i in indices], params, logprobs)
-
-        # Greedy: rows from different requests are independent, so requests that
-        # share a processor and a decoder length are served by one call.
-        buckets: dict[tuple, tuple] = {}
-        for indices, processor in greedy_units:
-            length = len(seqs[indices[0]].token_ids)
-            bucket = buckets.setdefault((id(processor), length), (processor, []))
-            bucket[1].extend(indices)
-        for processor, indices in buckets.values():
+        for indices in buckets.values():
             input_ids = torch.tensor(
                 [seqs[i].token_ids for i in indices], dtype=torch.long
             )
@@ -178,14 +152,12 @@ class LLMEngine:
     # -------------------------------------------------------------- sampling
     def _release(self, request_id: int) -> None:
         self.runner.clear_request(request_id)
-        self._logits_processors.pop(request_id, None)
 
     def _sample(self, seq: Sequence, params, logits) -> None:
         token = self.sampler(logits, params.temperature)
         seq.append_token(token)
         if token in params.eos_ids() or seq.num_completion_tokens >= params.max_tokens:
             self.scheduler.remove(seq)
-            seq.status = SequenceStatus.FINISHED
             self.block_manager.deallocate(seq)
             self._release(seq.request_id)
             self.results[seq.request_id] = seq.completion_token_ids
@@ -233,8 +205,6 @@ class LLMEngine:
             self._fork(beams[parents[r]], tokens[r], top_scores[r].item())
             for r in live_ranks
         ]
-        for child in new_finished:
-            child.status = SequenceStatus.FINISHED
 
         for beam in beams:
             self.scheduler.remove(beam)
@@ -243,7 +213,6 @@ class LLMEngine:
         self._finished_beams[request_id].extend(new_finished)
         self._prune_finished(request_id, params)
         for child in live:
-            child.status = SequenceStatus.RUNNING
             self.scheduler.add_running(child)
 
         if not live or self._should_stop(request_id, params, live):
@@ -292,7 +261,6 @@ class LLMEngine:
         for seq in live:
             self.scheduler.remove(seq)
         for seq in finished + live:
-            seq.status = SequenceStatus.FINISHED
             self.block_manager.deallocate(seq)
         self._release(request_id)
         self.results[request_id] = best.completion_token_ids if best else []

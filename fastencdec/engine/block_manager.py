@@ -9,8 +9,7 @@ from collections import deque
 
 
 class Block:
-    def __init__(self, block_id: int):
-        self.block_id = block_id
+    def __init__(self):
         self.ref_count = 0
 
 
@@ -18,7 +17,7 @@ class BlockManager:
     def __init__(self, num_blocks: int, block_size: int):
         self.num_blocks = num_blocks
         self.block_size = block_size
-        self.blocks = [Block(i) for i in range(num_blocks)]
+        self.blocks = [Block() for _ in range(num_blocks)]
         self.free_block_ids: deque[int] = deque(range(num_blocks))
         self.used_block_ids: set[int] = set()
 

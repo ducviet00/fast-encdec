@@ -56,7 +56,7 @@ fastencdec/
   outputs.py           RequestOutput / CompletionOutput (vLLM-shaped)
   sampling_params.py   SamplingParams
   engine/
-    sequence.py        Sequence / SequenceStatus
+    sequence.py        Sequence
     block_manager.py   paged blocks: allocate / fork / copy-on-write / free
     scheduler.py       continuous batching
     model_runner.py    batching, KV cache, encoder caching, forward
@@ -94,6 +94,8 @@ LLMEngine.step()                  # sample (greedy) or beam-expand; append; free
 ```
 
 `LLMEngine.run()` loops `step()` until `is_finished()`.
+`LLMEngine.generate(requests, params)` is the offline entrypoint: it adds the
+whole batch under a single `SamplingParams` and runs to completion.
 
 ## 5. Core invariants (read before changing anything)
 
@@ -136,7 +138,7 @@ LLMEngine.step()                  # sample (greedy) or beam-expand; append; free
    forward; it builds the step's `Context` and attention layers read it via
    `get_context()`. It is not thread-safe and assumes a single in-flight
    forward.
-9. **EOS.** `LLMEngine.add_request` fills `SamplingParams.eos_token_id` from the
+9. **EOS.** `LLMEngine.generate` fills `SamplingParams.eos_token_id` from the
    model config when unset. Logits processing is delegated to `transformers`'
    `LogitsProcessorList` (built in `layers/logits_processor.build_logits_processor`),
    so `min_length`, `no_repeat_ngram_size`, `repetition_penalty`, forced BOS/EOS,
@@ -144,9 +146,9 @@ LLMEngine.step()                  # sample (greedy) or beam-expand; append; free
    uses the checkpoint's `GenerationConfig` (via
    `SamplingParams.from_generation_config`) when called without params; an
    explicit `SamplingParams` fully overrides those defaults. `length_penalty`
-   ranks finished beams. Requests with equal resolved `SamplingParams` share one
-   (stateless) `LogitsProcessorList`, so greedy decoding applies the processors
-   to the whole batch in a single call.
+   ranks finished beams. The whole batch shares one (stateless)
+   `LogitsProcessorList`; greedy decoding applies it once per step to every
+   request at the same decoder length.
 10. **Multimodal inputs (Florence-2).** `Sequence.pixel_values` carries the
     request image `[3, H, W]`; `_encode` groups fresh sequences by
     `(encoder length, image shape)` and the model scatters projected visual
@@ -191,20 +193,20 @@ never hand-edit or guess.**
 
 | sweep (bf16, enc=256 unless noted) | config | ours ms | speedup vs HF |
 |---|---|---:|---:|
-| batch, beams=1 | batch=1 | 1148 | 1.01x |
-| batch, beams=1 | batch=2 | 1274 | 1.00x |
-| batch, beams=1 | batch=4 | 1512 | 0.97x |
-| batch, beams=1 | batch=8 | 2071 | 0.94x |
-| batch, beams=4 | batch=1 | 1308 | 1.17x |
-| batch, beams=4 | batch=2 | 1636 | 1.20x |
-| batch, beams=4 | batch=4 | 2316 | 1.30x |
-| batch, beams=4 | batch=8 | 3780 | 1.37x |
-| beams, batch=8 | beams=1 | 2075 | 0.94x |
-| beams, batch=8 | beams=4 | 3702 | 1.40x |
-| dtype, batch=8, beams=4 | float32 | 6921 | 1.96x |
-| dtype, batch=8, beams=4 | bfloat16 | 3742 | 1.38x |
-| enc length, batch=8, beams=1 | enc=128 | 1656 | 0.92x |
-| enc length, batch=8, beams=1 | enc=256 | 2091 | 0.92x |
+| batch, beams=1 | batch=1 | 1243 | 0.97x |
+| batch, beams=1 | batch=2 | 1320 | 0.99x |
+| batch, beams=1 | batch=4 | 1542 | 0.97x |
+| batch, beams=1 | batch=8 | 2079 | 0.94x |
+| batch, beams=4 | batch=1 | 1346 | 1.17x |
+| batch, beams=4 | batch=2 | 1692 | 1.29x |
+| batch, beams=4 | batch=4 | 2469 | 1.31x |
+| batch, beams=4 | batch=8 | 3962 | 1.37x |
+| beams, batch=8 | beams=1 | 2238 | 0.93x |
+| beams, batch=8 | beams=4 | 4023 | 1.36x |
+| dtype, batch=8, beams=4 | float32 | 6882 | 2.03x |
+| dtype, batch=8, beams=4 | bfloat16 | 3762 | 1.39x |
+| enc length, batch=8, beams=1 | enc=128 | 1679 | 0.93x |
+| enc length, batch=8, beams=1 | enc=256 | 2095 | 0.94x |
 
 ## 7. Gotchas
 

@@ -87,7 +87,6 @@ class LLM:
             self.generation_config, self.eos_token_id
         )
         config = Config(
-            model=model_path,
             num_blocks=num_blocks,
             block_size=block_size,
             max_num_seqs=max_num_seqs,
@@ -148,6 +147,7 @@ class LLM:
             eos_ids = {self.eos_token_id}
 
         records = []
+        engine_requests = []
         for item in prompts:
             encoder_prompt, encoder_ids, image = self._parse_prompt(item)
             decoder_ids = [self.decoder_start_token_id]
@@ -177,15 +177,15 @@ class LLM:
                     )["input_ids"]
                 pixel_values = None
 
-            request_id = self.engine.add_request(
-                encoder_ids, decoder_ids, sampling_params, pixel_values=pixel_values
-            )
-            records.append((request_id, encoder_prompt, encoder_ids, decoder_ids))
+            records.append((encoder_prompt, encoder_ids, decoder_ids))
+            engine_requests.append((encoder_ids, decoder_ids, pixel_values))
 
-        self.engine.run()
+        request_ids = self.engine.generate(engine_requests, sampling_params)
 
         results = []
-        for request_id, encoder_prompt, encoder_ids, decoder_ids in records:
+        for request_id, (encoder_prompt, encoder_ids, decoder_ids) in zip(
+            request_ids, records
+        ):
             token_ids = self.engine.results[request_id]
             finished = bool(token_ids) and token_ids[-1] in eos_ids
             results.append(
