@@ -21,9 +21,10 @@ HuggingFace BART reference; only the attention kernels differ.
 
 **Florence-2** (`fastencdec/models/florence2.py`) reuses that paged BART as its
 language model and pairs it with the DaViT vision encoder
-(`Florence2VisionBackbone`) and `Florence2MultiModalProjector`, both imported
-verbatim from `transformers`. Visual tokens are spliced into the encoder input
-at the `<image>` placeholders; the decoder is unchanged.
+(`Florence2VisionBackbone`) and `Florence2MultiModalProjector`, vendored in
+`fastencdec/models/davit.py` (an optimized copy of the `transformers`
+reference). Visual tokens are spliced into the encoder input at the `<image>`
+placeholders; the decoder is unchanged.
 
 ### Non-goals / do not add without discussion
 
@@ -69,6 +70,7 @@ fastencdec/
     sampler.py         greedy / multinomial sampling (Sampler nn.Module)
   models/
     bart.py            BART model (encoder / decoder / cross-attn)
+    davit.py           vendored + optimized DaViT vision tower + projector
     florence2.py       Florence-2 (DaViT + projector + BART language model)
   utils/
     context.py         global per-step Context read by attention layers
@@ -211,20 +213,34 @@ never hand-edit or guess.**
 
 | sweep (bf16, enc=256 unless noted) | config | ours ms | speedup vs HF |
 |---|---|---:|---:|
-| batch, beams=1 | batch=1 | 1059 | 1.13x |
-| batch, beams=1 | batch=2 | 1131 | 1.16x |
-| batch, beams=1 | batch=4 | 1151 | 1.29x |
-| batch, beams=1 | batch=8 | 1533 | 1.28x |
+| batch, beams=1 | batch=1 | 1057 | 1.13x |
+| batch, beams=1 | batch=2 | 1059 | 1.23x |
+| batch, beams=1 | batch=4 | 1182 | 1.26x |
+| batch, beams=1 | batch=8 | 1532 | 1.28x |
 | batch, beams=4 | batch=1 | 1112 | 1.37x |
-| batch, beams=4 | batch=2 | 1248 | 1.56x |
-| batch, beams=4 | batch=4 | 1532 | 1.94x |
-| batch, beams=4 | batch=8 | 2205 | 2.35x |
-| beams, batch=8 | beams=1 | 1540 | 1.27x |
-| beams, batch=8 | beams=4 | 2216 | 2.36x |
-| dtype, batch=8, beams=4 | float32 | 5924 | 2.34x |
-| dtype, batch=8, beams=4 | bfloat16 | 2175 | 2.39x |
-| enc length, batch=8, beams=1 | enc=128 | 1317 | 1.19x |
-| enc length, batch=8, beams=1 | enc=256 | 1539 | 1.39x |
+| batch, beams=4 | batch=2 | 1271 | 1.55x |
+| batch, beams=4 | batch=4 | 1563 | 1.93x |
+| batch, beams=4 | batch=8 | 2246 | 2.30x |
+| beams, batch=8 | beams=1 | 1541 | 1.29x |
+| beams, batch=8 | beams=4 | 2242 | 2.35x |
+| dtype, batch=8, beams=4 | float32 | 5990 | 2.26x |
+| dtype, batch=8, beams=4 | bfloat16 | 2187 | 2.36x |
+| enc length, batch=8, beams=1 | enc=128 | 1377 | 1.14x |
+| enc length, batch=8, beams=1 | enc=256 | 1719 | 1.15x |
+
+Snapshot of `PYTHONPATH=. $P benchmarks/benchmark_florence2.py --quick`
+(`florence-community/Florence-2-base`, bf16 for both engines, 8 threads,
+640×480 image → 768px, `max_tokens=96` / `beam_tokens=64`; vision tower +
+projector on `torch.compile`, the new default). Refresh from a real run.
+
+| sweep (bf16) | config | ours ms | speedup vs HF |
+|---|---|---:|---:|
+| greedy batch | batch=3 | 1913 | 1.32x |
+| greedy batch | batch=6 | 3045 | 1.44x |
+| beam (batch=3) | beams=1 | 1669 | 1.28x |
+| beam (batch=3) | beams=3 | 1864 | 1.57x |
+| continuous (N=6) | w=3 | 3413 | 1.30x |
+| continuous (N=6) | w=6 | 3022 | 1.47x |
 
 ## 7. Gotchas
 
@@ -269,11 +285,13 @@ never hand-edit or guess.**
   `hf-tiny-v2/...` tiny checkpoint is inconsistent (config `image_token_id=4`
   vs tokenizer `51289`, and its vision 2D position embeddings overflow at the
   processor's 768px), so `tests/test_florence2.py` builds inputs by hand.
-- **`compile_mm_encoder=True`** (opt-in) `torch.compile`s the vision tower +
-  projector (~1.3-1.5x there, ~1.15x end-to-end). It is off by default because
-  inductor's BF16 fusion shifts outputs (greedy tokens can diverge from HF) and
-  it compiles once per batch size. `dynamic=True` compiles fast but gives no
-  speedup; fp32 compile is exact but slower than plain BF16 eager.
+- **`compile_mm_encoder`** (on by default) `torch.compile`s the vision tower +
+  projector (~1.2x there, ~1.13x end-to-end after the vendored eager tower).
+  Inductor's BF16 fusion shifts outputs, so greedy tokens can diverge from HF;
+  pass `compile_mm_encoder=False` for exact parity or to avoid the per-shape
+  compile latency (it compiles once per batch size on first use). `dynamic=True`
+  compiles slowly and gives no speedup; fp32 compile is near-exact but slower
+  than plain BF16 eager.
 - **Attention backend.** `attn_backend="auto"` uses the vendored vLLM kernel
   when it compiles (the default), else SDPA. The kernel only handles
   `head_dim ∈ {32,48,64,80,96,112,128,160,192,224,256,512}`; other shapes (e.g.
@@ -311,7 +329,8 @@ never hand-edit or guess.**
 - Pure PyTorch plus the vendored vLLM CPU attention kernel in `csrc/` (approved;
   Apache-2.0). No new third-party dependencies without discussion. (`Pillow` was
   approved for Florence-2 image processing; the DaViT vision tower and projector
-  are imported from `transformers` rather than copied.)
+  are vendored in `fastencdec/models/davit.py`, an optimized copy of the
+  `transformers` reference.)
 - After changes: run `python -m compileall fastencdec`,
   `tests/test_parity.py`, `tests/test_attn_backend.py`,
   `tests/test_florence2.py`, `tests/test_beam.py`, `uvx ruff check` /

@@ -180,9 +180,10 @@ def main():
     parser.add_argument("--repeats", type=int, default=2)
     parser.add_argument("--quick", action="store_true")
     parser.add_argument(
-        "--compile-mm-encoder",
-        action="store_true",
-        help="torch.compile the vision tower + projector (opt-in)",
+        "--no-compile-mm-encoder",
+        dest="compile_mm_encoder",
+        action="store_false",
+        help="disable torch.compile of the vision tower + projector (default: enabled)",
     )
     parser.add_argument("--json", default=None)
     args = parser.parse_args()
@@ -191,7 +192,10 @@ def main():
         args.batches, args.beams = "3,6", "1,3"
         args.requests, args.windows = 6, "3,6"
         args.max_tokens, args.beam_tokens = 96, 64
-        args.warmup, args.repeats = 0, 1
+        args.repeats = 1
+    # torch.compile fires on the first call, so always warm up at least once.
+    if args.compile_mm_encoder and args.warmup < 1:
+        args.warmup = 1
 
     dtype = {"float32": torch.float32, "bfloat16": torch.bfloat16}[args.dtype]
     batches = [int(b) for b in args.batches.split(",") if b]

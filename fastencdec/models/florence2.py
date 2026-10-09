@@ -1,10 +1,11 @@
 """Florence-2: DaViT vision encoder + multimodal projector + BART language model.
 
 Only the language model is ours (:mod:`fastencdec.models.bart`); the DaViT
-vision tower and the multimodal projector are imported verbatim from
-``transformers`` so the HuggingFace checkpoint loads 1:1.  The module layout
-mirrors HF (``model.vision_tower``, ``model.multi_modal_projector``,
-``model.language_model``, ``lm_head``) so the same weight loader works.
+vision tower and projector are vendored in :mod:`fastencdec.models.davit`
+(an optimized copy of the reference implementation) so the HuggingFace
+checkpoint loads 1:1.  The module layout mirrors HF (``model.vision_tower``,
+``model.multi_modal_projector``, ``model.language_model``, ``lm_head``) so the
+same weight loader works.
 
 The image-side graph runs once per request in the encoder; the decoder is the
 standard paged BART decoder.  Visual tokens are produced by the projector and
@@ -14,12 +15,9 @@ in the reference implementation.
 
 import torch
 from torch import nn
-from transformers.models.florence2.modeling_florence2 import (
-    Florence2MultiModalProjector,
-    Florence2VisionBackbone,
-)
 
 from .bart import BartModel
+from .davit import Florence2MultiModalProjector, Florence2VisionBackbone
 
 
 class Florence2Model(nn.Module):
@@ -56,8 +54,7 @@ class Florence2ForConditionalGeneration(nn.Module):
     @torch.no_grad()
     def get_image_features(self, pixel_values: torch.Tensor) -> torch.Tensor:
         """``[B, 3, H, W]`` -> visual tokens ``[B, 1 + H' * W', d_model]``."""
-        image_outputs = self.model.vision_tower(pixel_values)
-        return self.model.multi_modal_projector(image_outputs.last_hidden_state)
+        return self.model.multi_modal_projector(self.model.vision_tower(pixel_values))
 
     def compile_mm_encoder(self, mode: str = "default", dynamic: bool = False) -> None:
         """Opt in to ``torch.compile`` for the vision tower + projector.

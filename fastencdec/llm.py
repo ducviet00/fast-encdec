@@ -43,9 +43,10 @@ class LLM:
             when it builds, else the PyTorch SDPA path), ``"vllm"`` (require
             it) or ``"sdpa"`` (force the PyTorch path).
         compile_mm_encoder: ``torch.compile`` the Florence-2 vision tower +
-            projector (~1.3-1.5x there).  Ignored for BART.  Off by default:
-            it changes the BF16 outputs slightly and compiles once per batch
-            size on first use.
+            projector (~1.2x there).  Ignored for BART.  On by default: it
+            changes the BF16 outputs slightly and compiles once per batch size
+            on first use, so pass ``False`` for exact HF parity or to avoid the
+            per-shape compile latency.
     """
 
     def __init__(
@@ -57,7 +58,7 @@ class LLM:
         max_num_seqs: int = 32,
         dtype: torch.dtype = torch.float32,
         attn_backend: str = "auto",
-        compile_mm_encoder: bool = False,
+        compile_mm_encoder: bool = True,
     ):
         hf_config = AutoConfig.from_pretrained(model_path)
         self.multimodal = hf_config.model_type == "florence2"
