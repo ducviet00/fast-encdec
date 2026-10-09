@@ -13,9 +13,11 @@ in the reference implementation.
 """
 
 import torch
-import torch.nn as nn
+from torch import nn
 from transformers.models.florence2.modeling_florence2 import (
-    Florence2MultiModalProjector, Florence2VisionBackbone)
+    Florence2MultiModalProjector,
+    Florence2VisionBackbone,
+)
 
 from .bart import BartModel
 
@@ -36,8 +38,8 @@ class Florence2ForConditionalGeneration(nn.Module):
         self.config = config
         self.model = Florence2Model(config)
         self.lm_head = nn.Linear(
-            config.text_config.d_model, config.text_config.vocab_size,
-            bias=False)
+            config.text_config.d_model, config.text_config.vocab_size, bias=False
+        )
         if config.text_config.tie_word_embeddings:
             self.lm_head.weight = self.model.language_model.shared.weight
 
@@ -65,25 +67,28 @@ class Florence2ForConditionalGeneration(nn.Module):
         default; the decoder is untouched.
         """
         self.get_image_features = torch.compile(
-            self.get_image_features, mode=mode, dynamic=dynamic)
+            self.get_image_features, mode=mode, dynamic=dynamic
+        )
 
     @torch.no_grad()
-    def encode(self, encoder_input_ids: torch.Tensor,
-               pixel_values: torch.Tensor | None = None) -> torch.Tensor:
+    def encode(
+        self, encoder_input_ids: torch.Tensor, pixel_values: torch.Tensor | None = None
+    ) -> torch.Tensor:
         """Run the encoder with visual tokens scattered into image slots."""
         language_model = self.model.language_model
         positions = torch.arange(
-            encoder_input_ids.shape[1], device=encoder_input_ids.device)
+            encoder_input_ids.shape[1], device=encoder_input_ids.device
+        )
         positions = positions.unsqueeze(0).expand_as(encoder_input_ids)
         inputs_embeds = language_model.shared(encoder_input_ids)
         if pixel_values is not None:
             image_features = self.get_image_features(pixel_values)
             image_features = image_features.to(inputs_embeds.dtype)
-            image_mask = (encoder_input_ids == self.config.image_token_id)
+            image_mask = encoder_input_ids == self.config.image_token_id
             inputs_embeds = inputs_embeds.masked_scatter(
-                image_mask.unsqueeze(-1), image_features)
-        return language_model.encoder(positions=positions,
-                                      inputs_embeds=inputs_embeds)
+                image_mask.unsqueeze(-1), image_features
+            )
+        return language_model.encoder(positions=positions, inputs_embeds=inputs_embeds)
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         return self.lm_head(hidden_states)

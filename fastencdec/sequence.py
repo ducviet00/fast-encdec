@@ -60,4 +60,4 @@ class Sequence:
         return len(self.token_ids) - len(self.decoder_prompt_ids)
 
     def generated_ids(self) -> list[int]:
-        return self.token_ids[len(self.decoder_prompt_ids):]
+        return self.token_ids[len(self.decoder_prompt_ids) :]

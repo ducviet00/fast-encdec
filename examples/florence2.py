@@ -19,8 +19,9 @@ def make_image() -> Image.Image:
 
 def main():
     image = make_image()
-    llm = Florence2LLM("florence-community/Florence-2-base",
-                       num_blocks=1024, block_size=16)
+    llm = Florence2LLM(
+        "florence-community/Florence-2-base", num_blocks=1024, block_size=16
+    )
 
     # One image, several tasks: the image is encoded once per request and the
     # results are decoded greedily.

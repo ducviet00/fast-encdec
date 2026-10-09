@@ -26,21 +26,31 @@ class LLM:
         dtype: ``torch.float32`` or ``torch.bfloat16``.
     """
 
-    def __init__(self, model_path: str, *, num_blocks: int = 512,
-                 block_size: int = 16, max_num_seqs: int = 32,
-                 dtype: torch.dtype = torch.float32):
+    def __init__(
+        self,
+        model_path: str,
+        *,
+        num_blocks: int = 512,
+        block_size: int = 16,
+        max_num_seqs: int = 32,
+        dtype: torch.dtype = torch.float32,
+    ):
         self.tokenizer = AutoTokenizer.from_pretrained(model_path)
         config = AutoConfig.from_pretrained(model_path)
         if config.model_type == "florence2":
             raise ValueError(
-                "use Florence2LLM for Florence-2 checkpoints (LLM is BART-only)")
+                "use Florence2LLM for Florence-2 checkpoints (LLM is BART-only)"
+            )
         self.model = BartForConditionalGeneration(config)
         load_hf_weights(self.model, model_path)
         self.model.to(dtype)
 
         self.engine = LLMEngine(
-            self.model, BlockManager(num_blocks, block_size),
-            max_num_seqs=max_num_seqs, dtype=dtype)
+            self.model,
+            BlockManager(num_blocks, block_size),
+            max_num_seqs=max_num_seqs,
+            dtype=dtype,
+        )
         self.decoder_start_token_id = config.decoder_start_token_id
         self.eos_token_id = config.eos_token_id
 
@@ -48,8 +58,12 @@ class LLM:
         return self.tokenizer.decode(token_ids, skip_special_tokens=True)
 
     @torch.no_grad()
-    def generate(self, encoder_prompts, sampling_params: SamplingParams | None = None,
-                 decoder_prompts: list[str] | None = None) -> list[str]:
+    def generate(
+        self,
+        encoder_prompts,
+        sampling_params: SamplingParams | None = None,
+        decoder_prompts: list[str] | None = None,
+    ) -> list[str]:
         """Summarize/translate ``encoder_prompts`` (str or list of str)."""
         if isinstance(encoder_prompts, str):
             encoder_prompts = [encoder_prompts]
@@ -59,17 +73,20 @@ class LLM:
             sampling_params.eos_token_id = self.eos_token_id
 
         encoder_ids = self.tokenizer(
-            encoder_prompts, add_special_tokens=True, padding=False)["input_ids"]
+            encoder_prompts, add_special_tokens=True, padding=False
+        )["input_ids"]
 
         request_ids = []
         for i, encoder_id in enumerate(encoder_ids):
             if decoder_prompts is not None:
                 decoder_ids = self.tokenizer(
-                    decoder_prompts[i], add_special_tokens=False)["input_ids"]
+                    decoder_prompts[i], add_special_tokens=False
+                )["input_ids"]
             else:
                 decoder_ids = [self.decoder_start_token_id]
             request_ids.append(
-                self.engine.add_request(encoder_id, decoder_ids, sampling_params))
+                self.engine.add_request(encoder_id, decoder_ids, sampling_params)
+            )
 
         self.engine.run()
         return [self._decode(self.engine.results[rid]) for rid in request_ids]
@@ -95,11 +112,18 @@ class Florence2LLM:
             outputs slightly and compiles once per batch size on first use.
     """
 
-    def __init__(self, model_path: str, *, num_blocks: int = 512,
-                 block_size: int = 16, max_num_seqs: int = 32,
-                 dtype: torch.dtype = torch.float32,
-                 compile_mm_encoder: bool = False):
-        from transformers import AutoProcessor, Florence2ForConditionalGeneration as HFFlorence2
+    def __init__(
+        self,
+        model_path: str,
+        *,
+        num_blocks: int = 512,
+        block_size: int = 16,
+        max_num_seqs: int = 32,
+        dtype: torch.dtype = torch.float32,
+        compile_mm_encoder: bool = False,
+    ):
+        from transformers import AutoProcessor
+        from transformers import Florence2ForConditionalGeneration as HFFlorence2
 
         self.processor = AutoProcessor.from_pretrained(model_path)
         config = AutoConfig.from_pretrained(model_path)
@@ -110,14 +134,21 @@ class Florence2LLM:
             self.model.compile_mm_encoder()
 
         self.engine = LLMEngine(
-            self.model, BlockManager(num_blocks, block_size),
-            max_num_seqs=max_num_seqs, dtype=dtype)
+            self.model,
+            BlockManager(num_blocks, block_size),
+            max_num_seqs=max_num_seqs,
+            dtype=dtype,
+        )
         self.decoder_start_token_id = config.text_config.decoder_start_token_id
         self.eos_token_id = config.text_config.eos_token_id
 
     @torch.no_grad()
-    def generate(self, prompts, images, sampling_params: SamplingParams | None = None,
-                 ) -> list[str]:
+    def generate(
+        self,
+        prompts,
+        images,
+        sampling_params: SamplingParams | None = None,
+    ) -> list[str]:
         """Run ``prompts`` (task strings like ``"<CAPTION>"``) on ``images``.
 
         ``prompts``/``images`` may be single items or equal-length lists; a
@@ -139,12 +170,18 @@ class Florence2LLM:
         request_ids = []
         for prompt, image in zip(prompts, images):
             inputs = self.processor(text=prompt, images=image, return_tensors="pt")
-            request_ids.append(self.engine.add_request(
-                inputs["input_ids"][0].tolist(),
-                [self.decoder_start_token_id], sampling_params,
-                pixel_values=inputs["pixel_values"][0]))
+            request_ids.append(
+                self.engine.add_request(
+                    inputs["input_ids"][0].tolist(),
+                    [self.decoder_start_token_id],
+                    sampling_params,
+                    pixel_values=inputs["pixel_values"][0],
+                )
+            )
 
         self.engine.run()
         tokenizer = self.processor.tokenizer
-        return [tokenizer.decode(self.engine.results[rid], skip_special_tokens=True)
-                for rid in request_ids]
+        return [
+            tokenizer.decode(self.engine.results[rid], skip_special_tokens=True)
+            for rid in request_ids
+        ]

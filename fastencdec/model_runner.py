@@ -17,8 +17,12 @@ class ModelRunner:
         # [num_blocks, block_size, num_heads, head_dim].
         self.cache_layers = [layer.self_attn for layer in self.decoder_layers]
         for layer in self.cache_layers:
-            shape = (block_manager.num_blocks, block_manager.block_size,
-                     layer.num_heads, layer.head_dim)
+            shape = (
+                block_manager.num_blocks,
+                block_manager.block_size,
+                layer.num_heads,
+                layer.head_dim,
+            )
             layer.k_cache = torch.zeros(shape, dtype=dtype)
             layer.v_cache = torch.zeros(shape, dtype=dtype)
 
@@ -35,8 +39,9 @@ class ModelRunner:
         """
         groups: dict[tuple, list] = {}
         for seq in seqs:
-            pixel_shape = (None if seq.pixel_values is None
-                           else tuple(seq.pixel_values.shape))
+            pixel_shape = (
+                None if seq.pixel_values is None else tuple(seq.pixel_values.shape)
+            )
             groups.setdefault((len(seq.encoder_token_ids), pixel_shape), []).append(seq)
         for group in groups.values():
             ids = torch.tensor([s.encoder_token_ids for s in group], dtype=torch.long)
@@ -96,7 +101,8 @@ class ModelRunner:
             self._encode(fresh)
 
         input_ids, positions, slot_mapping, qsl, context_lens, block_tables = (
-            self._prepare(seqs))
+            self._prepare(seqs)
+        )
 
         context = Context(
             slot_mapping=slot_mapping,
@@ -109,6 +115,7 @@ class ModelRunner:
         set_context(context)
 
         hidden = self.model.decoder(input_ids, positions)
-        last = torch.tensor([qsl[i + 1] - 1 for i in range(len(seqs))],
-                            dtype=torch.long)
+        last = torch.tensor(
+            [qsl[i + 1] - 1 for i in range(len(seqs))], dtype=torch.long
+        )
         return self.model.compute_logits(hidden.index_select(0, last))

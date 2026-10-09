@@ -22,6 +22,7 @@ def load_hf_weights(model, model_path: str, hf_model_cls=None):
     """
     if hf_model_cls is None:
         from transformers import AutoModelForSeq2SeqLM
+
         hf_model_cls = AutoModelForSeq2SeqLM
 
     hf_model = hf_model_cls.from_pretrained(model_path, dtype=torch.float32)

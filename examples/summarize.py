@@ -5,12 +5,16 @@ import time
 from fastencdec import LLM, SamplingParams
 
 ARTICLES = [
-    "The quick brown fox jumps over the lazy dog. It was a sunny afternoon and "
-    "the fox had been running through the meadow for hours, chasing butterflies "
-    "and enjoying the warm weather.",
-    "Scientists at the university announced on Monday that they had discovered "
-    "a new species of butterfly in the Amazon rainforest. The insect, which has "
-    "bright blue wings, was found during a three-week expedition.",
+    (
+        "The quick brown fox jumps over the lazy dog. It was a sunny afternoon and "
+        "the fox had been running through the meadow for hours, chasing butterflies "
+        "and enjoying the warm weather."
+    ),
+    (
+        "Scientists at the university announced on Monday that they had discovered "
+        "a new species of butterfly in the Amazon rainforest. The insect, which has "
+        "bright blue wings, was found during a three-week expedition."
+    ),
 ]
 
 
@@ -21,8 +25,12 @@ def main():
         # bart-large-cnn expects these generation heuristics; without them raw
         # decoding collapses to short/repetitive output.
         params = SamplingParams(
-            max_tokens=48, num_beams=beams, length_penalty=2.0,
-            no_repeat_ngram_size=3, min_length=8)
+            max_tokens=48,
+            num_beams=beams,
+            length_penalty=2.0,
+            no_repeat_ngram_size=3,
+            min_length=8,
+        )
         start = time.perf_counter()
         outputs = llm.generate(ARTICLES, params)
         elapsed = time.perf_counter() - start

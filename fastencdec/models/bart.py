@@ -17,8 +17,8 @@ HuggingFace weights load 1:1.
 import math
 
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
+from torch import nn
 
 from ..attention import cached_cross_attention, paged_attention, store_kvcache
 from ..context import get_context
@@ -40,8 +40,13 @@ class BartLearnedPositionalEmbedding(nn.Embedding):
 class BartScaledWordEmbedding(nn.Embedding):
     """Embeddings scaled by ``sqrt(d_model)`` when ``scale_embedding`` is set."""
 
-    def __init__(self, num_embeddings: int, embedding_dim: int,
-                 padding_idx: int, embed_scale: float = 1.0):
+    def __init__(
+        self,
+        num_embeddings: int,
+        embedding_dim: int,
+        padding_idx: int,
+        embed_scale: float = 1.0,
+    ):
         super().__init__(num_embeddings, embedding_dim, padding_idx)
         self.embed_scale = embed_scale
 
@@ -52,8 +57,14 @@ class BartScaledWordEmbedding(nn.Embedding):
 class BartEncoderSelfAttention(nn.Module):
     """Non-causal multi-head self-attention for the encoder (no cache)."""
 
-    def __init__(self, embed_dim: int, num_heads: int, bias: bool = True,
-                 config=None, layer_idx: int | None = None):
+    def __init__(
+        self,
+        embed_dim: int,
+        num_heads: int,
+        bias: bool = True,
+        config=None,
+        layer_idx: int | None = None,
+    ):
         super().__init__()
         self.embed_dim = embed_dim
         self.num_heads = num_heads
@@ -81,8 +92,14 @@ class BartEncoderSelfAttention(nn.Module):
 class BartDecoderSelfAttention(nn.Module):
     """Causal multi-head self-attention backed by the paged KV cache."""
 
-    def __init__(self, embed_dim: int, num_heads: int, bias: bool = True,
-                 config=None, layer_idx: int | None = None):
+    def __init__(
+        self,
+        embed_dim: int,
+        num_heads: int,
+        bias: bool = True,
+        config=None,
+        layer_idx: int | None = None,
+    ):
         super().__init__()
         self.embed_dim = embed_dim
         self.num_heads = num_heads
@@ -117,8 +134,14 @@ class BartDecoderSelfAttention(nn.Module):
 class BartDecoderCrossAttention(nn.Module):
     """Cross-attention using encoder K/V cached once per request."""
 
-    def __init__(self, embed_dim: int, num_heads: int, bias: bool = True,
-                 config=None, layer_idx: int | None = None):
+    def __init__(
+        self,
+        embed_dim: int,
+        num_heads: int,
+        bias: bool = True,
+        config=None,
+        layer_idx: int | None = None,
+    ):
         super().__init__()
         self.embed_dim = embed_dim
         self.num_heads = num_heads
@@ -150,8 +173,11 @@ class BartEncoderLayer(nn.Module):
         super().__init__()
         self.embed_dim = config.d_model
         self.self_attn = BartEncoderSelfAttention(
-            self.embed_dim, config.encoder_attention_heads, config=config,
-            layer_idx=layer_idx)
+            self.embed_dim,
+            config.encoder_attention_heads,
+            config=config,
+            layer_idx=layer_idx,
+        )
         self.self_attn_layer_norm = nn.LayerNorm(self.embed_dim)
         self.activation_fn = ACT2FN.get(config.activation_function, F.gelu)
         self.fc1 = nn.Linear(self.embed_dim, config.encoder_ffn_dim)
@@ -174,13 +200,19 @@ class BartDecoderLayer(nn.Module):
         super().__init__()
         self.embed_dim = config.d_model
         self.self_attn = BartDecoderSelfAttention(
-            self.embed_dim, config.decoder_attention_heads, config=config,
-            layer_idx=layer_idx)
+            self.embed_dim,
+            config.decoder_attention_heads,
+            config=config,
+            layer_idx=layer_idx,
+        )
         self.self_attn_layer_norm = nn.LayerNorm(self.embed_dim)
         self.activation_fn = ACT2FN.get(config.activation_function, F.gelu)
         self.encoder_attn = BartDecoderCrossAttention(
-            self.embed_dim, config.decoder_attention_heads, config=config,
-            layer_idx=layer_idx)
+            self.embed_dim,
+            config.decoder_attention_heads,
+            config=config,
+            layer_idx=layer_idx,
+        )
         self.encoder_attn_layer_norm = nn.LayerNorm(self.embed_dim)
         self.fc1 = nn.Linear(self.embed_dim, config.decoder_ffn_dim)
         self.fc2 = nn.Linear(config.decoder_ffn_dim, self.embed_dim)
@@ -209,18 +241,25 @@ class BartEncoder(nn.Module):
         self.embed_scale = math.sqrt(embed_dim) if config.scale_embedding else 1.0
 
         self.embed_tokens = BartScaledWordEmbedding(
-            config.vocab_size, embed_dim, self.padding_idx,
-            embed_scale=self.embed_scale)
+            config.vocab_size, embed_dim, self.padding_idx, embed_scale=self.embed_scale
+        )
         self.embed_positions = BartLearnedPositionalEmbedding(
-            config.max_position_embeddings, embed_dim)
+            config.max_position_embeddings, embed_dim
+        )
         self.layers = nn.ModuleList(
-            [BartEncoderLayer(config, layer_idx=i)
-             for i in range(config.encoder_layers)])
+            [
+                BartEncoderLayer(config, layer_idx=i)
+                for i in range(config.encoder_layers)
+            ]
+        )
         self.layernorm_embedding = nn.LayerNorm(embed_dim)
 
-    def forward(self, input_ids: torch.Tensor | None = None,
-                positions: torch.Tensor | None = None,
-                inputs_embeds: torch.Tensor | None = None) -> torch.Tensor:
+    def forward(
+        self,
+        input_ids: torch.Tensor | None = None,
+        positions: torch.Tensor | None = None,
+        inputs_embeds: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         # ``inputs_embeds`` is used by multimodal models (Florence-2) that mix
         # projected image features into the token embeddings before encoding.
         if inputs_embeds is None:
@@ -239,13 +278,20 @@ class BartDecoder(nn.Module):
         self.embed_scale = math.sqrt(config.d_model) if config.scale_embedding else 1.0
 
         self.embed_tokens = BartScaledWordEmbedding(
-            config.vocab_size, config.d_model, self.padding_idx,
-            embed_scale=self.embed_scale)
+            config.vocab_size,
+            config.d_model,
+            self.padding_idx,
+            embed_scale=self.embed_scale,
+        )
         self.embed_positions = BartLearnedPositionalEmbedding(
-            config.max_position_embeddings, config.d_model)
+            config.max_position_embeddings, config.d_model
+        )
         self.layers = nn.ModuleList(
-            [BartDecoderLayer(config, layer_idx=i)
-             for i in range(config.decoder_layers)])
+            [
+                BartDecoderLayer(config, layer_idx=i)
+                for i in range(config.decoder_layers)
+            ]
+        )
         self.layernorm_embedding = nn.LayerNorm(config.d_model)
 
     def forward(self, input_ids: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
@@ -261,8 +307,11 @@ class BartModel(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.shared = BartScaledWordEmbedding(
-            config.vocab_size, config.d_model, config.pad_token_id,
-            embed_scale=math.sqrt(config.d_model) if config.scale_embedding else 1.0)
+            config.vocab_size,
+            config.d_model,
+            config.pad_token_id,
+            embed_scale=math.sqrt(config.d_model) if config.scale_embedding else 1.0,
+        )
         self.encoder = BartEncoder(config)
         self.decoder = BartDecoder(config)
 
@@ -278,10 +327,11 @@ class BartForConditionalGeneration(nn.Module):
         self.config = config
         self.model = BartModel(config)
         self.register_buffer(
-            "final_logits_bias",
-            torch.zeros(1, self.model.shared.num_embeddings))
+            "final_logits_bias", torch.zeros(1, self.model.shared.num_embeddings)
+        )
         self.lm_head = nn.Linear(
-            config.d_model, self.model.shared.num_embeddings, bias=False)
+            config.d_model, self.model.shared.num_embeddings, bias=False
+        )
         if config.tie_word_embeddings:
             self.lm_head.weight = self.model.shared.weight
 
@@ -289,7 +339,8 @@ class BartForConditionalGeneration(nn.Module):
     def encode(self, encoder_input_ids: torch.Tensor) -> torch.Tensor:
         """Run the encoder for a batch of ids [B, S] -> hidden [B, S, D]."""
         positions = torch.arange(
-            encoder_input_ids.shape[1], device=encoder_input_ids.device)
+            encoder_input_ids.shape[1], device=encoder_input_ids.device
+        )
         positions = positions.unsqueeze(0).expand_as(encoder_input_ids)
         return self.model.encoder(encoder_input_ids, positions)
 

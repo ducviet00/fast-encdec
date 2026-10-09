@@ -7,10 +7,10 @@ def banned_tokens(token_ids: list[int], ngram_size: int) -> set[int]:
     """Tokens that would repeat the last (ngram_size - 1) tokens."""
     if ngram_size <= 1 or len(token_ids) < ngram_size:
         return set()
-    prefix = tuple(token_ids[-(ngram_size - 1):])
+    prefix = tuple(token_ids[-(ngram_size - 1) :])
     banned = set()
     for i in range(len(token_ids) - ngram_size + 1):
-        if tuple(token_ids[i:i + ngram_size - 1]) == prefix:
+        if tuple(token_ids[i : i + ngram_size - 1]) == prefix:
             banned.add(token_ids[i + ngram_size - 1])
     return banned
 

@@ -48,14 +48,19 @@ llm = LLM("facebook/bart-large-cnn", num_blocks=256, block_size=16)
 print(llm.generate("The quick brown fox ...", SamplingParams(max_tokens=32)))
 
 # beam search
-print(llm.generate(
-    "The quick brown fox ...",
-    SamplingParams(max_tokens=32, num_beams=4),
-))
+print(
+    llm.generate(
+        "The quick brown fox ...",
+        SamplingParams(max_tokens=32, num_beams=4),
+    )
+)
 
 # batched (continuous batching): different-length inputs run together
-print(llm.generate([article_a, article_b, article_c],
-                   SamplingParams(max_tokens=32, num_beams=4)))
+print(
+    llm.generate(
+        [article_a, article_b, article_c], SamplingParams(max_tokens=32, num_beams=4)
+    )
+)
 ```
 
 `dtype=torch.bfloat16` halves memory and speeds up the GEMMs on CPUs with
@@ -69,8 +74,9 @@ explicitly when they matter — `bart-large-cnn` collapses to short/repetitive
 output without them:
 
 ```python
-SamplingParams(max_tokens=48, num_beams=4, length_penalty=2.0,
-               no_repeat_ngram_size=3, min_length=8)
+SamplingParams(
+    max_tokens=48, num_beams=4, length_penalty=2.0, no_repeat_ngram_size=3, min_length=8
+)
 ```
 
 `length_penalty` is applied when ranking finished hypotheses, `min_length` masks
@@ -90,8 +96,7 @@ encoder input at the `<image>` placeholders.
 from PIL import Image
 from fastencdec import Florence2LLM, SamplingParams
 
-llm = Florence2LLM("florence-community/Florence-2-base",
-                   num_blocks=1024, block_size=16)
+llm = Florence2LLM("florence-community/Florence-2-base", num_blocks=1024, block_size=16)
 
 image = Image.open("photo.jpg")
 print(llm.generate("<CAPTION>", image, SamplingParams(max_tokens=32)))

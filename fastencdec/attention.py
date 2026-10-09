@@ -11,22 +11,34 @@ import torch.nn.functional as F
 from .context import get_context
 
 
-def store_kvcache(key: torch.Tensor, value: torch.Tensor, k_cache: torch.Tensor,
-                  v_cache: torch.Tensor, slot_mapping) -> None:
+def store_kvcache(
+    key: torch.Tensor,
+    value: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    slot_mapping,
+) -> None:
     """Scatter new K/V ``[T, H, D]`` into the flat paged cache."""
     k_cache.view(-1, *key.shape[1:])[slot_mapping] = key
     v_cache.view(-1, *value.shape[1:])[slot_mapping] = value
 
 
-def _gather(cache: torch.Tensor, block_table, length: int, block_size: int) -> torch.Tensor:
+def _gather(
+    cache: torch.Tensor, block_table, length: int, block_size: int
+) -> torch.Tensor:
     """Collect ``length`` contiguous K/V rows for one sequence."""
     num_blocks = (length + block_size - 1) // block_size
     blocks = torch.tensor(block_table[:num_blocks], dtype=torch.long)
     return cache.index_select(0, blocks).reshape(-1, *cache.shape[2:])[:length]
 
 
-def _sdpa(query: torch.Tensor, key: torch.Tensor, value: torch.Tensor,
-          causal: bool, scale: float) -> torch.Tensor:
+def _sdpa(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    causal: bool,
+    scale: float,
+) -> torch.Tensor:
     # [L, H, D] -> [1, H, L, D]
     out = F.scaled_dot_product_attention(
         query.transpose(0, 1).unsqueeze(0),
@@ -38,8 +50,9 @@ def _sdpa(query: torch.Tensor, key: torch.Tensor, value: torch.Tensor,
     return out.squeeze(0).transpose(0, 1)
 
 
-def cross_sdpa(query: torch.Tensor, key: torch.Tensor, value: torch.Tensor,
-               scale: float) -> torch.Tensor:
+def cross_sdpa(
+    query: torch.Tensor, key: torch.Tensor, value: torch.Tensor, scale: float
+) -> torch.Tensor:
     """Cross-attention over encoder K/V already stored as contiguous [H, S, D].
 
     Transposing once at encode time keeps the (long) key tensor contiguous for
@@ -55,8 +68,9 @@ def cross_sdpa(query: torch.Tensor, key: torch.Tensor, value: torch.Tensor,
     return out.squeeze(0).transpose(0, 1)
 
 
-def paged_attention(query: torch.Tensor, k_cache: torch.Tensor, v_cache: torch.Tensor,
-                    scale: float) -> torch.Tensor:
+def paged_attention(
+    query: torch.Tensor, k_cache: torch.Tensor, v_cache: torch.Tensor, scale: float
+) -> torch.Tensor:
     """Causal self-attention over the paged cache.  ``query`` is [T, H, D]."""
     ctx = get_context()
     block_size = k_cache.shape[1]

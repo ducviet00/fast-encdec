@@ -41,16 +41,22 @@ class Scheduler:
 
 
 class LLMEngine:
-    def __init__(self, model, block_manager, max_num_seqs: int = 32,
-                 dtype=torch.float32):
+    def __init__(
+        self, model, block_manager, max_num_seqs: int = 32, dtype=torch.float32
+    ):
         self.runner = ModelRunner(model, block_manager, dtype)
         self.scheduler = Scheduler(max_num_seqs)
         self.results: dict[int, list[int]] = {}
         self._finished_beams: dict[int, list[Sequence]] = defaultdict(list)
         self._next_request_id = 0
 
-    def add_request(self, encoder_token_ids: list[int], decoder_token_ids: list[int],
-                    params, pixel_values=None) -> int:
+    def add_request(
+        self,
+        encoder_token_ids: list[int],
+        decoder_token_ids: list[int],
+        params,
+        pixel_values=None,
+    ) -> int:
         request_id = self._next_request_id
         self._next_request_id += 1
         seq = Sequence(
@@ -130,15 +136,19 @@ class LLMEngine:
                 candidates.append((beam.cum_logprob + value, index, token))
 
         eos_candidates = sorted(
-            (c for c in candidates if c[2] in eos_ids), reverse=True)
+            (c for c in candidates if c[2] in eos_ids), reverse=True
+        )
         live_candidates = sorted(
-            (c for c in candidates if c[2] not in eos_ids), reverse=True)
+            (c for c in candidates if c[2] not in eos_ids), reverse=True
+        )
 
         beams = [seq for seq, _ in items]
 
         # Build children before freeing parents (children share parent blocks).
-        finished = [self._fork(beams[i], tok, score)
-                    for score, i, tok in eos_candidates[:num_beams]]
+        finished = [
+            self._fork(beams[i], tok, score)
+            for score, i, tok in eos_candidates[:num_beams]
+        ]
         live = []
         for score, i, tok in live_candidates[:num_beams]:
             child = self._fork(beams[i], tok, score)
@@ -160,13 +170,12 @@ class LLMEngine:
 
     def _finish_beam_request(self, request_id: int, params) -> None:
         done = self._finished_beams.pop(request_id, [])
-        live = [s for s in list(self.scheduler.running)
-                if s.request_id == request_id]
+        live = [s for s in list(self.scheduler.running) if s.request_id == request_id]
         candidates = done + live
 
         def length_penalized(seq: Sequence) -> float:
             length = max(seq.num_generated, 1)
-            return seq.cum_logprob / (length ** params.length_penalty)
+            return seq.cum_logprob / (length**params.length_penalty)
 
         best = max(candidates, key=length_penalized) if candidates else None
 

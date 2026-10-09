@@ -29,8 +29,12 @@ MODEL = "hf-tiny-v2/tiny-random-Florence2ForConditionalGeneration"
 def build_encoder_ids(config, tokenizer, num_image_tokens):
     text = config.text_config
     prompt_ids = tokenizer("<CAPTION>", add_special_tokens=False)["input_ids"]
-    return ([config.image_token_id] * num_image_tokens
-            + [text.bos_token_id] + prompt_ids + [text.eos_token_id])
+    return (
+        [config.image_token_id] * num_image_tokens
+        + [text.bos_token_id]
+        + prompt_ids
+        + [text.eos_token_id]
+    )
 
 
 def main():
@@ -51,30 +55,47 @@ def main():
         num_image_tokens = feat_ref.shape[1]
         encoder_ids = build_encoder_ids(config, tokenizer, num_image_tokens)
         encoder = torch.tensor([encoder_ids])
-        hidden_ref = hf.model(input_ids=encoder, pixel_values=pixel_values).encoder_last_hidden_state
+        hidden_ref = hf.model(
+            input_ids=encoder, pixel_values=pixel_values
+        ).encoder_last_hidden_state
         hidden_our = ours.encode(encoder, pixel_values)
 
     feat_diff = (feat_ref - feat_our).abs().max().item()
     hidden_diff = (hidden_ref - hidden_our).abs().max().item()
-    print(f"[{'OK' if feat_diff == 0 else 'MISMATCH'}] image features: maxdiff={feat_diff}")
-    print(f"[{'OK' if hidden_diff == 0 else 'MISMATCH'}] encoder hidden: maxdiff={hidden_diff}")
+    print(
+        f"[{'OK' if feat_diff == 0 else 'MISMATCH'}] image features: maxdiff={feat_diff}"
+    )
+    print(
+        f"[{'OK' if hidden_diff == 0 else 'MISMATCH'}] encoder hidden: maxdiff={hidden_diff}"
+    )
 
     # Greedy/beam generation parity through the paged engine.
     for beams in (1, 2, 4):
         params = SamplingParams(max_tokens=6, num_beams=beams, temperature=0.0)
         engine = LLMEngine(ours, BlockManager(64, 16), max_num_seqs=8)
-        request = engine.add_request(encoder_ids,
-                                     [config.text_config.decoder_start_token_id],
-                                     params, pixel_values=pixel_values[0])
+        request = engine.add_request(
+            encoder_ids,
+            [config.text_config.decoder_start_token_id],
+            params,
+            pixel_values=pixel_values[0],
+        )
         engine.run()
-        our_tokens = [config.text_config.decoder_start_token_id] + engine.results[request]
+        our_tokens = [config.text_config.decoder_start_token_id] + engine.results[
+            request
+        ]
 
         with torch.no_grad():
-            ref = hf.generate(input_ids=encoder, pixel_values=pixel_values,
-                              max_new_tokens=6, num_beams=beams, do_sample=False,
-                              forced_bos_token_id=None, forced_eos_token_id=None)
+            ref = hf.generate(
+                input_ids=encoder,
+                pixel_values=pixel_values,
+                max_new_tokens=6,
+                num_beams=beams,
+                do_sample=False,
+                forced_bos_token_id=None,
+                forced_eos_token_id=None,
+            )
         ref_tokens = ref[0].tolist()
-        status = "OK" if our_tokens[:len(ref_tokens)] == ref_tokens else "MISMATCH"
+        status = "OK" if our_tokens[: len(ref_tokens)] == ref_tokens else "MISMATCH"
         print(f"[{status}] beams={beams}: {our_tokens}")
 
     # Different images/lengths must batch to the same tokens as single runs.
@@ -86,10 +107,13 @@ def main():
         ids = build_encoder_ids(config, tokenizer, n_img)
         params = SamplingParams(max_tokens=6, num_beams=1, temperature=0.0)
         engine = LLMEngine(ours, BlockManager(64, 16), max_num_seqs=8)
-        request = engine.add_request(ids, [config.text_config.decoder_start_token_id],
-                                     params, pixel_values=image)
+        request = engine.add_request(
+            ids, [config.text_config.decoder_start_token_id], params, pixel_values=image
+        )
         engine.run()
-        singles.append([config.text_config.decoder_start_token_id] + engine.results[request])
+        singles.append(
+            [config.text_config.decoder_start_token_id] + engine.results[request]
+        )
 
     params = SamplingParams(max_tokens=6, num_beams=1, temperature=0.0)
     engine = LLMEngine(ours, BlockManager(64, 16), max_num_seqs=8)
@@ -98,8 +122,14 @@ def main():
         with torch.no_grad():
             n_img = ours.get_image_features(image.unsqueeze(0)).shape[1]
         ids = build_encoder_ids(config, tokenizer, n_img)
-        requests.append(engine.add_request(ids, [config.text_config.decoder_start_token_id],
-                                           params, pixel_values=image))
+        requests.append(
+            engine.add_request(
+                ids,
+                [config.text_config.decoder_start_token_id],
+                params,
+                pixel_values=image,
+            )
+        )
     engine.run()
     for i, request in enumerate(requests):
         batched = [config.text_config.decoder_start_token_id] + engine.results[request]
