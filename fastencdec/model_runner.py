@@ -93,7 +93,7 @@ class ModelRunner:
 
             query_start_loc.append(len(input_ids))
             context_lens.append(seq.num_cached_tokens)
-            block_tables.append(seq.block_table)
+            block_tables.append(torch.tensor(seq.block_table, dtype=torch.long))
 
         return (
             torch.tensor(input_ids, dtype=torch.long),

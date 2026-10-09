@@ -24,12 +24,17 @@ def store_kvcache(
 
 
 def _gather(
-    cache: torch.Tensor, block_table, length: int, block_size: int
+    cache: torch.Tensor, block_table: torch.Tensor, length: int, block_size: int
 ) -> torch.Tensor:
-    """Collect ``length`` contiguous K/V rows for one sequence."""
+    """Collect ``length`` contiguous K/V rows for one sequence.
+
+    ``block_table`` is the sequence's physical block ids as a tensor, built
+    once per step in :meth:`ModelRunner._prepare` and shared by every layer.
+    """
     num_blocks = (length + block_size - 1) // block_size
-    blocks = torch.tensor(block_table[:num_blocks], dtype=torch.long)
-    return cache.index_select(0, blocks).reshape(-1, *cache.shape[2:])[:length]
+    return cache.index_select(0, block_table[:num_blocks]).reshape(
+        -1, *cache.shape[2:]
+    )[:length]
 
 
 def _sdpa(
