@@ -21,6 +21,26 @@ from .scheduler import Scheduler
 from .sequence import Sequence, SequenceStatus
 
 
+def _params_key(params) -> tuple:
+    """Value-based key so requests with equal ``SamplingParams`` share a processor."""
+    return (
+        params.max_tokens,
+        params.num_beams,
+        params.temperature,
+        params.top_p,
+        params.top_k,
+        params.repetition_penalty,
+        tuple(sorted(params.eos_ids())),
+        params.length_penalty,
+        params.no_repeat_ngram_size,
+        params.min_length,
+        params.forced_bos_token_id,
+        params.forced_eos_token_id,
+        tuple(params.suppress_tokens or ()),
+        tuple(params.begin_suppress_tokens or ()),
+    )
+
+
 def _length_penalized(seq: Sequence, length_penalty: float) -> float:
     length = max(seq.num_generated, 1)
     return seq.cum_logprob / (length**length_penalty)
@@ -58,6 +78,7 @@ class LLMEngine:
         self.results: dict[int, list[int]] = {}
         self._finished_beams: dict[int, list[Sequence]] = defaultdict(list)
         self._logits_processors: dict[int, object] = {}
+        self._processor_cache: dict[tuple, object] = {}
         self._next_request_id = 0
 
     def add_request(
@@ -81,12 +102,21 @@ class LLMEngine:
         begin_index = len(decoder_token_ids) + int(
             params.forced_bos_token_id is not None and len(decoder_token_ids) == 1
         )
-        self._logits_processors[request_id] = build_logits_processor(
-            params,
-            max_length=len(decoder_token_ids) + params.max_tokens,
-            begin_index=begin_index,
-            is_beam=params.num_beams > 1,
-        )
+        max_length = len(decoder_token_ids) + params.max_tokens
+        is_beam = params.num_beams > 1
+        # Requests with equal params share one (stateless) ``LogitsProcessorList``
+        # so the greedy path can apply it to the whole batch in one call.
+        key = (is_beam, max_length, begin_index, _params_key(params))
+        processor = self._processor_cache.get(key)
+        if processor is None:
+            processor = build_logits_processor(
+                params,
+                max_length=max_length,
+                begin_index=begin_index,
+                is_beam=is_beam,
+            )
+            self._processor_cache[key] = processor
+        self._logits_processors[request_id] = processor
         self.scheduler.add(seq)
         return request_id
 
@@ -108,24 +138,42 @@ class LLMEngine:
         for index, seq in enumerate(seqs):
             groups[seq.request_id].append(index)
 
+        beam_units = []
+        greedy_units = []
         for request_id, indices in groups.items():
             params = seqs[indices[0]].sampling
+            processor = self._logits_processors[request_id]
+            if params.num_beams > 1:
+                beam_units.append((request_id, indices, params, processor))
+            else:
+                greedy_units.append((indices, processor))
+
+        for request_id, indices, params, processor in beam_units:
             input_ids = torch.tensor(
                 [seqs[i].token_ids for i in indices], dtype=torch.long
             )
-            logits_batch = logits[indices].float()
-            processor = self._logits_processors[request_id]
-            if params.num_beams > 1:
-                # generate's beam search applies the processors to log-probs,
-                # so a masking processor does not renormalize the surviving
-                # scores (unlike the greedy path below).
-                logprobs = processor(input_ids, torch.log_softmax(logits_batch, dim=-1))
-                beams = [seqs[i] for i in indices]
-                self._beam_step(request_id, beams, params, logprobs)
-            else:
-                scores = processor(input_ids, logits_batch)
-                for i, score in zip(indices, scores):
-                    self._sample(seqs[i], params, score)
+            # generate's beam search applies the processors to log-probs, so a
+            # masking processor does not renormalize the surviving scores
+            # (unlike the greedy path below).
+            logprobs = processor(
+                input_ids, torch.log_softmax(logits[indices].float(), dim=-1)
+            )
+            self._beam_step(request_id, [seqs[i] for i in indices], params, logprobs)
+
+        # Greedy: rows from different requests are independent, so requests that
+        # share a processor and a decoder length are served by one call.
+        buckets: dict[tuple, tuple] = {}
+        for indices, processor in greedy_units:
+            length = len(seqs[indices[0]].token_ids)
+            bucket = buckets.setdefault((id(processor), length), (processor, []))
+            bucket[1].extend(indices)
+        for processor, indices in buckets.values():
+            input_ids = torch.tensor(
+                [seqs[i].token_ids for i in indices], dtype=torch.long
+            )
+            scores = processor(input_ids, logits[indices].float())
+            for row, i in enumerate(indices):
+                self._sample(seqs[i], seqs[i].sampling, scores[row])
 
     # -------------------------------------------------------------- sampling
     def _release(self, request_id: int) -> None:

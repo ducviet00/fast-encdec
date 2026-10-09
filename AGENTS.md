@@ -109,6 +109,9 @@ LLMEngine.step()                  # sample (greedy) or beam-expand; append; free
    A token at sequence position `p` lives at physical slot
    `block_table[p // block_size] * block_size + (p % block_size)`.
    `Context.context_lens[i]` is the total cached length *after* writing.
+   `Context.key_slot_ids` is the flat, per-step map of every cached key's slot
+   (ordered by sequence), so attention gathers each layer's cache with a single
+   `index_select` over the whole batch instead of one per sequence.
 4. **Causal rule** (`paged_attention` in `layers/attention.py`): `is_causal = query_len ==
    context_len`. Prefill has `query_len == context_len` (fresh sequence);
    decode has `query_len == 1 < context_len` (attend to every cached key).
@@ -141,7 +144,9 @@ LLMEngine.step()                  # sample (greedy) or beam-expand; append; free
    uses the checkpoint's `GenerationConfig` (via
    `SamplingParams.from_generation_config`) when called without params; an
    explicit `SamplingParams` fully overrides those defaults. `length_penalty`
-   ranks finished beams.
+   ranks finished beams. Requests with equal resolved `SamplingParams` share one
+   (stateless) `LogitsProcessorList`, so greedy decoding applies the processors
+   to the whole batch in a single call.
 10. **Multimodal inputs (Florence-2).** `Sequence.pixel_values` carries the
     request image `[3, H, W]`; `_encode` groups fresh sequences by
     `(encoder length, image shape)` and the model scatters projected visual
@@ -186,20 +191,20 @@ never hand-edit or guess.**
 
 | sweep (bf16, enc=256 unless noted) | config | ours ms | speedup vs HF |
 |---|---|---:|---:|
-| batch, beams=1 | batch=1 | 1135 | 1.02x |
-| batch, beams=1 | batch=2 | 1288 | 0.98x |
-| batch, beams=1 | batch=4 | 1568 | 0.93x |
-| batch, beams=1 | batch=8 | 2215 | 0.87x |
-| batch, beams=4 | batch=1 | 1334 | 1.15x |
-| batch, beams=4 | batch=2 | 1695 | 1.18x |
-| batch, beams=4 | batch=4 | 2407 | 1.23x |
-| batch, beams=4 | batch=8 | 3967 | 1.29x |
-| beams, batch=8 | beams=1 | 2184 | 0.88x |
-| beams, batch=8 | beams=4 | 3921 | 1.30x |
-| dtype, batch=8, beams=4 | float32 | 7099 | 1.96x |
-| dtype, batch=8, beams=4 | bfloat16 | 3974 | 1.29x |
-| enc length, batch=8, beams=1 | enc=128 | 1781 | 0.85x |
-| enc length, batch=8, beams=1 | enc=256 | 2196 | 0.88x |
+| batch, beams=1 | batch=1 | 1148 | 1.01x |
+| batch, beams=1 | batch=2 | 1274 | 1.00x |
+| batch, beams=1 | batch=4 | 1512 | 0.97x |
+| batch, beams=1 | batch=8 | 2071 | 0.94x |
+| batch, beams=4 | batch=1 | 1308 | 1.17x |
+| batch, beams=4 | batch=2 | 1636 | 1.20x |
+| batch, beams=4 | batch=4 | 2316 | 1.30x |
+| batch, beams=4 | batch=8 | 3780 | 1.37x |
+| beams, batch=8 | beams=1 | 2075 | 0.94x |
+| beams, batch=8 | beams=4 | 3702 | 1.40x |
+| dtype, batch=8, beams=4 | float32 | 6921 | 1.96x |
+| dtype, batch=8, beams=4 | bfloat16 | 3742 | 1.38x |
+| enc length, batch=8, beams=1 | enc=128 | 1656 | 0.92x |
+| enc length, batch=8, beams=1 | enc=256 | 2091 | 0.92x |
 
 ## 7. Gotchas
 

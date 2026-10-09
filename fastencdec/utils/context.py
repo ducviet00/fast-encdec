@@ -7,6 +7,10 @@ reference.
 """
 
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    import torch
 
 
 @dataclass
@@ -17,7 +21,10 @@ class Context:
         slot_mapping: Physical cache slots for the new tokens, shape [T].
         query_start_loc: Cumulative new-token counts, length num_seqs + 1.
         context_lens: Total cached length per sequence, length num_seqs.
-        block_tables: Physical block ids per sequence (list of tensors).
+        key_slot_ids: Flat physical cache slots for every cached key, ordered by
+            sequence (seq 0's positions, then seq 1's, ...).  Attention gathers
+            all layers' K/V with one ``index_select`` per cache instead of one
+            per sequence.
         request_ids: Request id per sequence (used for cross-attn cache).
         num_seqs: Number of sequences in the batch.
     """
@@ -25,7 +32,7 @@ class Context:
     slot_mapping: list
     query_start_loc: list
     context_lens: list
-    block_tables: list
+    key_slot_ids: "torch.Tensor"
     request_ids: list
     num_seqs: int
 
@@ -41,7 +48,7 @@ def set_context(
     slot_mapping,
     query_start_loc,
     context_lens,
-    block_tables,
+    key_slot_ids,
     request_ids,
     num_seqs,
 ) -> None:
@@ -50,7 +57,7 @@ def set_context(
         slot_mapping,
         query_start_loc,
         context_lens,
-        block_tables,
+        key_slot_ids,
         request_ids,
         num_seqs,
     )

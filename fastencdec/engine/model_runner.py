@@ -93,7 +93,7 @@ class ModelRunner:
 
             query_start_loc.append(len(input_ids))
             context_lens.append(seq.num_cached_tokens)
-            block_tables.append(torch.tensor(seq.block_table, dtype=torch.long))
+            block_tables.append(seq.block_table)
 
         return (
             torch.tensor(input_ids, dtype=torch.long),
@@ -101,8 +101,29 @@ class ModelRunner:
             slot_mapping,
             query_start_loc,
             context_lens,
-            block_tables,
+            self._key_slots(block_tables, context_lens, bs),
         )
+
+    @staticmethod
+    def _key_slots(block_tables, context_lens, block_size) -> torch.Tensor:
+        """Flat cache slots for every cached key, ordered by sequence.
+
+        Computed once per step and reused by every attention layer, so the paged
+        cache is gathered with a single ``index_select`` per cache instead of
+        one per sequence.
+        """
+        lens = torch.tensor(context_lens, dtype=torch.long)
+        max_len = int(lens.max())
+        max_blocks = max(len(table) for table in block_tables)
+        table = torch.zeros((len(block_tables), max_blocks), dtype=torch.long)
+        for i, seq_table in enumerate(block_tables):
+            table[i, : len(seq_table)] = torch.tensor(seq_table, dtype=torch.long)
+        positions = torch.arange(max_len)
+        slots = table[:, positions // block_size] * block_size + (
+            positions % block_size
+        )
+        mask = positions.unsqueeze(0) < lens.unsqueeze(1)
+        return slots[mask]
 
     @torch.no_grad()
     def run(self, seqs):
@@ -110,7 +131,7 @@ class ModelRunner:
         if fresh:
             self._encode(fresh)
 
-        input_ids, positions, slot_mapping, qsl, context_lens, block_tables = (
+        input_ids, positions, slot_mapping, qsl, context_lens, key_slot_ids = (
             self._prepare(seqs)
         )
 
@@ -118,7 +139,7 @@ class ModelRunner:
             slot_mapping=slot_mapping,
             query_start_loc=qsl,
             context_lens=context_lens,
-            block_tables=block_tables,
+            key_slot_ids=key_slot_ids,
             request_ids=[seq.request_id for seq in seqs],
             num_seqs=len(seqs),
         )

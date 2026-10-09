@@ -236,18 +236,18 @@ tokens, encoder length 256:
 
 | config | ours ms | hf ms | speedup |
 |---|---:|---:|---:|
-| batch=1, beams=1 | 1150 | 1159 | 1.01× |
-| batch=8, beams=1 | 2187 | 1907 | 0.87× |
-| batch=16, beams=1 | 3439 | 2869 | 0.83× |
-| batch=1, beams=4 | 1332 | 1534 | 1.15× |
-| batch=8, beams=4 | 3965 | 5123 | 1.29× |
-| batch=16, beams=4 | 7043 | 10977 | 1.56× |
+| batch=1, beams=1 | 1172 | 1157 | 0.99× |
+| batch=8, beams=1 | 2050 | 1912 | 0.93× |
+| batch=16, beams=1 | 3153 | 2848 | 0.90× |
+| batch=1, beams=4 | 1338 | 1531 | 1.14× |
+| batch=8, beams=4 | 3778 | 5175 | 1.37× |
+| batch=16, beams=4 | 6672 | 10832 | 1.62× |
 
-Other axes: at batch=8/beams=4 the same-precision speedup is ~1.3× in BF16 and
-~1.9× in FP32; HF gains more from BF16 than we do (it speeds up 2.7× going
+Other axes: at batch=8/beams=4 the same-precision speedup is ~1.4× in BF16 and
+~1.9× in FP32; HF gains more from BF16 than we do (it speeds up 2.6× going
 FP32→BF16, ours 1.8×). For greedy decoding (batch=8, beams=1) our per-sequence
-attention is ~15% slower than HF's batched SDPA (0.84× at enc=128), but the gap
-narrows as the encoder grows (0.93× at enc=1000) since the encoder is
+attention is ~9% slower than HF's batched SDPA (0.91× at enc=128), but the gap
+narrows as the encoder grows (0.95× at enc=1000) since the encoder is
 GEMM-bound and both engines share the same oneDNN matmuls.
 
 ### Florence-2
@@ -266,18 +266,18 @@ max 256 tokens, ~13/22/256 output tokens:
 
 | sweep | ours ms | hf ms | speedup |
 |---|---:|---:|---:|
-| greedy batch=3 | 3764 | 4430 | 1.18× |
-| greedy batch=6 | 6000 | 6649 | 1.11× |
-| greedy batch=12 | 10418 | 11670 | 1.12× |
-| beams=1 | 2559 | 2830 | 1.11× |
-| beams=3 | 2940 | 4462 | 1.52× |
-| beams=5 | 3247 | 5824 | 1.79× |
-| N=24, running window=12 | 17315 | 22041 | 1.27× |
+| greedy batch=3 | 3751 | 4357 | 1.16× |
+| greedy batch=6 | 5868 | 6634 | 1.13× |
+| greedy batch=12 | 10237 | 11734 | 1.15× |
+| beams=1 | 2558 | 2812 | 1.10× |
+| beams=3 | 2910 | 4554 | 1.56× |
+| beams=5 | 3240 | 5906 | 1.82× |
+| N=24, running window=12 | 18250 | 22314 | 1.22× |
 
 The win comes from **not padding**: the mixed batch has a 13/22/256-token
 spread, and fast-encdec never decodes the padding positions HF carries.
 Beam search benefits most, because the paged cache shares blocks instead of
-reordering a full beam cache each step (up to 1.79×); greedy is a more modest
+reordering a full beam cache each step (up to 1.82×); greedy is a more modest
 1.1–1.2×, since the DaViT vision encoder (~0.5 s/image here) is a large cost
 shared by both engines and our per-sequence CPU attention can be slower than
 HF's batched SDPA.

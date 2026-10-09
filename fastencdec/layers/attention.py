@@ -23,20 +23,6 @@ def store_kvcache(
     v_cache.view(-1, *value.shape[1:])[slot_mapping] = value
 
 
-def _gather(
-    cache: torch.Tensor, block_table: torch.Tensor, length: int, block_size: int
-) -> torch.Tensor:
-    """Collect ``length`` contiguous K/V rows for one sequence.
-
-    ``block_table`` is the sequence's physical block ids as a tensor, built
-    once per step in :meth:`ModelRunner._prepare` and shared by every layer.
-    """
-    num_blocks = (length + block_size - 1) // block_size
-    return cache.index_select(0, block_table[:num_blocks]).reshape(
-        -1, *cache.shape[2:]
-    )[:length]
-
-
 def _sdpa(
     query: torch.Tensor,
     key: torch.Tensor,
@@ -84,23 +70,32 @@ def paged_attention(
     """Write new K/V into the paged cache, then attend causally over it.
 
     ``query``/``key``/``value`` are ``[T, H, D]``; the new K/V are scattered at
-    ``context.slot_mapping`` before each sequence gathers its cached rows
-    (``context.context_lens`` is the length *after* the write).
+    ``context.slot_mapping`` before the cached rows are gathered
+    (``context.context_lens`` is the length *after* the write).  The gather is
+    a single ``index_select`` per cache covering the whole batch, using the
+    flat ``context.key_slot_ids`` built once per step.
     """
     ctx = get_context()
     store_kvcache(key, value, k_cache, v_cache, ctx.slot_mapping)
-    block_size = k_cache.shape[1]
+    k_all = k_cache.view(-1, k_cache.shape[2], k_cache.shape[3]).index_select(
+        0, ctx.key_slot_ids
+    )
+    v_all = v_cache.view(-1, v_cache.shape[2], v_cache.shape[3]).index_select(
+        0, ctx.key_slot_ids
+    )
     outputs = []
+    offset = 0
     for i in range(ctx.num_seqs):
         start, end = ctx.query_start_loc[i], ctx.query_start_loc[i + 1]
-        query_i = query[start:end]
         length = ctx.context_lens[i]
-        key_i = _gather(k_cache, ctx.block_tables[i], length, block_size)
-        value_i = _gather(v_cache, ctx.block_tables[i], length, block_size)
+        query_i = query[start:end]
+        key_i = k_all[offset : offset + length]
+        value_i = v_all[offset : offset + length]
         # Prefill feeds the whole sequence (queries == keys, causal);
         # decode feeds a single token that may attend to every cached key.
         causal = query_i.shape[0] == length
         outputs.append(_sdpa(query_i, key_i, value_i, causal, scale))
+        offset += length
     return torch.cat(outputs, dim=0)
 
 
