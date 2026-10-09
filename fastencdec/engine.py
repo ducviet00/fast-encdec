@@ -58,6 +58,27 @@ class Scheduler:
         return list(self.running)
 
 
+def _length_penalized(seq: Sequence, length_penalty: float) -> float:
+    length = max(seq.num_generated, 1)
+    return seq.cum_logprob / (length**length_penalty)
+
+
+def select_beam_candidates(
+    stopped: list[bool], num_beams: int
+) -> tuple[list[int], list[int]]:
+    """Split a descending-ranked candidate list into finished and live ranks.
+
+    ``stopped`` marks candidates that hit a stopping criterion (EOS or max
+    length); the lists are parallel to that ranking.  A stopped candidate may
+    only finish if it ranks within the top ``num_beams`` — otherwise it is
+    dropped, as in ``generate`` — and the remaining slots go to the best
+    non-stopped continuations.
+    """
+    finished = [r for r, stop in enumerate(stopped) if stop and r < num_beams]
+    live = [r for r, stop in enumerate(stopped) if not stop][:num_beams]
+    return finished, live
+
+
 class LLMEngine:
     def __init__(
         self,
@@ -162,60 +183,88 @@ class LLMEngine:
     def _beam_step(self, request_id: int, beams, params, logits) -> None:
         num_beams = params.num_beams
         eos_ids = params.eos_ids()
+        vocab = logits.shape[-1]
         logprobs = torch.log_softmax(logits, dim=-1)
 
-        candidates = []  # (score, parent_index, token)
-        for index, beam in enumerate(beams):
-            topk = min(2 * num_beams, logprobs.shape[-1])
-            values, tokens = torch.topk(logprobs[index], topk)
-            for value, token in zip(values.tolist(), tokens.tolist()):
-                candidates.append((beam.cum_logprob + value, index, token))
+        # Rank every continuation globally, like HF's beam search.
+        cumulative = torch.tensor([beam.cum_logprob for beam in beams]).unsqueeze(1)
+        scores = (logprobs + cumulative).reshape(-1)
+        keep = min(max(2, 1 + len(eos_ids)) * num_beams, scores.numel())
+        top_scores, top_indices = torch.topk(scores, keep)
+        parents = (top_indices // vocab).tolist()
+        tokens = (top_indices % vocab).tolist()
 
-        eos_candidates = sorted(
-            (c for c in candidates if c[2] in eos_ids), reverse=True
-        )
-        live_candidates = sorted(
-            (c for c in candidates if c[2] not in eos_ids), reverse=True
-        )
+        stopped = [
+            token in eos_ids or beams[parent].num_generated + 1 >= params.max_tokens
+            for parent, token in zip(parents, tokens)
+        ]
+        finished_ranks, live_ranks = select_beam_candidates(stopped, num_beams)
 
         # Build children before freeing parents (children share parent blocks).
-        finished = [
-            self._fork(beams[i], tok, score)
-            for score, i, tok in eos_candidates[:num_beams]
+        new_finished = [
+            self._fork(beams[parents[r]], tokens[r], top_scores[r].item())
+            for r in finished_ranks
         ]
-        live = []
-        for score, i, tok in live_candidates[:num_beams]:
-            child = self._fork(beams[i], tok, score)
-            if child.num_generated >= params.max_tokens:
-                finished.append(child)
-            else:
-                live.append(child)
+        live = [
+            self._fork(beams[parents[r]], tokens[r], top_scores[r].item())
+            for r in live_ranks
+        ]
 
         for beam in beams:
             self.scheduler.remove(beam)
             self.runner.block_manager.free(beam)
 
-        self._finished_beams[request_id].extend(finished)
+        self._finished_beams[request_id].extend(new_finished)
+        self._prune_finished(request_id, params)
         for child in live:
             self.scheduler.add_running(child)
 
-        if not live or len(self._finished_beams[request_id]) >= num_beams:
+        if not live or self._should_stop(request_id, params, live):
             self._finish_beam_request(request_id, params)
 
+    def _prune_finished(self, request_id: int, params) -> None:
+        """Keep only the best ``num_beams`` finished hypotheses."""
+        finished = self._finished_beams[request_id]
+        if len(finished) <= params.num_beams:
+            return
+        finished.sort(
+            key=lambda seq: _length_penalized(seq, params.length_penalty), reverse=True
+        )
+        for seq in finished[params.num_beams :]:
+            self.runner.block_manager.free(seq)
+        del finished[params.num_beams :]
+
+    def _should_stop(self, request_id: int, params, live) -> bool:
+        """HF ``early_stopping=False``: stop when no live beam can improve.
+
+        Once ``num_beams`` hypotheses are finished, compare the worst finished
+        (length-normalized) score against the best possible live score at the
+        current length.
+        """
+        finished = self._finished_beams[request_id]
+        if len(finished) < params.num_beams:
+            return False
+        worst_finished = min(
+            _length_penalized(seq, params.length_penalty) for seq in finished
+        )
+        best_possible = max(seq.cum_logprob for seq in live) / (
+            max(live[0].num_generated, 1) ** params.length_penalty
+        )
+        return worst_finished >= best_possible
+
     def _finish_beam_request(self, request_id: int, params) -> None:
-        done = self._finished_beams.pop(request_id, [])
+        finished = self._finished_beams.pop(request_id, [])
         live = [s for s in list(self.scheduler.running) if s.request_id == request_id]
-        candidates = done + live
 
-        def length_penalized(seq: Sequence) -> float:
-            length = max(seq.num_generated, 1)
-            return seq.cum_logprob / (length**params.length_penalty)
-
-        best = max(candidates, key=length_penalized) if candidates else None
+        best = max(
+            finished,
+            key=lambda seq: _length_penalized(seq, params.length_penalty),
+            default=None,
+        )
 
         for seq in live:
             self.scheduler.remove(seq)
-        for seq in candidates:
+        for seq in finished + live:
             self.runner.block_manager.free(seq)
         self._release(request_id)
         self.results[request_id] = best.generated_ids() if best else []
