@@ -21,8 +21,8 @@ HuggingFace BART reference; only the attention kernels differ.
 
 **Florence-2** (`fastencdec/models/florence2.py`) reuses that paged BART as its
 language model and pairs it with the DaViT vision encoder
-(`Florence2VisionBackbone`) and `Florence2MultiModalProjector`, vendored in
-`fastencdec/models/davit.py` (an optimized copy of the `transformers`
+(`Florence2VisionBackbone`) and `Florence2MultiModalProjector`, vendored in the
+same `fastencdec/models/florence2.py` (an optimized copy of the `transformers`
 reference). Visual tokens are spliced into the encoder input at the `<image>`
 placeholders; the decoder is unchanged.
 
@@ -70,8 +70,7 @@ fastencdec/
     sampler.py         greedy / multinomial sampling (Sampler nn.Module)
   models/
     bart.py            BART model (encoder / decoder / cross-attn)
-    davit.py           vendored + optimized DaViT vision tower + projector
-    florence2.py       Florence-2 (DaViT + projector + BART language model)
+    florence2.py       Florence-2 (vendored DaViT + projector + BART LM)
   utils/
     context.py         global per-step Context read by attention layers
     loader.py          HF checkpoint -> model weight loading
@@ -213,20 +212,20 @@ never hand-edit or guess.**
 
 | sweep (bf16, enc=256 unless noted) | config | ours ms | speedup vs HF |
 |---|---|---:|---:|
-| batch, beams=1 | batch=1 | 1038 | 1.11x |
-| batch, beams=1 | batch=2 | 951 | 1.33x |
-| batch, beams=1 | batch=4 | 1115 | 1.31x |
-| batch, beams=1 | batch=8 | 1486 | 1.29x |
-| batch, beams=4 | batch=1 | 1081 | 1.41x |
-| batch, beams=4 | batch=2 | 1238 | 1.59x |
-| batch, beams=4 | batch=4 | 1544 | 1.91x |
-| batch, beams=4 | batch=8 | 2219 | 2.31x |
-| beams, batch=8 | beams=1 | 1518 | 1.28x |
-| beams, batch=8 | beams=4 | 2222 | 2.35x |
-| dtype, batch=8, beams=4 | float32 | 5962 | 2.15x |
-| dtype, batch=8, beams=4 | bfloat16 | 2187 | 2.37x |
-| enc length, batch=8, beams=1 | enc=128 | 1194 | 1.28x |
-| enc length, batch=8, beams=1 | enc=256 | 1507 | 1.28x |
+| batch, beams=1 | batch=1 | 1040 | 1.12x |
+| batch, beams=1 | batch=2 | 997 | 1.27x |
+| batch, beams=1 | batch=4 | 1132 | 1.29x |
+| batch, beams=1 | batch=8 | 1504 | 1.29x |
+| batch, beams=4 | batch=1 | 973 | 1.56x |
+| batch, beams=4 | batch=2 | 1240 | 1.57x |
+| batch, beams=4 | batch=4 | 1537 | 1.93x |
+| batch, beams=4 | batch=8 | 2201 | 2.38x |
+| beams, batch=8 | beams=1 | 1525 | 1.28x |
+| beams, batch=8 | beams=4 | 2214 | 2.33x |
+| dtype, batch=8, beams=4 | float32 | 5975 | 2.30x |
+| dtype, batch=8, beams=4 | bfloat16 | 2196 | 2.37x |
+| enc length, batch=8, beams=1 | enc=128 | 1199 | 1.27x |
+| enc length, batch=8, beams=1 | enc=256 | 1510 | 1.28x |
 
 Snapshot of `PYTHONPATH=. $P benchmarks/benchmark_florence2.py --quick`
 (`florence-community/Florence-2-base`, bf16 for both engines, 8 threads,
@@ -235,12 +234,12 @@ projector on `torch.compile`, the new default). Refresh from a real run.
 
 | sweep (bf16) | config | ours ms | speedup vs HF |
 |---|---|---:|---:|
-| greedy batch | batch=3 | 1923 | 1.32x |
-| greedy batch | batch=6 | 3151 | 1.40x |
-| beam (batch=3) | beams=1 | 1690 | 1.27x |
-| beam (batch=3) | beams=3 | 1883 | 1.56x |
-| continuous (N=6) | w=3 | 3416 | 1.30x |
-| continuous (N=6) | w=6 | 3106 | 1.43x |
+| greedy batch | batch=3 | 1930 | 1.36x |
+| greedy batch | batch=6 | 3106 | 1.42x |
+| beam (batch=3) | beams=1 | 1686 | 1.28x |
+| beam (batch=3) | beams=3 | 1871 | 1.56x |
+| continuous (N=6) | w=3 | 3413 | 1.32x |
+| continuous (N=6) | w=6 | 3071 | 1.46x |
 
 ## 7. Gotchas
 
@@ -305,7 +304,7 @@ projector on `torch.compile`, the new default). Refresh from a real run.
   faster non-contiguous). The encoder self-attention builds q/k/v with
   `view().transpose(1, 2)`, so it calls `.contiguous()` before SDPA (the SDPA
   fallback in `layers/attention.py` does too), and so does the vendored DaViT
-  window attention (`models/davit.py`). Without it, BF16 on Graviton ran at fp32
+  window attention (`models/florence2.py`). Without it, BF16 on Graviton ran at fp32
   speed; with it, BF16 is ~2.3x faster than fp32 there. Measured penalty for
   the non-contiguous BF16 vision shapes (Graviton, torch 2.14): ~5.5x for the
   window attention, ~19x for the text encoder shape; the vision tower was ~2x
@@ -334,7 +333,7 @@ projector on `torch.compile`, the new default). Refresh from a real run.
 - Pure PyTorch plus the vendored vLLM CPU attention kernel in `csrc/` (approved;
   Apache-2.0). No new third-party dependencies without discussion. (`Pillow` was
   approved for Florence-2 image processing; the DaViT vision tower and projector
-  are vendored in `fastencdec/models/davit.py`, an optimized copy of the
+  are vendored in `fastencdec/models/florence2.py`, an optimized copy of the
   `transformers` reference.)
 - After changes: run `python -m compileall fastencdec`,
   `tests/test_parity.py`, `tests/test_attn_backend.py`,
