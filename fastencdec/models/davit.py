@@ -169,15 +169,16 @@ class Florence2VisionWindowAttention(nn.Module):
         )
         num_windows = windows.shape[0]
 
-        # Q/K/V stay in the projected layout: for the window shapes the math
-        # SDPA backend handles them without a copy and is faster than forcing
-        # flash with a pre-contiguous copy.
+        # Pre-contiguous Q/K/V: on aarch64 SDPA with BF16 non-contiguous
+        # (transposed) inputs is ~5.5x slower (Graviton), and the small copy is
+        # cheaper than that; x86 pays the copy either way.
         qkv = (
             self.qkv(windows)
             .reshape(
                 num_windows, ws * ws, 3, self.num_heads, embed_dim // self.num_heads
             )
             .permute(2, 0, 3, 1, 4)
+            .contiguous()
         )
         query, key, value = qkv.unbind(0)
         windows = F.scaled_dot_product_attention(query, key, value, scale=self.scale)

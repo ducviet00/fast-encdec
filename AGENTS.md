@@ -213,20 +213,20 @@ never hand-edit or guess.**
 
 | sweep (bf16, enc=256 unless noted) | config | ours ms | speedup vs HF |
 |---|---|---:|---:|
-| batch, beams=1 | batch=1 | 1057 | 1.13x |
-| batch, beams=1 | batch=2 | 1059 | 1.23x |
-| batch, beams=1 | batch=4 | 1182 | 1.26x |
-| batch, beams=1 | batch=8 | 1532 | 1.28x |
-| batch, beams=4 | batch=1 | 1112 | 1.37x |
-| batch, beams=4 | batch=2 | 1271 | 1.55x |
-| batch, beams=4 | batch=4 | 1563 | 1.93x |
-| batch, beams=4 | batch=8 | 2246 | 2.30x |
-| beams, batch=8 | beams=1 | 1541 | 1.29x |
-| beams, batch=8 | beams=4 | 2242 | 2.35x |
-| dtype, batch=8, beams=4 | float32 | 5990 | 2.26x |
-| dtype, batch=8, beams=4 | bfloat16 | 2187 | 2.36x |
-| enc length, batch=8, beams=1 | enc=128 | 1377 | 1.14x |
-| enc length, batch=8, beams=1 | enc=256 | 1719 | 1.15x |
+| batch, beams=1 | batch=1 | 1038 | 1.11x |
+| batch, beams=1 | batch=2 | 951 | 1.33x |
+| batch, beams=1 | batch=4 | 1115 | 1.31x |
+| batch, beams=1 | batch=8 | 1486 | 1.29x |
+| batch, beams=4 | batch=1 | 1081 | 1.41x |
+| batch, beams=4 | batch=2 | 1238 | 1.59x |
+| batch, beams=4 | batch=4 | 1544 | 1.91x |
+| batch, beams=4 | batch=8 | 2219 | 2.31x |
+| beams, batch=8 | beams=1 | 1518 | 1.28x |
+| beams, batch=8 | beams=4 | 2222 | 2.35x |
+| dtype, batch=8, beams=4 | float32 | 5962 | 2.15x |
+| dtype, batch=8, beams=4 | bfloat16 | 2187 | 2.37x |
+| enc length, batch=8, beams=1 | enc=128 | 1194 | 1.28x |
+| enc length, batch=8, beams=1 | enc=256 | 1507 | 1.28x |
 
 Snapshot of `PYTHONPATH=. $P benchmarks/benchmark_florence2.py --quick`
 (`florence-community/Florence-2-base`, bf16 for both engines, 8 threads,
@@ -235,12 +235,12 @@ projector on `torch.compile`, the new default). Refresh from a real run.
 
 | sweep (bf16) | config | ours ms | speedup vs HF |
 |---|---|---:|---:|
-| greedy batch | batch=3 | 1913 | 1.32x |
-| greedy batch | batch=6 | 3045 | 1.44x |
-| beam (batch=3) | beams=1 | 1669 | 1.28x |
-| beam (batch=3) | beams=3 | 1864 | 1.57x |
-| continuous (N=6) | w=3 | 3413 | 1.30x |
-| continuous (N=6) | w=6 | 3022 | 1.47x |
+| greedy batch | batch=3 | 1923 | 1.32x |
+| greedy batch | batch=6 | 3151 | 1.40x |
+| beam (batch=3) | beams=1 | 1690 | 1.27x |
+| beam (batch=3) | beams=3 | 1883 | 1.56x |
+| continuous (N=6) | w=3 | 3416 | 1.30x |
+| continuous (N=6) | w=6 | 3106 | 1.43x |
 
 ## 7. Gotchas
 
@@ -301,10 +301,15 @@ projector on `torch.compile`, the new default). Refresh from a real run.
 - **BF16 SDPA needs contiguous inputs on aarch64.** PyTorch's CPU SDPA with BF16
   *non-contiguous* (transposed) inputs takes a path ~20x slower than the
   contiguous one (Graviton: 86 ms vs 4 ms for a BART-large encoder block); x86
-  is unaffected. The encoder self-attention builds q/k/v with
+  dispatches to the same flash kernel either way and is unaffected (slightly
+  faster non-contiguous). The encoder self-attention builds q/k/v with
   `view().transpose(1, 2)`, so it calls `.contiguous()` before SDPA (the SDPA
-  fallback in `layers/attention.py` does too). Without it, BF16 on Graviton ran
-  at fp32 speed; with it, BF16 is ~2.3x faster than fp32 there.
+  fallback in `layers/attention.py` does too), and so does the vendored DaViT
+  window attention (`models/davit.py`). Without it, BF16 on Graviton ran at fp32
+  speed; with it, BF16 is ~2.3x faster than fp32 there. Measured penalty for
+  the non-contiguous BF16 vision shapes (Graviton, torch 2.14): ~5.5x for the
+  window attention, ~19x for the text encoder shape; the vision tower was ~2x
+  slower end-to-end until the window attention was made contiguous.
 
 ## 8. Known limitations / TODO ideas
 
