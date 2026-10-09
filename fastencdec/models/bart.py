@@ -20,8 +20,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from ..attention import cached_cross_attention, paged_attention, store_kvcache
-from ..context import get_context
+from ..attention import cached_cross_attention, paged_attention
 
 ACT2FN = {"gelu": F.gelu}
 
@@ -118,7 +117,6 @@ class BartDecoderSelfAttention(nn.Module):
         self.v_cache = None
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        context = get_context()
         num_tokens = hidden_states.shape[0]
         head = (num_tokens, self.num_heads, self.head_dim)
 
@@ -126,8 +124,9 @@ class BartDecoderSelfAttention(nn.Module):
         key = self.k_proj(hidden_states).view(head)
         value = self.v_proj(hidden_states).view(head)
 
-        store_kvcache(key, value, self.k_cache, self.v_cache, context.slot_mapping)
-        out = paged_attention(query, self.k_cache, self.v_cache, self.scaling)
+        out = paged_attention(
+            query, key, value, self.k_cache, self.v_cache, self.scaling
+        )
         return self.out_proj(out.reshape(num_tokens, self.embed_dim))
 
 

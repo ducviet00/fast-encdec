@@ -69,10 +69,21 @@ def cross_sdpa(
 
 
 def paged_attention(
-    query: torch.Tensor, k_cache: torch.Tensor, v_cache: torch.Tensor, scale: float
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    scale: float,
 ) -> torch.Tensor:
-    """Causal self-attention over the paged cache.  ``query`` is [T, H, D]."""
+    """Write new K/V into the paged cache, then attend causally over it.
+
+    ``query``/``key``/``value`` are ``[T, H, D]``; the new K/V are scattered at
+    ``context.slot_mapping`` before each sequence gathers its cached rows
+    (``context.context_lens`` is the length *after* the write).
+    """
     ctx = get_context()
+    store_kvcache(key, value, k_cache, v_cache, ctx.slot_mapping)
     block_size = k_cache.shape[1]
     outputs = []
     for i in range(ctx.num_seqs):
