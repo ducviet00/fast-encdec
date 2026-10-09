@@ -29,7 +29,7 @@ class SamplingParams:
         return set(self.eos_token_id)
 
 
-@dataclass
+@dataclass(eq=False)
 class Sequence:
     """One decoder hypothesis.
 
