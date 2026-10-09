@@ -177,27 +177,29 @@ PYTHONPATH=. $P benchmarks/benchmark_florence2.py --batches 3,6,12 --beams 1,3,5
 ### Benchmark baseline
 
 Snapshot of `PYTHONPATH=. $P benchmarks/benchmark.py --quick`
-(`bart-large-cnn`, 8 threads, bfloat16, `max_tokens=48`, `num_blocks=1024`,
-`block_size=16`, on the dev CPU). **Every commit must refresh this from a real
-run of the script — replace the numbers with the actual `ours ms` / `speedup`
-output; never hand-edit or guess.**
+(`bart-large-cnn`, 8 threads, bfloat16 for **both** engines, `max_tokens=48`,
+`num_blocks=1024`, `block_size=16`, on the dev CPU). The HF baseline is loaded
+at the same dtype and both engines decode exactly `max_tokens`, so the speedup
+is engine-vs-engine. **Every commit must refresh this from a real run of the
+script — replace the numbers with the actual `ours ms` / `speedup` output;
+never hand-edit or guess.**
 
 | sweep (bf16, enc=256 unless noted) | config | ours ms | speedup vs HF |
 |---|---|---:|---:|
-| batch, beams=1 | batch=1 | 796 | 2.09x |
-| batch, beams=1 | batch=2 | 916 | 1.57x |
-| batch, beams=1 | batch=4 | 1149 | 2.20x |
-| batch, beams=1 | batch=8 | 1650 | 2.47x |
-| batch, beams=4 | batch=1 | 1321 | 2.52x |
-| batch, beams=4 | batch=2 | 1673 | 3.16x |
-| batch, beams=4 | batch=4 | 2414 | 2.96x |
-| batch, beams=4 | batch=8 | 3968 | 3.19x |
-| beams, batch=8 | beams=1 | 1665 | 2.48x |
-| beams, batch=8 | beams=4 | 3988 | 3.20x |
-| dtype, batch=8, beams=4 | float32 | 7088 | 1.93x |
-| dtype, batch=8, beams=4 | bfloat16 | 3894 | 3.30x |
-| enc length, batch=8, beams=1 | enc=128 | 678 | 2.56x |
-| enc length, batch=8, beams=1 | enc=256 | 1649 | 2.44x |
+| batch, beams=1 | batch=1 | 1135 | 1.02x |
+| batch, beams=1 | batch=2 | 1288 | 0.98x |
+| batch, beams=1 | batch=4 | 1568 | 0.93x |
+| batch, beams=1 | batch=8 | 2215 | 0.87x |
+| batch, beams=4 | batch=1 | 1334 | 1.15x |
+| batch, beams=4 | batch=2 | 1695 | 1.18x |
+| batch, beams=4 | batch=4 | 2407 | 1.23x |
+| batch, beams=4 | batch=8 | 3967 | 1.29x |
+| beams, batch=8 | beams=1 | 2184 | 0.88x |
+| beams, batch=8 | beams=4 | 3921 | 1.30x |
+| dtype, batch=8, beams=4 | float32 | 7099 | 1.96x |
+| dtype, batch=8, beams=4 | bfloat16 | 3974 | 1.29x |
+| enc length, batch=8, beams=1 | enc=128 | 1781 | 0.85x |
+| enc length, batch=8, beams=1 | enc=256 | 2196 | 0.88x |
 
 ## 7. Gotchas
 
@@ -208,6 +210,11 @@ output; never hand-edit or guess.**
   `forced_bos_token_id=0` / `forced_eos_token_id=2`, which are applied through
   `transformers`' logits processors (so an explicit `SamplingParams` leaves them
   at `None` to disable them).
+- **Fair benchmarks.** `benchmark.py` loads HF at the run's `--dtype` (never
+  fp32-for-HF vs bf16-for-us) and both engines decode exactly `max_tokens` (EOS
+  suppressed via `min_length=max_tokens+1` / HF `min_new_tokens`). Same
+  precision, the engine wins on beam search and is near parity (slightly
+  behind) for greedy.
 - **Comparing to HF.** To get a clean reference, disable the checkpoint's
   generation config (`forced_bos_token_id=None`, `forced_eos_token_id=None`,
   `min_length=0`, `no_repeat_ngram_size=0`, `length_penalty=1.0`,

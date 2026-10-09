@@ -1,5 +1,11 @@
 """Benchmark Florence-2 on CPU: fast-encdec vs HuggingFace ``generate``.
 
+Fair comparison: both engines run the same dtype (``--dtype``, bf16 by
+default), on the same processor inputs, with neutral decoding (no checkpoint
+heuristics) and the same ``max_new_tokens`` cap.  Both stop each request at
+EOS, so the per-sequence output tokens match; the reported token totals let
+you verify it.
+
 The workload mixes three task types with very different output lengths:
 
     <CAPTION>                              short   (~15 tokens)
@@ -125,6 +131,9 @@ def run_hf(model, processor, workload, max_tokens, beams, warmup, repeats):
                 forced_bos_token_id=None,
                 forced_eos_token_id=None,
                 early_stopping=False,
+                # Neutral decoding, matching run_ours (no checkpoint heuristics).
+                length_penalty=1.0,
+                no_repeat_ngram_size=0,
             )
         rows = []
         for row in out:  # strip decoder-start and trailing padding
@@ -198,7 +207,7 @@ def main():
 
     image = load_image(args.image)
     print(
-        f"model={args.model}  dtype={args.dtype}  image={image.size}  "
+        f"model={args.model}  dtype={args.dtype} (ours and HF)  image={image.size}  "
         f"max_tokens={args.max_tokens}  beam_tokens={args.beam_tokens}"
     )
 

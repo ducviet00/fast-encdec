@@ -1,7 +1,13 @@
 """Benchmark fast-encdec against HuggingFace ``generate`` on CPU.
 
-Sweeps batch size, beam width, dtype and encoder length, reporting latency and
-throughput for both engines.  Example:
+Fair comparison: both engines run the same dtype, on the same inputs, with the
+same decoding parameters, and generate the same number of output tokens.  The
+HF baseline is loaded at the run's ``--dtype`` (bf16 by default) rather than
+fp32, so the reported speedup reflects the engine, not the precision.
+
+Both engines decode exactly ``--max-tokens`` tokens: EOS is suppressed so the
+work per request is identical regardless of where a hypothesis would naturally
+stop.  Example:
 
     PYTHONPATH=. python benchmarks/benchmark.py --model facebook/bart-large-cnn
     PYTHONPATH=. python benchmarks/benchmark.py --quick
@@ -49,7 +55,8 @@ PARAGRAPHS = [
 ]
 
 # Decoding heuristics that make BART checkpoints produce sensible summaries.
-DECODE = {"length_penalty": 2.0, "no_repeat_ngram_size": 3, "min_length": 8}
+# ``min_length`` is set per run to force a fixed output length (see ``params``).
+DECODE = {"length_penalty": 2.0, "no_repeat_ngram_size": 3}
 
 
 def make_prompt(tokenizer, target_tokens: int) -> str:
@@ -76,6 +83,30 @@ def timed(fn, warmup: int, repeats: int):
     return best, last
 
 
+def params_for(max_tokens: int, beams: int) -> SamplingParams:
+    """Fixed-length decoding: ``min_length`` masks EOS for the whole run.
+
+    The decoder prompt is a single token, so ``max_tokens + 1`` is the total
+    decoder length at which EOS becomes legal — i.e. it is never emitted.  This
+    mirrors HF's ``min_new_tokens=max_tokens`` so both engines decode exactly
+    ``max_tokens`` tokens.
+    """
+    return SamplingParams(
+        max_tokens=max_tokens, num_beams=beams, min_length=max_tokens + 1, **DECODE
+    )
+
+
+def count_generated(rows, pad_token_id) -> int:
+    """Count generated tokens, dropping the decoder-start token and padding."""
+    total = 0
+    for row in rows:
+        toks = row.tolist()[1:]
+        while toks and toks[-1] == pad_token_id:
+            toks.pop()
+        total += len(toks)
+    return total
+
+
 def bench_ours(llm, prompts, params, warmup, repeats):
     dt, _ = timed(
         lambda: llm.generate(prompts, sampling_params=params), warmup, repeats
@@ -88,6 +119,7 @@ def bench_hf(hf, tokenizer, prompts, max_new, beams, warmup, repeats):
     enc = tokenizer(prompts, return_tensors="pt", padding=True)
     kwargs = dict(
         max_new_tokens=max_new,
+        min_new_tokens=max_new,  # fixed length: EOS suppressed until max_new
         num_beams=beams,
         do_sample=False,
         forced_bos_token_id=None,
@@ -101,8 +133,7 @@ def bench_hf(hf, tokenizer, prompts, max_new, beams, warmup, repeats):
             return hf.generate(**enc, **kwargs)
 
     dt, out = timed(run, warmup, repeats)
-    generated = int((out != tokenizer.pad_token_id).sum())
-    return dt, generated
+    return dt, count_generated(out, tokenizer.pad_token_id)
 
 
 def row(label, ours_dt, ours_tok, hf_dt, hf_tok, n):
@@ -147,7 +178,6 @@ def main():
 
     transformers.logging.set_verbosity_error()
     tokenizer = AutoTokenizer.from_pretrained(args.model)
-    hf = AutoModelForSeq2SeqLM.from_pretrained(args.model, dtype=torch.float32).eval()
 
     def build_llm(dt):
         return LLM(
@@ -158,7 +188,12 @@ def main():
             dtype=dt,
         )
 
+    def build_hf(dt):
+        # Same dtype as ``build_llm`` — never fp32-for-HF vs bf16-for-us.
+        return AutoModelForSeq2SeqLM.from_pretrained(args.model, dtype=dt).eval()
+
     llm = build_llm(dtype)
+    hf = build_hf(dtype)
     prompt_cache = {}
     raw = []
 
@@ -167,13 +202,18 @@ def main():
             prompt_cache[enc_tokens] = make_prompt(tokenizer, enc_tokens)
         return [prompt_cache[enc_tokens]] * n
 
-    def run(label, n, beams, llm_, dtype_name, enc_tokens):
+    def run(label, n, beams, llm_, hf_, dtype_name, enc_tokens):
         prompts = prompts_for(n, enc_tokens)
-        params = SamplingParams(max_tokens=args.max_tokens, num_beams=beams, **DECODE)
+        params = params_for(args.max_tokens, beams)
         ours_dt, ours_tok = bench_ours(llm_, prompts, params, args.warmup, args.repeats)
         hf_dt, hf_tok = bench_hf(
-            hf, tokenizer, prompts, args.max_tokens, beams, args.warmup, args.repeats
+            hf_, tokenizer, prompts, args.max_tokens, beams, args.warmup, args.repeats
         )
+        if ours_tok != hf_tok:
+            raise RuntimeError(
+                f"{label}: output token mismatch (ours={ours_tok}, hf={hf_tok}); "
+                "the two engines must decode the same number of tokens"
+            )
         raw.append(
             {
                 "label": label,
@@ -183,15 +223,16 @@ def main():
                 "encoder_tokens": enc_tokens,
                 "ours_ms": ours_dt * 1e3,
                 "hf_ms": hf_dt * 1e3,
+                "tokens": ours_tok,
             }
         )
         return row(label, ours_dt, ours_tok, hf_dt, hf_tok, n)
 
     print("# fast-encdec benchmark\n", flush=True)
     print(
-        f"model={args.model}  threads={args.threads}  dtype={args.dtype}  "
-        f"max_tokens={args.max_tokens}  num_blocks={args.num_blocks}  "
-        f"block_size={args.block_size}",
+        f"model={args.model}  threads={args.threads}  dtype={args.dtype} "
+        f"(ours and HF)  max_tokens={args.max_tokens}  "
+        f"num_blocks={args.num_blocks}  block_size={args.block_size}",
         flush=True,
     )
 
@@ -201,7 +242,7 @@ def main():
     table(
         f"batch scaling (beams=1, {args.dtype}, enc={args.encoder_tokens})",
         [
-            run(f"batch={n}", n, 1, llm, args.dtype, args.encoder_tokens)
+            run(f"batch={n}", n, 1, llm, hf, args.dtype, args.encoder_tokens)
             for n in batch_sizes
         ],
     )
@@ -209,7 +250,7 @@ def main():
     table(
         f"batch scaling (beams=4, {args.dtype}, enc={args.encoder_tokens})",
         [
-            run(f"batch={n}", n, 4, llm, args.dtype, args.encoder_tokens)
+            run(f"batch={n}", n, 4, llm, hf, args.dtype, args.encoder_tokens)
             for n in batch_sizes
         ],
     )
@@ -217,7 +258,7 @@ def main():
     table(
         f"beam scaling (batch=8, {args.dtype}, enc={args.encoder_tokens})",
         [
-            run(f"beams={b}", 8, b, llm, args.dtype, args.encoder_tokens)
+            run(f"beams={b}", 8, b, llm, hf, args.dtype, args.encoder_tokens)
             for b in beam_widths
         ],
     )
@@ -230,6 +271,7 @@ def main():
                 8,
                 4,
                 build_llm(getattr(torch, dt_name)),
+                build_hf(getattr(torch, dt_name)),
                 dt_name,
                 args.encoder_tokens,
             )
@@ -240,7 +282,7 @@ def main():
     enc_lengths = [128, 256] if args.quick else [128, 256, 512, 1000]
     table(
         f"encoder length (batch=8, beams=1, {args.dtype})",
-        [run(f"enc={e}", 8, 1, llm, args.dtype, e) for e in enc_lengths],
+        [run(f"enc={e}", 8, 1, llm, hf, args.dtype, e) for e in enc_lengths],
     )
 
     if args.json:

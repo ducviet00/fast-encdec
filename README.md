@@ -222,25 +222,33 @@ PYTHONPATH=. python benchmarks/benchmark.py --quick    # fast smoke
 ```
 
 It sweeps batch size, beam width, dtype and encoder length, comparing fast-encdec
-against HuggingFace `generate` on the same machine (latency, req/s, tok/s,
-speedup).
+against HuggingFace `generate` on the same machine, at the **same dtype, same
+inputs and same decoding**, with a fixed output length (EOS suppressed) so both
+engines do identical work (latency, req/s, tok/s, speedup).
 
-Full sweep — `facebook/bart-large-cnn`, 8 threads, BF16, 48 tokens, encoder
-length 256:
+The same-precision comparison is the honest one. The paged cache and block
+sharing win on **beam search** (each step avoids HF's per-step cache reordering),
+while greedy decoding is near parity — HF's batched SDPA edges out our
+per-sequence attention when there is no padding or beam work to exploit.
+
+Full sweep — `facebook/bart-large-cnn`, 8 threads, BF16 for both engines, 48
+tokens, encoder length 256:
 
 | config | ours ms | hf ms | speedup |
 |---|---:|---:|---:|
-| batch=1, beams=1 | 835 | 1695 | 2.0× |
-| batch=8, beams=1 | 1916 | 4185 | 2.2× |
-| batch=16, beams=1 | 3138 | 6038 | 1.9× |
-| batch=1, beams=4 | 550 | 3319 | 6.0× |
-| batch=8, beams=4 | 1992 | 12580 | 6.3× |
-| batch=16, beams=4 | 3681 | 20853 | 5.7× |
+| batch=1, beams=1 | 1150 | 1159 | 1.01× |
+| batch=8, beams=1 | 2187 | 1907 | 0.87× |
+| batch=16, beams=1 | 3439 | 2869 | 0.83× |
+| batch=1, beams=4 | 1332 | 1534 | 1.15× |
+| batch=8, beams=4 | 3965 | 5123 | 1.29× |
+| batch=16, beams=4 | 7043 | 10977 | 1.56× |
 
-Other axes: BF16 is ~1.7× faster than FP32 in our engine (1984 ms vs 3337 ms
-at batch=8/beams=4); the speedup shrinks as the encoder grows (2.3× at
-enc=128 → 1.7× at enc=1000) because the encoder is GEMM-bound and both engines
-use the same oneDNN matmuls.
+Other axes: at batch=8/beams=4 the same-precision speedup is ~1.3× in BF16 and
+~1.9× in FP32; HF gains more from BF16 than we do (it speeds up 2.7× going
+FP32→BF16, ours 1.8×). For greedy decoding (batch=8, beams=1) our per-sequence
+attention is ~15% slower than HF's batched SDPA (0.84× at enc=128), but the gap
+narrows as the encoder grows (0.93× at enc=1000) since the encoder is
+GEMM-bound and both engines share the same oneDNN matmuls.
 
 ### Florence-2
 
@@ -253,26 +261,26 @@ PYTHONPATH=. python benchmarks/benchmark_florence2.py --quick
 PYTHONPATH=. python benchmarks/benchmark_florence2.py --batches 3,6,12 --beams 1,3,5
 ```
 
-`florence-community/Florence-2-base`, BF16, `<CAPTION>`/`<OD>`/`<REFERRING_EXPRESSION_SEGMENTATION>`,
-max 256 tokens, ~15/25/256 output tokens:
+`florence-community/Florence-2-base`, BF16 for both engines, `<CAPTION>`/`<OD>`/`<REFERRING_EXPRESSION_SEGMENTATION>`,
+max 256 tokens, ~13/22/256 output tokens:
 
 | sweep | ours ms | hf ms | speedup |
 |---|---:|---:|---:|
-| greedy batch=3 | 3627 | 4518 | 1.25× |
-| greedy batch=6 | 5900 | 6923 | 1.17× |
-| greedy batch=12 | 10227 | 11994 | 1.17× |
-| beams=1 | 2458 | 2892 | 1.18× |
-| beams=3 | 2865 | 4520 | 1.58× |
-| beams=5 | 3209 | 5917 | 1.84× |
-| N=24, running window=12 | 18117 | 22849 | 1.26× |
+| greedy batch=3 | 3764 | 4430 | 1.18× |
+| greedy batch=6 | 6000 | 6649 | 1.11× |
+| greedy batch=12 | 10418 | 11670 | 1.12× |
+| beams=1 | 2559 | 2830 | 1.11× |
+| beams=3 | 2940 | 4462 | 1.52× |
+| beams=5 | 3247 | 5824 | 1.79× |
+| N=24, running window=12 | 17315 | 22041 | 1.27× |
 
-The win is real but smaller than BART's, for two reasons: the DaViT vision
-encoder is a large cost shared by both engines (~0.5 s/image here), and our CPU
-attention is a per-sequence Python loop, roughly 1.6× slower per decode step
-than HF's batched SDPA.  The no-padding / continuous-batching savings therefore
-only partly translate into wall-clock time.  Beam search benefits most, because
-the paged cache shares blocks instead of reordering a full beam cache each step;
-the decode-only advantage is ~1.6–1.8×.
+The win comes from **not padding**: the mixed batch has a 13/22/256-token
+spread, and fast-encdec never decodes the padding positions HF carries.
+Beam search benefits most, because the paged cache shares blocks instead of
+reordering a full beam cache each step (up to 1.79×); greedy is a more modest
+1.1–1.2×, since the DaViT vision encoder (~0.5 s/image here) is a large cost
+shared by both engines and our per-sequence CPU attention can be slower than
+HF's batched SDPA.
 
 `LLM(..., compile_mm_encoder=True)` compiles the shared vision tower
 (~1.3–1.5×, ≈1.15× end-to-end); it may change the decoded tokens, so it is off
