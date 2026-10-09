@@ -5,7 +5,7 @@ encoder + BART language model) through :class:`Florence2LLM`."""
 __version__ = "0.1.0"
 
 import torch
-from transformers import AutoConfig, AutoTokenizer
+from transformers import AutoConfig, AutoTokenizer, GenerationConfig
 
 from .block_manager import BlockManager
 from .engine import LLMEngine
@@ -13,6 +13,14 @@ from .loader import load_hf_weights
 from .models.bart import BartForConditionalGeneration
 from .models.florence2 import Florence2ForConditionalGeneration
 from .sequence import SamplingParams
+
+
+def _load_generation_config(model_path: str) -> GenerationConfig:
+    """Load the checkpoint's ``GenerationConfig``, or a bare default."""
+    try:
+        return GenerationConfig.from_pretrained(model_path)
+    except OSError:
+        return GenerationConfig()
 
 
 class LLM:
@@ -45,14 +53,19 @@ class LLM:
         load_hf_weights(self.model, model_path)
         self.model.to(dtype)
 
+        self.generation_config = _load_generation_config(model_path)
+        self.decoder_start_token_id = config.decoder_start_token_id
+        self.eos_token_id = config.eos_token_id
+        self.default_sampling_params = SamplingParams.from_generation_config(
+            self.generation_config, self.eos_token_id
+        )
         self.engine = LLMEngine(
             self.model,
             BlockManager(num_blocks, block_size),
             max_num_seqs=max_num_seqs,
             dtype=dtype,
+            eos_token_id=self.eos_token_id,
         )
-        self.decoder_start_token_id = config.decoder_start_token_id
-        self.eos_token_id = config.eos_token_id
 
     def _decode(self, token_ids: list[int]) -> str:
         return self.tokenizer.decode(token_ids, skip_special_tokens=True)
@@ -68,9 +81,7 @@ class LLM:
         if isinstance(encoder_prompts, str):
             encoder_prompts = [encoder_prompts]
         if sampling_params is None:
-            sampling_params = SamplingParams()
-        if sampling_params.eos_token_id is None:
-            sampling_params.eos_token_id = self.eos_token_id
+            sampling_params = self.default_sampling_params
 
         encoder_ids = self.tokenizer(
             encoder_prompts, add_special_tokens=True, padding=False
@@ -133,14 +144,19 @@ class Florence2LLM:
         if compile_mm_encoder:
             self.model.compile_mm_encoder()
 
+        self.generation_config = _load_generation_config(model_path)
+        self.decoder_start_token_id = config.text_config.decoder_start_token_id
+        self.eos_token_id = config.text_config.eos_token_id
+        self.default_sampling_params = SamplingParams.from_generation_config(
+            self.generation_config, self.eos_token_id
+        )
         self.engine = LLMEngine(
             self.model,
             BlockManager(num_blocks, block_size),
             max_num_seqs=max_num_seqs,
             dtype=dtype,
+            eos_token_id=self.eos_token_id,
         )
-        self.decoder_start_token_id = config.text_config.decoder_start_token_id
-        self.eos_token_id = config.text_config.eos_token_id
 
     @torch.no_grad()
     def generate(
@@ -163,9 +179,7 @@ class Florence2LLM:
         if len(images) != len(prompts):
             raise ValueError("prompts and images must have the same length")
         if sampling_params is None:
-            sampling_params = SamplingParams()
-        if sampling_params.eos_token_id is None:
-            sampling_params.eos_token_id = self.eos_token_id
+            sampling_params = self.default_sampling_params
 
         request_ids = []
         for prompt, image in zip(prompts, images):

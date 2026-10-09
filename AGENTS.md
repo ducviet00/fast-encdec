@@ -58,7 +58,8 @@ fastencdec/
   loader.py          HF checkpoint -> model weight loading
   model_runner.py    batching, KV cache, encoder caching, forward
   engine.py          Scheduler (continuous batching) + beam search
-  sampler.py         greedy / temperature / top-p / n-gram banning
+  logits_processor.py transformers LogitsProcessorList from SamplingParams
+  sampler.py         greedy / multinomial sampling on processed logits
 examples/summarize.py
 examples/florence2.py
 benchmarks/benchmark.py
@@ -117,10 +118,15 @@ LLMEngine.run()                   # sample (greedy) or beam-expand; free finishe
 8. **Global context.** `context.set_context` is called once per forward;
    attention layers read it via `context.get_context()`. It is not thread-safe
    and assumes a single in-flight forward.
-9. **EOS.** `LLM.generate` fills `SamplingParams.eos_token_id` from the model
-   config when unset. Generation heuristics: `length_penalty` ranks finished
-   beams, `min_length` masks EOS early, `no_repeat_ngram_size` bans repeated
-   n-grams (`sampler.banned_tokens`).
+9. **EOS.** `LLMEngine.add_request` fills `SamplingParams.eos_token_id` from the
+   model config when unset. Logits processing is delegated to `transformers`'
+   `LogitsProcessorList` (built in `logits_processor.build_logits_processor`),
+   so `min_length`, `no_repeat_ngram_size`, `repetition_penalty`, forced BOS/EOS,
+   suppressed tokens and the sampling warpers match `generate`. `LLM.generate`
+   uses the checkpoint's `GenerationConfig` (via
+   `SamplingParams.from_generation_config`) when called without params; an
+   explicit `SamplingParams` fully overrides those defaults. `length_penalty`
+   ranks finished beams.
 10. **Multimodal inputs (Florence-2).** `Sequence.pixel_values` carries the
     request image `[3, H, W]`; `_encode` groups fresh sequences by
     `(encoder length, image shape)` and the model scatters projected visual
@@ -157,9 +163,11 @@ PYTHONPATH=. $P benchmarks/benchmark_florence2.py --batches 3,6,12 --beams 1,3,5
 
 - **`bart-large-cnn` needs decoding heuristics.** Without `length_penalty=2.0`,
   `no_repeat_ngram_size=3`, `min_length=8` it collapses to short/repetitive
-  output. The checkpoint's `generation_config.json` also sets
-  `forced_bos_token_id=0` / `forced_eos_token_id=2`, which are **not**
-  implemented.
+  output. Those come from `generation_config.json` automatically when
+  `generate` is called without `SamplingParams`; the checkpoint also sets
+  `forced_bos_token_id=0` / `forced_eos_token_id=2`, which are applied through
+  `transformers`' logits processors (so an explicit `SamplingParams` leaves them
+  at `None` to disable them).
 - **Comparing to HF.** To get a clean reference, disable the checkpoint's
   generation config (`forced_bos_token_id=None`, `forced_eos_token_id=None`,
   `min_length=0`, `no_repeat_ngram_size=0`, `length_penalty=1.0`,

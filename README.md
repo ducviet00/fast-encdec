@@ -33,7 +33,8 @@ fastencdec/
   loader.py        # HuggingFace -> model weight loading
   model_runner.py  # batching, KV cache, encoder caching, forward
   engine.py        # scheduler (continuous batching) + beam search loop
-  sampler.py       # greedy / temperature / top-p / n-gram banning
+  logits_processor.py # transformers LogitsProcessorList from SamplingParams
+  sampler.py       # greedy / multinomial sampling on processed logits
   __init__.py      # LLM facade (BART) and Florence2LLM facade
 ```
 
@@ -69,20 +70,32 @@ print(
 
 ### Generation heuristics
 
-BART checkpoints ship decoding settings in `generation_config.json`. Pass them
-explicitly when they matter — `bart-large-cnn` collapses to short/repetitive
-output without them:
+Decoding runs through HuggingFace's logits processors
+(`LogitsProcessorList`), so `min_length`, `no_repeat_ngram_size`,
+`repetition_penalty`, `forced_bos_token_id` / `forced_eos_token_id`,
+`suppress_tokens` and the sampling warpers (temperature / top-k / top-p)
+behave exactly as in `generate`. When no `SamplingParams` is passed they are
+taken from the checkpoint's `generation_config.json`:
+
+```python
+llm.generate(article)  # checkpoint defaults
+llm.generate(article, SamplingParams(max_tokens=48))  # explicit; neutral elsewhere
+```
+
+For `bart-large-cnn` the default is `num_beams=4`, `length_penalty=2.0`,
+`no_repeat_ngram_size=3`, `min_length=56`, `forced_bos_token_id=0`,
+`forced_eos_token_id=2`. Passing a `SamplingParams` overrides the defaults
+entirely, so reproduce a "clean" reference (e.g. for parity tests) with:
 
 ```python
 SamplingParams(
-    max_tokens=48, num_beams=4, length_penalty=2.0, no_repeat_ngram_size=3, min_length=8
+    max_tokens=48, num_beams=1, length_penalty=2.0, no_repeat_ngram_size=3, min_length=8
 )
 ```
 
-`length_penalty` is applied when ranking finished hypotheses, `min_length` masks
-EOS until enough tokens are produced, and `no_repeat_ngram_size` bans tokens
-that would repeat an n-gram. (`forced_bos_token_id` / `forced_eos_token_id` are
-not implemented.)
+`length_penalty` ranks finished hypotheses, `min_length` masks EOS (counting
+the decoder prompt, as `generate` does), and `no_repeat_ngram_size` bans tokens
+that would repeat an n-gram.
 
 ## Florence-2
 
