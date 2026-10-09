@@ -23,6 +23,11 @@ class Scheduler:
         self.max_num_seqs = max_num_seqs
 
     def add(self, seq: Sequence) -> None:
+        if seq.sampling.num_beams > self.max_num_seqs:
+            raise ValueError(
+                f"num_beams ({seq.sampling.num_beams}) exceeds "
+                f"max_num_seqs ({self.max_num_seqs})"
+            )
         self.waiting.append(seq)
 
     def add_running(self, seq: Sequence) -> None:
@@ -35,8 +40,19 @@ class Scheduler:
         return bool(self.waiting or self.running)
 
     def schedule(self) -> list[Sequence]:
-        while self.waiting and len(self.running) < self.max_num_seqs:
-            self.running.append(self.waiting.popleft())
+        # A request expands to ``num_beams`` sequences once beam search starts,
+        # so charge every in-flight request its full beam width.  Counting
+        # sequences directly would admit ``max_num_seqs`` seeds and then
+        # overflow the batch on the following step.
+        widths = {seq.request_id: seq.sampling.num_beams for seq in self.running}
+        used = sum(widths.values())
+        while self.waiting:
+            seq = self.waiting[0]
+            if used + seq.sampling.num_beams > self.max_num_seqs:
+                break
+            self.waiting.popleft()
+            self.running.append(seq)
+            used += seq.sampling.num_beams
         return list(self.running)
 
 

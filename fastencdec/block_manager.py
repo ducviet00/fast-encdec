@@ -20,6 +20,26 @@ class BlockManager:
         self.ref_count[block] = 1
         return block
 
+    def required_new_blocks(self, seq, num_new_tokens: int) -> int:
+        """Upper bound on the fresh blocks :meth:`ensure_capacity` allocates.
+
+        Counts the blocks the sequence still has to grow into plus one
+        copy-on-write copy per existing block it is about to write while
+        shared.  It can overcount when several sequences share a block that
+        only the first of them copies, so it is safe to reserve with.
+        """
+        if num_new_tokens <= 0:
+            return 0
+        bs = self.block_size
+        start = seq.num_cached_tokens
+        end = start + num_new_tokens
+        old = len(seq.block_table)
+        count = max(0, (end + bs - 1) // bs - old)
+        for i in range(start // bs, (end - 1) // bs + 1):
+            if i < old and self.ref_count[seq.block_table[i]] > 1:
+                count += 1
+        return count
+
     def ensure_capacity(self, seq, num_new_tokens: int, copy_block) -> None:
         """Grow ``seq`` and make every block it will write to private."""
         bs = self.block_size

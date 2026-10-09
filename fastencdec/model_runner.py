@@ -67,6 +67,16 @@ class ModelRunner:
 
     def _prepare(self, seqs):
         bs = self.block_manager.block_size
+        # Reserve the whole batch's blocks before mutating anything so a full
+        # cache raises cleanly instead of leaving sequences half-prepared.
+        required = sum(
+            self.block_manager.required_new_blocks(
+                seq, len(seq.token_ids) - seq.num_cached_tokens
+            )
+            for seq in seqs
+        )
+        if required > len(self.block_manager.free_blocks):
+            raise RuntimeError("KV cache is full; increase num_blocks")
         input_ids, positions, slot_mapping = [], [], []
         query_start_loc = [0]
         context_lens, block_tables = [], []
