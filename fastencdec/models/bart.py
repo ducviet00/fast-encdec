@@ -113,8 +113,8 @@ class BartDecoderSelfAttention(nn.Module):
         self.out_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
 
         # Assigned by the model runner: [num_blocks, block_size, heads, head_dim].
-        self.k_cache = None
-        self.v_cache = None
+        self.k_cache = torch.empty([])
+        self.v_cache = torch.empty([])
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         num_tokens = hidden_states.shape[0]
