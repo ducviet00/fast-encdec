@@ -433,6 +433,18 @@ on this box with the same kind of workload.
   illegal indices), so `_self_derived` no longer precomputes `(block, pos)`. It
   falls back to eager when `len(seqs) > max_bs` and re-captures if the
   cross-cache capacity grows (new requests admitted mid-run).
+- **`torch.compile` (`compile_model=True`, default off) is a net loss here.**
+  Measured on the L4 (`bart-large-cnn`, enc=512, out=256): eager 3943 tok/s vs
+  1890 compiled; with the CUDA graph 3931 vs 3835. `torch.compile` treats every
+  flash call as a graph break (`flash_attn_interface.py:fwd_kvcache`), so the
+  decoder compiles into ~24 tiny regions per step (one per attention call) and
+  Dynamo's per-break overhead beats any fusion. (nano-vllm compiles its whole
+  model because its attention is fully traceable.) The flag is kept to re-test
+  once the kernel wrapper is traceable; the CUDA graph already provides the
+  launch-overhead win. Two changes made for it are kept: `flash_attn.module()` is
+  a resolved-once global rather than `functools.lru_cache` (Dynamo inlines an
+  `lru_cache` body and would trace the Hub download), and the flash
+  self-attention path reads the Context directly instead of the per-step memo.
 - **BF16 SDPA needs contiguous inputs on aarch64.** PyTorch's CPU SDPA with BF16
   *non-contiguous* (transposed) inputs takes a path ~20x slower than the
   contiguous one (Graviton: 86 ms vs 4 ms for a BART-large encoder block); x86

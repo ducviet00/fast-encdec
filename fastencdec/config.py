@@ -24,6 +24,9 @@ class Config:
         device: ``"cpu"`` or ``"cuda"`` (``"cuda:N"`` also works).
         use_cudagraph: capture the decoder step into a CUDA graph (CUDA +
             FlashAttention-2 only; default off).  Prototype.
+        compile_model: ``torch.compile`` the decoder (default off), like
+            nano-vllm.  Ignored for Florence-2's vision tower, which has its own
+            ``compile_mm_encoder``.
     """
 
     num_blocks: int = 512
@@ -33,6 +36,7 @@ class Config:
     attn_backend: str = "auto"
     device: str = "cpu"
     use_cudagraph: bool = False
+    compile_model: bool = False
 
     def __post_init__(self) -> None:
         if self.block_size is None:

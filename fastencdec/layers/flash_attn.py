@@ -11,7 +11,6 @@ compiled for; :func:`supported` is the gate the model runner uses.
 """
 
 import contextlib
-import functools
 
 import torch
 
@@ -28,13 +27,11 @@ def supported(dtype: torch.dtype, head_dim: int) -> bool:
     return dtype in _FLOAT_DTYPES and head_dim in _HEAD_DIMS
 
 
-@functools.lru_cache(maxsize=1)
-def module():
-    """The loaded kernel module, or ``None`` if it could not be loaded.
+_MODULE = None
+_RESOLVED = False
 
-    ``kernels`` >= 0.17 requires an explicit kernel API version; try the known
-    stable ones, then a version-less call for older releases.
-    """
+
+def _load():
     try:
         from kernels import get_kernel
     except Exception:  # noqa: BLE001 - kernels not installed
@@ -44,6 +41,20 @@ def module():
         with contextlib.suppress(Exception):  # try the next version on failure
             return get_kernel(KERNEL_ID, **kwargs)
     return None
+
+
+def module():
+    """The loaded kernel module, or ``None`` if it could not be loaded.
+
+    Resolved once into a plain global rather than via ``functools.lru_cache``:
+    ``torch.compile`` inlines an ``lru_cache`` body and would trace the Hub
+    download, whereas a warm global read just becomes a guard.
+    """
+    global _MODULE, _RESOLVED
+    if not _RESOLVED:
+        _MODULE = _load()
+        _RESOLVED = True
+    return _MODULE
 
 
 def require():

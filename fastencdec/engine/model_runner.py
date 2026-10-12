@@ -24,6 +24,7 @@ class ModelRunner:
         device="cpu",
         max_num_seqs=32,
         use_cudagraph=False,
+        compile_model=False,
     ):
         self.device = torch.device(device)
         self.model = model.eval()
@@ -31,6 +32,9 @@ class ModelRunner:
         self.block_size = block_manager.block_size
         self.dtype = dtype
         self.decoder_layers = list(model.decoder_layers)
+        # torch.compile the decoder (nano-vllm style); the paged attention ops
+        # graph-break, so this fuses the model's pointwise work around them.
+        self.decoder = torch.compile(model.decoder) if compile_model else model.decoder
 
         attention.set_backend(attn_backend)
 
@@ -185,7 +189,7 @@ class ModelRunner:
                 return self.model.compute_logits(hidden)
 
         set_context(**fields)
-        hidden = self.model.decoder(input_ids, positions)
+        hidden = self.decoder(input_ids, positions)
         # One new token per sequence (the decoder prompt is a single token), so
         # the logits are just the rows in sequence order.
         return self.model.compute_logits(hidden)

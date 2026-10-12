@@ -133,6 +133,11 @@ the per-step host launch overhead that dominates small-batch latency. It needs
 the CUDA + FlashAttention-2 path and keeps a fixed preallocated encoder cache;
 see `fastencdec/engine/cudagraph.py` and the AGENTS gotchas.
 
+`compile_model=True` (default off) wraps the decoder in `torch.compile`.
+Measured on this stack it is a **net loss** (the flash wrapper graph-breaks on
+every call, so the decoder compiles into one tiny region per attention call and
+Dynamo's per-break overhead beats the fusion), which is why it is off by default.
+
 ### Generation heuristics
 
 Decoding runs through HuggingFace's logits processors

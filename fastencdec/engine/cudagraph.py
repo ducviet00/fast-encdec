@@ -192,12 +192,12 @@ class DecodeGraphRunner:
         self._fill_sentinels()
         for bs in reversed(self.graph_bs):
             self._set_context(bs)
-            b["outputs"][:bs] = self.runner.model.decoder(
+            b["outputs"][:bs] = self.runner.decoder(
                 b["input_ids"][:bs], b["positions"][:bs]
             )
             graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(graph, self.pool):
-                b["outputs"][:bs] = self.runner.model.decoder(
+                b["outputs"][:bs] = self.runner.decoder(
                     b["input_ids"][:bs], b["positions"][:bs]
                 )
             if self.pool is None:

@@ -236,6 +236,30 @@ def decoder_self_attention(query, key, value, k_cache, v_cache, scale, block_siz
     ctx = get_context()
     num_heads, head_dim = query.shape[1], query.shape[2]
     backend = _paged_backend(query.device, query.dtype, head_dim, block_size)
+    if backend == "flash":
+        # Everything the kernel needs is in the Context, so no per-step memo is
+        # involved -- which keeps the op traceable by torch.compile (Dynamo
+        # would otherwise guard the module-level memo and recompile every step).
+        store_kvcache(
+            key,
+            value,
+            k_cache,
+            v_cache,
+            ctx.slot_mapping,
+            block_size,
+            page_major=True,
+        )
+        out = flash_attn.require().flash_attn_with_kvcache(
+            query.unsqueeze(1),
+            k_cache,
+            v_cache,
+            cache_seqlens=ctx.context_lens,
+            block_table=ctx.block_tables,
+            causal=True,
+            softmax_scale=scale,
+        )
+        return out.squeeze(1)
+
     data = _self_derived(ctx, backend, num_heads, head_dim, query.dtype, block_size)
     _store(
         key,
@@ -247,17 +271,6 @@ def decoder_self_attention(query, key, value, k_cache, v_cache, scale, block_siz
         backend,
         data.get("isa"),
     )
-    if backend == "flash":
-        out = flash_attn.require().flash_attn_with_kvcache(
-            query.unsqueeze(1),
-            k_cache,
-            v_cache,
-            cache_seqlens=data["cache_seqlens"],
-            block_table=ctx.block_tables,
-            causal=True,
-            softmax_scale=scale,
-        )
-        return out.squeeze(1)
     if backend == "vllm":
         return cpu_attn.module().attention_forward(
             query,
