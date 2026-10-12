@@ -1,6 +1,7 @@
-"""fast-encdec: a tiny CPU BART inference library with paged KV cache,
-continuous batching and beam search.  Florence-2 (DaViT vision encoder + BART
-language model) checkpoints are served by the same :class:`LLM` facade.
+"""fast-encdec: a tiny BART inference library with paged KV cache,
+continuous batching and beam search (CPU, with an optional CUDA
+FlashAttention-2 path).  Florence-2 (DaViT vision encoder + BART language
+model) checkpoints are served by the same :class:`LLM` facade.
 
 ``LLM.generate`` mirrors the vLLM offline entrypoint: it takes prompts plus
 optional ``SamplingParams`` and returns ``RequestOutput`` objects (the text is

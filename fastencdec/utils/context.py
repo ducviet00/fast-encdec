@@ -19,14 +19,19 @@ class Context:
         context_lens: Total cached length per sequence, length num_seqs.
         request_ids: Request id per sequence (used for cross-attn cache).
         num_seqs: Number of sequences in the batch.
-        attn_isa: Kernel ISA (``"vec"``/``"vec16"``) or ``None`` for SDPA.
+        attn_backend: ``"vllm"``, ``"flash"`` or ``"sdpa"``; selects the
+            attention implementation for this forward.
+        attn_isa: CPU kernel ISA (``"vec"``/``"vec16"``) or ``None``.
         block_table: int32 ``[num_seqs, max_blocks]`` paged block ids.
         key_slot_ids: ``(block_ids, pos_in_block)`` for every cached key,
-            ordered by sequence (SDPA fallback gather).
+            ordered by sequence (SDPA/kernel gather).
+        cache_seqlens: int32 ``[num_seqs]`` cached length per sequence
+            (FlashAttention-2 paged self-attention).
         cpu_query_start_loc / cpu_seq_lens / dynamic_causal / attn_metadata:
-            int32 inputs and scheduler metadata for the vendored kernel.
-        cross_block_table / cross_seq_lens / cross_metadata: the same for the
-            encoder (cross-attention) paged cache.
+            int32 inputs and scheduler metadata for the vendored CPU kernel.
+        cross_block_table / cross_cache_seqlens / cross_seq_lens / cross_metadata:
+            encoder (cross-attention) paged cache metadata; flash reads the
+            first two, the vLLM kernel the last two.
     """
 
     slot_mapping: object
@@ -34,14 +39,17 @@ class Context:
     context_lens: list
     request_ids: list
     num_seqs: int
+    attn_backend: str = "sdpa"
     attn_isa: str | None = None
     block_table: object | None = None
     key_slot_ids: object | None = None
+    cache_seqlens: object | None = None
     cpu_query_start_loc: object | None = None
     cpu_seq_lens: object | None = None
     dynamic_causal: object | None = None
     attn_metadata: object | None = None
     cross_block_table: object | None = None
+    cross_cache_seqlens: object | None = None
     cross_seq_lens: object | None = None
     cross_metadata: object | None = None
 

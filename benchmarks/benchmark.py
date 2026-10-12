@@ -70,6 +70,12 @@ def make_prompt(tokenizer, target_tokens: int) -> str:
     return tokenizer.decode(ids)
 
 
+def _sync() -> None:
+    """Block on the GPU so GPU timings include kernel execution (no-op on CPU)."""
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+
+
 def timed(fn, warmup: int, repeats: int):
     """Return (best_seconds, last_result)."""
     for _ in range(warmup):
@@ -77,8 +83,10 @@ def timed(fn, warmup: int, repeats: int):
     best = float("inf")
     last = None
     for _ in range(repeats):
+        _sync()
         start = time.perf_counter()
         last = fn()
+        _sync()
         best = min(best, time.perf_counter() - start)
     return best, last
 
@@ -115,8 +123,9 @@ def bench_ours(llm, prompts, params, warmup, repeats):
     return dt, sum(len(x) for x in ids)
 
 
-def bench_hf(hf, tokenizer, prompts, max_new, beams, warmup, repeats):
+def bench_hf(hf, tokenizer, prompts, max_new, beams, warmup, repeats, device="cpu"):
     enc = tokenizer(prompts, return_tensors="pt", padding=True)
+    enc = {key: value.to(device) for key, value in enc.items()}
     kwargs = dict(
         max_new_tokens=max_new,
         min_new_tokens=max_new,  # fixed length: EOS suppressed until max_new
@@ -159,10 +168,16 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", default="facebook/bart-large-cnn")
     ap.add_argument("--threads", type=int, default=8)
+    ap.add_argument("--device", default="cpu", help="cpu or cuda (cuda:N works)")
     ap.add_argument("--dtype", default="bfloat16", choices=["float32", "bfloat16"])
     ap.add_argument("--max-tokens", type=int, default=48)
     ap.add_argument("--num-blocks", type=int, default=1024)
-    ap.add_argument("--block-size", type=int, default=16)
+    ap.add_argument(
+        "--block-size",
+        type=int,
+        default=0,
+        help="0 = device default (256 cuda, 16 cpu)",
+    )
     ap.add_argument("--warmup", type=int, default=1)
     ap.add_argument("--repeats", type=int, default=2)
     ap.add_argument("--encoder-tokens", type=int, default=256)
@@ -173,6 +188,12 @@ def main():
     torch.set_num_threads(args.threads)
     dtype = getattr(torch, args.dtype)
 
+    # Keep the KV token budget (num_blocks * block_size) constant across
+    # devices: the CUDA default block is 256 (flash needs a multiple of 256),
+    # the CPU default is 16.
+    block_size = args.block_size or (256 if str(args.device).startswith("cuda") else 16)
+    num_blocks = max(1, args.num_blocks * 16 // block_size)
+
     import transformers
     from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
 
@@ -182,15 +203,20 @@ def main():
     def build_llm(dt):
         return LLM(
             args.model,
-            num_blocks=args.num_blocks,
-            block_size=args.block_size,
+            num_blocks=num_blocks,
+            block_size=block_size,
             max_num_seqs=64,
             dtype=dt,
+            device=args.device,
         )
 
     def build_hf(dt):
         # Same dtype as ``build_llm`` — never fp32-for-HF vs bf16-for-us.
-        return AutoModelForSeq2SeqLM.from_pretrained(args.model, dtype=dt).eval()
+        return (
+            AutoModelForSeq2SeqLM.from_pretrained(args.model, dtype=dt)
+            .eval()
+            .to(args.device)
+        )
 
     llm = build_llm(dtype)
     hf = build_hf(dtype)
@@ -207,7 +233,14 @@ def main():
         params = params_for(args.max_tokens, beams)
         ours_dt, ours_tok = bench_ours(llm_, prompts, params, args.warmup, args.repeats)
         hf_dt, hf_tok = bench_hf(
-            hf_, tokenizer, prompts, args.max_tokens, beams, args.warmup, args.repeats
+            hf_,
+            tokenizer,
+            prompts,
+            args.max_tokens,
+            beams,
+            args.warmup,
+            args.repeats,
+            args.device,
         )
         if ours_tok != hf_tok:
             raise RuntimeError(
@@ -230,9 +263,9 @@ def main():
 
     print("# fast-encdec benchmark\n", flush=True)
     print(
-        f"model={args.model}  threads={args.threads}  dtype={args.dtype} "
-        f"(ours and HF)  max_tokens={args.max_tokens}  "
-        f"num_blocks={args.num_blocks}  block_size={args.block_size}",
+        f"model={args.model}  device={args.device}  threads={args.threads}  "
+        f"dtype={args.dtype} (ours and HF)  max_tokens={args.max_tokens}  "
+        f"num_blocks={num_blocks}  block_size={block_size}",
         flush=True,
     )
 

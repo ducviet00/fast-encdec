@@ -55,10 +55,12 @@ class LLMEngine:
             self.block_manager,
             config.dtype,
             attn_backend=config.attn_backend,
+            device=config.device,
         )
         self.scheduler = Scheduler(config)
         self.sampler = Sampler()
         self.eos_token_id = eos_token_id
+        self.device = torch.device(config.device)
         self.results: dict[int, list[int]] = {}
         self._finished_beams: dict[int, list[Sequence]] = defaultdict(list)
         self._logits_processor = None
@@ -89,6 +91,7 @@ class LLMEngine:
             max_length=prompt_len + params.max_tokens,
             begin_index=begin_index,
             is_beam=params.num_beams > 1,
+            device=self.device,
         )
 
         request_ids = []
@@ -129,12 +132,15 @@ class LLMEngine:
 
         # Greedy rows are independent, so requests at the same decoder length
         # are served by one processor call; beam needs the per-request ranking.
+        device = logits.device
         buckets: dict[int, list[int]] = {}
         for request_id, indices in groups.items():
             params = seqs[indices[0]].sampling
             if params.num_beams > 1:
                 input_ids = torch.tensor(
-                    [seqs[i].token_ids for i in indices], dtype=torch.long
+                    [seqs[i].token_ids for i in indices],
+                    dtype=torch.long,
+                    device=device,
                 )
                 logprobs = processor(
                     input_ids, torch.log_softmax(logits[indices].float(), dim=-1)
@@ -148,7 +154,7 @@ class LLMEngine:
 
         for indices in buckets.values():
             input_ids = torch.tensor(
-                [seqs[i].token_ids for i in indices], dtype=torch.long
+                [seqs[i].token_ids for i in indices], dtype=torch.long, device=device
             )
             scores = processor(input_ids, logits[indices].float())
             for row, i in enumerate(indices):
@@ -188,7 +194,9 @@ class LLMEngine:
         vocab = logprobs.shape[-1]
 
         # Rank every continuation globally, like HF's beam search.
-        cumulative = torch.tensor([beam.cum_logprob for beam in beams]).unsqueeze(1)
+        cumulative = torch.tensor(
+            [beam.cum_logprob for beam in beams], device=logprobs.device
+        ).unsqueeze(1)
         scores = (logprobs + cumulative).reshape(-1)
         keep = min(max(2, 1 + len(eos_ids)) * num_beams, scores.numel())
         top_scores, top_indices = torch.topk(scores, keep)

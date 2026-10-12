@@ -1,10 +1,10 @@
-"""BART model with CPU paged attention.
+"""BART model with paged attention (vLLM CPU kernel or CUDA FlashAttention-2).
 
 Adapted from the HuggingFace BART reference.  Compared to the GPU version this
 only swaps the attention kernels:
 
-* encoder self-attention stays a plain non-causal SDPA (it runs once and holds
-  no cache),
+* encoder self-attention stays a plain non-causal attention (it runs once and
+  holds no cache),
 * decoder self-attention reads/writes the paged KV cache through the global
   :class:`~fastencdec.utils.context.Context`,
 * decoder cross-attention uses encoder K/V cached per request on the layer.
@@ -20,7 +20,11 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from ..layers.attention import cached_cross_attention, paged_attention
+from ..layers.attention import (
+    cached_cross_attention,
+    dense_attention,
+    paged_attention,
+)
 
 ACT2FN = {"gelu": F.gelu}
 
@@ -87,7 +91,8 @@ class BartEncoderSelfAttention(nn.Module):
         query = self.q_proj(hidden_states).view(shape).transpose(1, 2).contiguous()
         key = self.k_proj(hidden_states).view(shape).transpose(1, 2).contiguous()
         value = self.v_proj(hidden_states).view(shape).transpose(1, 2).contiguous()
-        out = F.scaled_dot_product_attention(query, key, value, is_causal=False)
+        # FlashAttention-2 on CUDA, PyTorch SDPA elsewhere (see the helper).
+        out = dense_attention(query, key, value, causal=False)
         out = out.transpose(1, 2).reshape(*hidden_states.shape[:-1], -1).contiguous()
         return self.out_proj(out)
 
@@ -164,6 +169,8 @@ class BartDecoderCrossAttention(nn.Module):
         self.encoder_kv_cache: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
         # vLLM-kernel paged encoder K/V (set by the model runner when active).
         self.encoder_paged_cache = None
+        # FlashAttention-2 page-major encoder K/V (set by the model runner).
+        self.encoder_flash_cache = None
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         num_tokens = hidden_states.shape[0]

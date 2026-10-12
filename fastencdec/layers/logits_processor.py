@@ -29,6 +29,7 @@ def build_logits_processor(
     max_length: int,
     begin_index: int,
     is_beam: bool,
+    device: str = "cpu",
 ) -> LogitsProcessorList:
     """Assemble the processors for one request's resolved ``SamplingParams``.
 
@@ -37,9 +38,11 @@ def build_logits_processor(
         begin_index: decoder position at which ``begin_suppress_tokens`` apply.
         is_beam: keep at least ``num_eos + 1`` tokens in the warpers so beam
             search always has a non-EOS continuation to explore.
+        device: device the step logits live on (processors index ``scores`` with
+            their token tensors, which must be on the same device).
     """
     eos_ids = sorted(params.eos_ids())
-    eos = torch.tensor(eos_ids, dtype=torch.long) if eos_ids else None
+    eos = torch.tensor(eos_ids, dtype=torch.long, device=device) if eos_ids else None
 
     processors = LogitsProcessorList()
     if params.repetition_penalty != 1.0:
@@ -47,19 +50,25 @@ def build_logits_processor(
     if params.no_repeat_ngram_size > 0:
         processors.append(NoRepeatNGramLogitsProcessor(params.no_repeat_ngram_size))
     if params.min_length > 0 and eos is not None:
-        processors.append(MinLengthLogitsProcessor(params.min_length, eos))
+        processors.append(
+            MinLengthLogitsProcessor(params.min_length, eos, device=device)
+        )
     if params.forced_bos_token_id is not None:
         processors.append(ForcedBOSTokenLogitsProcessor(params.forced_bos_token_id))
     if params.forced_eos_token_id is not None:
         processors.append(
-            ForcedEOSTokenLogitsProcessor(max_length, params.forced_eos_token_id)
+            ForcedEOSTokenLogitsProcessor(
+                max_length, params.forced_eos_token_id, device=device
+            )
         )
     if params.suppress_tokens:
-        processors.append(SuppressTokensLogitsProcessor(params.suppress_tokens))
+        processors.append(
+            SuppressTokensLogitsProcessor(params.suppress_tokens, device=device)
+        )
     if params.begin_suppress_tokens:
         processors.append(
             SuppressTokensAtBeginLogitsProcessor(
-                params.begin_suppress_tokens, begin_index
+                params.begin_suppress_tokens, begin_index, device=device
             )
         )
 

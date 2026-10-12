@@ -47,6 +47,9 @@ class LLM:
             changes the BF16 outputs slightly and compiles once per batch size
             on first use, so pass ``False`` for exact HF parity or to avoid the
             per-shape compile latency.
+        device: ``"cpu"`` (default) or ``"cuda"`` to run on a GPU.  On CUDA the
+            decoder attention uses FlashAttention-2 (``attn_backend="flash"``)
+            when it is available and the shape is supported, else SDPA.
     """
 
     def __init__(
@@ -54,11 +57,12 @@ class LLM:
         model_path: str,
         *,
         num_blocks: int = 512,
-        block_size: int = 16,
+        block_size: int | None = None,
         max_num_seqs: int = 32,
         dtype: torch.dtype = torch.float32,
         attn_backend: str = "auto",
         compile_mm_encoder: bool = True,
+        device: str = "cpu",
     ):
         hf_config = AutoConfig.from_pretrained(model_path)
         self.multimodal = hf_config.model_type == "florence2"
@@ -72,7 +76,7 @@ class LLM:
             self.processor = AutoProcessor.from_pretrained(model_path)
             self.model = Florence2ForConditionalGeneration(hf_config)
             load_hf_weights(self.model, model_path, hf_model_cls=HFFlorence2)
-            self.model.to(dtype)
+            self.model.to(dtype).to(device)
             if compile_mm_encoder:
                 self.model.compile_mm_encoder()
             self.tokenizer = self.processor.tokenizer
@@ -83,7 +87,7 @@ class LLM:
             self.tokenizer = AutoTokenizer.from_pretrained(model_path)
             self.model = BartForConditionalGeneration(hf_config)
             load_hf_weights(self.model, model_path)
-            self.model.to(dtype)
+            self.model.to(dtype).to(device)
             self.decoder_start_token_id = hf_config.decoder_start_token_id
             self.eos_token_id = hf_config.eos_token_id
 
@@ -97,6 +101,7 @@ class LLM:
             max_num_seqs=max_num_seqs,
             dtype=dtype,
             attn_backend=attn_backend,
+            device=device,
         )
         self.engine = LLMEngine(self.model, config, eos_token_id=self.eos_token_id)
 

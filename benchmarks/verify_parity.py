@@ -28,7 +28,26 @@ from fastencdec import LLM, SamplingParams
 
 BART = "facebook/bart-large-cnn"
 FLORENCE = "florence-community/Florence-2-base"
-IMAGE = "/tmp/opencode/florence2_bench.jpg"
+IMAGE = "/tmp/fastencdec/florence2_bench.jpg"
+IMAGE_URL = "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/transformers/tasks/car.jpg"
+
+
+def block_config(device, tokens):
+    """Scale ``num_blocks`` so the KV token budget is device-independent."""
+    block_size = 256 if str(device).startswith("cuda") else 16
+    return max(1, tokens // block_size), block_size
+
+
+def load_image():
+    import urllib.request
+
+    from PIL import Image
+
+    if not os.path.exists(IMAGE):
+        os.makedirs(os.path.dirname(IMAGE), exist_ok=True)
+        urllib.request.urlretrieve(IMAGE_URL, IMAGE)
+    return Image.open(IMAGE).convert("RGB")
+
 
 BART_TEXTS = [
     "The quick brown fox jumps over the lazy dog. " * 6,
@@ -51,12 +70,19 @@ def _status(a, b):
     return f"MISMATCH (len {len(a)} vs {len(b)}, first diff at {first})"
 
 
-def bart(dtype, beams, max_tokens):
+def bart(dtype, beams, max_tokens, device="cpu"):
     from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
 
-    llm = LLM(BART, num_blocks=2048, block_size=16, dtype=dtype)
+    num_blocks, block_size = block_config(device, 2048 * 16)
+    llm = LLM(
+        BART,
+        num_blocks=num_blocks,
+        block_size=block_size,
+        dtype=dtype,
+        device=device,
+    )
     tokenizer = AutoTokenizer.from_pretrained(BART)
-    hf = AutoModelForSeq2SeqLM.from_pretrained(BART, dtype=dtype).eval()
+    hf = AutoModelForSeq2SeqLM.from_pretrained(BART, dtype=dtype).eval().to(device)
 
     params = SamplingParams(
         max_tokens=max_tokens,
@@ -71,6 +97,7 @@ def bart(dtype, beams, max_tokens):
     ]
 
     enc = tokenizer(BART_TEXTS, return_tensors="pt", padding=True)
+    enc = {key: value.to(device) for key, value in enc.items()}
     with torch.no_grad():
         ref = hf.generate(
             **enc,
@@ -89,15 +116,21 @@ def bart(dtype, beams, max_tokens):
         print(f"[{_status(a, b)}] bart beams={beams} seq={i}")
 
 
-def florence(dtype, beams, max_tokens):
-    from PIL import Image
+def florence(dtype, beams, max_tokens, device="cpu"):
     from transformers import AutoProcessor
     from transformers import Florence2ForConditionalGeneration as HFFlorence2
 
-    image = Image.open(IMAGE).convert("RGB")
-    llm = LLM(FLORENCE, num_blocks=4096, block_size=16, dtype=dtype)
+    image = load_image()
+    num_blocks, block_size = block_config(device, 4096 * 16)
+    llm = LLM(
+        FLORENCE,
+        num_blocks=num_blocks,
+        block_size=block_size,
+        dtype=dtype,
+        device=device,
+    )
     processor = AutoProcessor.from_pretrained(FLORENCE)
-    hf = HFFlorence2.from_pretrained(FLORENCE, dtype=dtype).eval()
+    hf = HFFlorence2.from_pretrained(FLORENCE, dtype=dtype).eval().to(device)
 
     prepared = []
     for prompt in FLORENCE_PROMPTS:
@@ -122,6 +155,7 @@ def florence(dtype, beams, max_tokens):
         padding=True,
         return_tensors="pt",
     )
+    inputs = {key: value.to(device) for key, value in inputs.items()}
     pad = processor.tokenizer.pad_token_id
     with torch.no_grad():
         out = hf.generate(
@@ -148,14 +182,15 @@ def florence(dtype, beams, max_tokens):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--dtype", default="bfloat16", choices=["float32", "bfloat16"])
+    ap.add_argument("--device", default="cpu", help="cpu or cuda (cuda:N works)")
     ap.add_argument("--max-tokens", type=int, default=32)
     args = ap.parse_args()
     dtype = getattr(torch, args.dtype)
-    print(f"== {args.dtype} ==", flush=True)
+    print(f"== {args.dtype} on {args.device} ==", flush=True)
     for beams in (1, 4):
-        bart(dtype, beams, args.max_tokens)
+        bart(dtype, beams, args.max_tokens, args.device)
     for beams in (1, 3):
-        florence(dtype, beams, args.max_tokens)
+        florence(dtype, beams, args.max_tokens, args.device)
 
 
 if __name__ == "__main__":

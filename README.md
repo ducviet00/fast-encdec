@@ -90,6 +90,43 @@ compiles `csrc/` (1–3 min) and caches the `.so`. Pass `attn_backend="sdpa"` to
 force the pure-PyTorch path, or `attn_backend="vllm"` to require the kernel
 (raising instead of silently falling back).
 
+### GPU (CUDA)
+
+Pass `device="cuda"` to run the whole engine on a GPU. The model, the paged KV
+cache and every per-step tensor move to the device, the decoder self- and
+cross-attention run on **FlashAttention-2** (the prebuilt
+[`kernels-community/flash-attn2`](https://huggingface.co/kernels-community/flash-attn2)
+kernel, fetched once via the HuggingFace `kernels` library and cached), and the
+DaViT vision tower / BART encoder run through it too:
+
+```python
+llm = LLM(
+    "facebook/bart-large-cnn",
+    num_blocks=1024,
+    dtype=torch.bfloat16,
+    device="cuda",
+)
+```
+
+`attn_backend` behaves the same but picks the CUDA kernel: `"auto"` uses
+FlashAttention-2 when it can (CUDA, fp16/bf16, a supported head dim, a
+compatible block size), else the PyTorch SDPA path; `"flash"` requires it
+(raising otherwise) and `"sdpa"` forces SDPA. FlashAttention-2 only supports
+fp16/bf16 with head dims `{32, 64, 96, 128, 160, 192, 224, 256}`, and its
+*paged* decode kernel needs a page size divisible by 256, so `block_size`
+defaults to 256 on CUDA — fp32, an odd head dim (like the tiny-random-BART test
+model's 4) or an explicit `block_size=16` falls back to SDPA. The kernel is
+loaded lazily, so a CPU-only install never imports it.
+
+On GPU the decoder cache uses FlashAttention-2's page-major
+`[blocks, block_size, heads, head_dim]` layout and `flash_attn_with_kvcache`
+reads it straight through the block table (no gather, one call per layer), with
+`cache_seqlens` carrying the per-sequence context length. Cross-attention stages
+each request's encoder K/V into the same kind of paged cache once per active
+batch, so beams share it and never duplicate K/V. All the paging machinery
+(reference-counted blocks, copy-on-write, continuous batching, beam search) is
+identical on both devices.
+
 ### Generation heuristics
 
 Decoding runs through HuggingFace's logits processors
@@ -188,9 +225,10 @@ own block table, so there is no padding.
 Decoder self-attention is paged. **Cross-attention is dense**: each decoder
 layer keeps `encoder_kv_cache[request_id] -> (k, v)` of shape
 `[heads, enc_len, dim]`, computed once per request and shared by all of its
-beams. With the vLLM backend that dense K/V is staged into a paged cache
-(`EncoderPagedCache`) so cross-attention uses the same kernel; the staging is
-rebuilt only when the set of active requests changes.
+beams. Each kernel stages that dense K/V into its own paged cache (the vLLM
+kernel's `EncoderPagedCache`, or `encoder_flash_cache` for FlashAttention-2) so
+cross-attention uses the same kernel as self-attention; the staging is rebuilt
+only when the set of active requests changes.
 
 For Florence-2 the encoder input is not pure token embeddings: the DaViT tower
 and the multimodal projector produce one visual token per image patch (plus one
@@ -218,6 +256,9 @@ is returned.
 - `tests/test_florence2.py`: image features, encoder hidden states, and
   greedy/beam output match HuggingFace on a tiny random Florence-2, plus
   batched-vs-single equivalence with mixed image sizes.
+- `tests/test_gpu_flash.py` (CUDA only): the FlashAttention-2 paged/cross paths
+  match the SDPA path, on the raw attention kernel and end-to-end through a tiny
+  BART.
 - Greedy decoding matches HuggingFace on `facebook/bart-large-cnn` (the
   `bart-large-cnn` generation config — `forced_bos_token_id`,
   `forced_eos_token_id`, `min_length`, `no_repeat_ngram_size`,
@@ -230,8 +271,10 @@ is returned.
 ```bash
 PYTHONPATH=. python benchmarks/benchmark.py --quick                 # BART, bf16
 PYTHONPATH=. python benchmarks/benchmark.py --dtype float32         # BART, fp32
+PYTHONPATH=. python benchmarks/benchmark.py --quick --device cuda   # BART on GPU
 PYTHONPATH=. python benchmarks/benchmark_florence2.py --quick       # Florence-2, bf16
 PYTHONPATH=. python benchmarks/benchmark_florence2.py --quick --dtype float32
+PYTHONPATH=. python benchmarks/benchmark_florence2.py --quick --device cuda
 ```
 
 It compares fast-encdec against HuggingFace `generate` on the same machine, at
@@ -258,6 +301,9 @@ In **fp32** the engine reproduces HF's tokens exactly — BART and Florence-2,
 greedy and beam, token for token.  In **bf16** the output length always matches
 and the tokens agree except for occasional single-step differences: expected,
 since HF runs its own batched SDPA while fast-encdec runs the vLLM CPU kernel.
+The same holds with `--device cuda` for BART (fp32 and bf16 token-for-token
+against HF on the L4); Florence-2 in bf16 can differ in a few tokens because the
+compiled vision tower shifts the encoder features.
 
 ### Hardware
 
@@ -265,6 +311,7 @@ since HF runs its own batched SDPA while fast-encdec runs the vLLM CPU kernel.
 |---|---|---|---|
 | x86 dev | AMD Ryzen 7 7840H (Zen 4, AVX-512 + `avx512_bf16`, no AMX) | 8 | `vec16` |
 | Graviton 5 | AWS Graviton 5, 8× Arm Neoverse-V3 (BF16 / I8MM / SVE2) | 8 | `neon` |
+| L4 GPU | NVIDIA L4 (sm89, 24 GB) + 4 vCPU (`--device cuda`) | — | flash-attn2 |
 
 Both boxes run torch 2.14 CPU with `block_size=16` and the vendored kernel
 (`attn_backend="auto"`).
@@ -321,6 +368,32 @@ is a large cost shared by both engines, which caps the end-to-end gain.
 (~1.3–1.5×, ≈1.15× end-to-end); it may change the decoded tokens, so it is off
 by default.
 
+### GPU (`--device cuda`, NVIDIA L4)
+
+On a GPU the two engines are much closer.  HF's attention is already fused and a
+small-batch step is launch-bound, so the engine no longer has its kernel
+advantage; FlashAttention-2 keeps it competitive:
+
+| sweep (BART, bf16, enc=256) | config | speedup vs HF |
+|---|---|---:|
+| batch, beams=1 | batch=1 / 2 / 4 / 8 | 1.03× / 1.04× / 1.01× / 0.94× |
+| batch, beams=4 | batch=1 / 2 / 4 / 8 | 1.14× / 1.08× / 0.96× / 0.80× |
+| beams, batch=8 | beams=1 / 4 | 0.96× / 0.79× |
+| dtype, batch=8, beams=4 | bf16 / fp32 | 0.78× / 0.48× |
+
+| sweep (Florence-2, bf16) | config | speedup vs HF |
+|---|---|---:|
+| greedy | batch=3 / 6 | 1.24× / 1.22× |
+| beam (batch=3) | beams=1 / 3 | 1.21× / 1.15× |
+| continuous (N=6) | window=3 / 6 | 0.98× / 1.26× |
+
+Greedy BART is parity and beam search trails slightly; Florence-2 leads (the
+paged, unpadded decoder avoids HF's padded batch decode).  FP32 trails because
+FlashAttention-2 is fp16/bf16-only and the SDPA fallback is slower — use
+`dtype=torch.bfloat16` on a GPU.  Run the GPU benchmarks with
+`--device cuda` (see the commands above); the run above uses `num_blocks=64`,
+`block_size=256`.
+
 ## Limitations
 
 - The scheduler returns the whole running set each step; there is no token
@@ -335,4 +408,6 @@ by default.
 - Attention runs on the vendored vLLM CPU kernel by default (one fused call per
   step); `attn_backend="sdpa"` selects the pure-PyTorch per-sequence loop, which
   is the fallback when the kernel cannot be compiled or the head size is
-  unsupported.
+  unsupported. On CUDA the decoder attention runs on FlashAttention-2's paged
+  decode kernel (`flash_attn_with_kvcache`), which reads the block table
+  directly, so there is no per-step gather.

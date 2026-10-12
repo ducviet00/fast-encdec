@@ -56,6 +56,7 @@ TASKS = [
 
 def load_image(path: str) -> Image.Image:
     if not os.path.exists(path):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
         urllib.request.urlretrieve(IMAGE_URL, path)
     return Image.open(path).convert("RGB")
 
@@ -67,13 +68,21 @@ def workload_of(image, n):
     ]
 
 
+def _sync() -> None:
+    """Block on the GPU so GPU timings include kernel execution (no-op on CPU)."""
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+
+
 def timed(fn, warmup, repeats):
     for _ in range(warmup):
         fn()
     best, result = float("inf"), None
     for _ in range(repeats):
+        _sync()
         start = time.perf_counter()
         result = fn()
+        _sync()
         best = min(best, time.perf_counter() - start)
     return best, result
 
@@ -109,13 +118,16 @@ def run_ours(llm, prepared, max_tokens, beams, warmup, repeats):
     return timed(once, warmup, repeats)
 
 
-def run_hf(model, processor, workload, max_tokens, beams, warmup, repeats):
+def run_hf(
+    model, processor, workload, max_tokens, beams, warmup, repeats, device="cpu"
+):
     inputs = processor(
         text=[p for _, p, _ in workload],
         images=[im for _, _, im in workload],
         padding=True,
         return_tensors="pt",
     )
+    inputs = {key: value.to(device) for key, value in inputs.items()}
     pad = processor.tokenizer.pad_token_id
 
     def once():
@@ -168,7 +180,7 @@ HEADER = (
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", default=DEFAULT_MODEL)
-    parser.add_argument("--image", default="/tmp/opencode/florence2_bench.jpg")
+    parser.add_argument("--image", default="/tmp/fastencdec/florence2_bench.jpg")
     parser.add_argument("--batches", default="3,6,12")
     parser.add_argument("--beams", default="1,3,5")
     parser.add_argument("--requests", type=int, default=24)
@@ -176,6 +188,7 @@ def main():
     parser.add_argument("--max-tokens", type=int, default=256)
     parser.add_argument("--beam-tokens", type=int, default=128)
     parser.add_argument("--dtype", default="bfloat16", choices=["float32", "bfloat16"])
+    parser.add_argument("--device", default="cpu", help="cpu or cuda (cuda:N works)")
     parser.add_argument("--warmup", type=int, default=1)
     parser.add_argument("--repeats", type=int, default=2)
     parser.add_argument("--quick", action="store_true")
@@ -202,26 +215,32 @@ def main():
     beams_list = [int(b) for b in args.beams.split(",") if b]
     windows = [int(w) for w in args.windows.split(",") if w]
     max_seqs = max(max(batches), max(windows), args.requests)
+    # Keep the KV token budget constant across devices (CUDA uses 256-token
+    # blocks so flash's paged kernel applies; CPU uses 16).
+    block_size = 256 if str(args.device).startswith("cuda") else 16
+    num_blocks = max(1, 4096 * 16 // block_size)
 
     from transformers import AutoProcessor
     from transformers import Florence2ForConditionalGeneration as HFFlorence2
 
     image = load_image(args.image)
     print(
-        f"model={args.model}  dtype={args.dtype} (ours and HF)  image={image.size}  "
-        f"max_tokens={args.max_tokens}  beam_tokens={args.beam_tokens}"
+        f"model={args.model}  device={args.device}  dtype={args.dtype} (ours and HF)  "
+        f"image={image.size}  max_tokens={args.max_tokens}  "
+        f"beam_tokens={args.beam_tokens}"
     )
 
     llm = LLM(
         args.model,
-        num_blocks=4096,
-        block_size=16,
+        num_blocks=num_blocks,
+        block_size=block_size,
         max_num_seqs=max_seqs,
         dtype=dtype,
         compile_mm_encoder=args.compile_mm_encoder,
+        device=args.device,
     )
     processor = AutoProcessor.from_pretrained(args.model)
-    hf = HFFlorence2.from_pretrained(args.model, dtype=dtype).eval()
+    hf = HFFlorence2.from_pretrained(args.model, dtype=dtype).eval().to(args.device)
     results = []
 
     # ---------------------------------------------------------- batch scaling
@@ -233,7 +252,14 @@ def main():
             llm, prepared, args.max_tokens, 1, args.warmup, args.repeats
         )
         hf_s, hf_out = run_hf(
-            hf, processor, workload, args.max_tokens, 1, args.warmup, args.repeats
+            hf,
+            processor,
+            workload,
+            args.max_tokens,
+            1,
+            args.warmup,
+            args.repeats,
+            args.device,
         )
         ours_tok = sum(map(len, ours_out))
         hf_tok = sum(map(len, hf_out))
@@ -259,7 +285,14 @@ def main():
             llm, prepared, args.beam_tokens, beams, args.warmup, args.repeats
         )
         hf_s, hf_out = run_hf(
-            hf, processor, workload, args.beam_tokens, beams, args.warmup, args.repeats
+            hf,
+            processor,
+            workload,
+            args.beam_tokens,
+            beams,
+            args.warmup,
+            args.repeats,
+            args.device,
         )
         ours_tok = sum(map(len, ours_out))
         hf_tok = sum(map(len, hf_out))
@@ -281,7 +314,14 @@ def main():
     workload = workload_of(image, args.requests)
     prepared = prepare_ours(llm, workload)
     hf_s, hf_out = run_hf(
-        hf, processor, workload, args.max_tokens, 1, args.warmup, args.repeats
+        hf,
+        processor,
+        workload,
+        args.max_tokens,
+        1,
+        args.warmup,
+        args.repeats,
+        args.device,
     )
     hf_tok = sum(map(len, hf_out))
     print(
