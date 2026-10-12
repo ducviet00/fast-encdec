@@ -1,8 +1,9 @@
 from .attention import (
-    cached_cross_attention,
-    cross_sdpa,
-    paged_attention,
-    store_kvcache,
+    decoder_cross_attention,
+    decoder_self_attention,
+    encoder_self_attention,
+    self_cache_shape,
+    set_backend,
 )
 from .logits_processor import build_logits_processor
 from .sampler import Sampler
@@ -10,8 +11,9 @@ from .sampler import Sampler
 __all__ = [
     "Sampler",
     "build_logits_processor",
-    "cached_cross_attention",
-    "cross_sdpa",
-    "paged_attention",
-    "store_kvcache",
+    "decoder_cross_attention",
+    "decoder_self_attention",
+    "encoder_self_attention",
+    "self_cache_shape",
+    "set_backend",
 ]

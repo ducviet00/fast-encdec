@@ -21,9 +21,9 @@ import torch.nn.functional as F
 from torch import nn
 
 from ..layers.attention import (
-    cached_cross_attention,
-    dense_attention,
-    paged_attention,
+    decoder_cross_attention,
+    decoder_self_attention,
+    encoder_self_attention,
 )
 
 ACT2FN = {"gelu": F.gelu}
@@ -91,8 +91,7 @@ class BartEncoderSelfAttention(nn.Module):
         query = self.q_proj(hidden_states).view(shape).transpose(1, 2).contiguous()
         key = self.k_proj(hidden_states).view(shape).transpose(1, 2).contiguous()
         value = self.v_proj(hidden_states).view(shape).transpose(1, 2).contiguous()
-        # FlashAttention-2 on CUDA, PyTorch SDPA elsewhere (see the helper).
-        out = dense_attention(query, key, value, causal=False)
+        out = encoder_self_attention(query, key, value)
         out = out.transpose(1, 2).reshape(*hidden_states.shape[:-1], -1).contiguous()
         return self.out_proj(out)
 
@@ -121,9 +120,11 @@ class BartDecoderSelfAttention(nn.Module):
         self.q_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
         self.out_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
 
-        # Assigned by the model runner: [num_blocks, block_size, heads, head_dim].
+        # Assigned by the model runner: [num_blocks, heads, block_size, head_dim]
+        # (or the page-major layout on CUDA), plus the block size the op needs.
         self.k_cache = torch.empty([])
         self.v_cache = torch.empty([])
+        self.block_size = 16
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         num_tokens = hidden_states.shape[0]
@@ -133,8 +134,8 @@ class BartDecoderSelfAttention(nn.Module):
         key = self.k_proj(hidden_states).view(head)
         value = self.v_proj(hidden_states).view(head)
 
-        out = paged_attention(
-            query, key, value, self.k_cache, self.v_cache, self.scaling
+        out = decoder_self_attention(
+            query, key, value, self.k_cache, self.v_cache, self.scaling, self.block_size
         )
         return self.out_proj(out.reshape(num_tokens, self.embed_dim))
 
@@ -164,19 +165,16 @@ class BartDecoderCrossAttention(nn.Module):
         self.out_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
 
         # request_id -> (key, value), each [num_heads, enc_len, head_dim].
-        # Dense per request (not paged); shared by all beams of the request.
-        # Stored head-first so the flash kernel sees a contiguous key tensor.
+        # Dense per request (not paged), shared by all beams of the request; the
+        # attention op stages it into a paged cache for kernels that need one.
         self.encoder_kv_cache: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
-        # vLLM-kernel paged encoder K/V (set by the model runner when active).
-        self.encoder_paged_cache = None
-        # FlashAttention-2 page-major encoder K/V (set by the model runner).
-        self.encoder_flash_cache = None
+        self.block_size = 16
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         num_tokens = hidden_states.shape[0]
         head = (num_tokens, self.num_heads, self.head_dim)
         query = self.q_proj(hidden_states).view(head)
-        out = cached_cross_attention(query, self, self.scaling)
+        out = decoder_cross_attention(query, self, self.scaling, self.block_size)
         return self.out_proj(out.reshape(num_tokens, self.embed_dim))
 
 

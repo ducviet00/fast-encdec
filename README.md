@@ -207,28 +207,31 @@ llm = LLM("florence-community/Florence-2-base", compile_mm_encoder=True)
 scheduler.schedule()            -> all running sequences (+ admit waiting)
 model_runner.run(seqs)
     _encode(fresh seqs)         batched encoder (grouped by length/image shape)
-                                -> cross-attn K/V per request
-    build input_ids/positions/slot_mapping
-    decoder forward             self-attn reads/writes paged cache,
-                                cross-attn reads cached encoder K/V
-    set_context(...)            global metadata read by attention
+                                -> dense cross-attn K/V per request
+    _prepare(seqs)              input_ids / positions / slot_mapping / blocks
+    set_context(...)            Context: is_prefill, context_lens,
+                                block_tables, slot_mapping, request_ids
+    decoder forward             ops pick vLLM-CPU / flash-attn2-CUDA / SDPA
 llm_engine.step()               compute logits -> sample / beam-expand -> free finished
 ```
 
 `LLMEngine.run()` loops `step()` until `is_finished()`.
 
-Each sequence only feeds the tokens not yet in the cache
-(`token_ids[num_cached_tokens:]`): the whole prompt on prefill, one token per
-decode step. Attention gathers exactly `context_len` keys per sequence from its
-own block table, so there is no padding.
+Each sequence only feeds the token not yet in the cache, which is one token per
+sequence per step (the decoder prompt is a single token). Attention reads exactly
+`context_len` keys per sequence from its own block table, so there is no padding.
 
-Decoder self-attention is paged. **Cross-attention is dense**: each decoder
-layer keeps `encoder_kv_cache[request_id] -> (k, v)` of shape
-`[heads, enc_len, dim]`, computed once per request and shared by all of its
-beams. Each kernel stages that dense K/V into its own paged cache (the vLLM
-kernel's `EncoderPagedCache`, or `encoder_flash_cache` for FlashAttention-2) so
-cross-attention uses the same kernel as self-attention; the staging is rebuilt
-only when the set of active requests changes.
+The model calls three device-agnostic ops (`layers/attention.py`):
+`encoder_self_attention` (dense, once per request), `decoder_self_attention`
+(paged, growing cache) and `decoder_cross_attention`. Each op picks its kernel
+from the tensor device, dtype and head dim — FlashAttention-2 on CUDA, the
+vendored vLLM CPU kernel, or PyTorch SDPA. Decoder self-attention is paged;
+**cross-attention is dense**: each decoder layer keeps
+`encoder_kv_cache[request_id] -> (k, v)` of shape `[heads, enc_len, dim]`,
+computed once per request and shared by all of its beams. The paged kernels
+stage that dense K/V into their own page-major (flash) or head-major (vLLM)
+cache, memoized on the layer, so it is rebuilt only when the active request set
+changes; SDPA reads the dense cache directly.
 
 For Florence-2 the encoder input is not pure token embeddings: the DaViT tower
 and the multimodal projector produce one visual token per image patch (plus one
@@ -376,16 +379,16 @@ advantage; FlashAttention-2 keeps it competitive:
 
 | sweep (BART, bf16, enc=256) | config | speedup vs HF |
 |---|---|---:|
-| batch, beams=1 | batch=1 / 2 / 4 / 8 | 1.03× / 1.04× / 1.01× / 0.94× |
-| batch, beams=4 | batch=1 / 2 / 4 / 8 | 1.14× / 1.08× / 0.96× / 0.80× |
-| beams, batch=8 | beams=1 / 4 | 0.96× / 0.79× |
-| dtype, batch=8, beams=4 | bf16 / fp32 | 0.78× / 0.48× |
+| batch, beams=1 | batch=1 / 2 / 4 / 8 | 1.01× / 1.02× / 0.99× / 0.93× |
+| batch, beams=4 | batch=1 / 2 / 4 / 8 | 1.14× / 1.05× / 0.93× / 0.77× |
+| beams, batch=8 | beams=1 / 4 | 0.93× / 0.77× |
+| dtype, batch=8, beams=4 | bf16 / fp32 | 0.76× / 0.54× |
 
 | sweep (Florence-2, bf16) | config | speedup vs HF |
 |---|---|---:|
-| greedy | batch=3 / 6 | 1.24× / 1.22× |
-| beam (batch=3) | beams=1 / 3 | 1.21× / 1.15× |
-| continuous (N=6) | window=3 / 6 | 0.98× / 1.26× |
+| greedy | batch=3 / 6 | 1.21× / 1.21× |
+| beam (batch=3) | beams=1 / 3 | 1.22× / 1.12× |
+| continuous (N=6) | window=3 / 6 | 0.94× / 1.20× |
 
 Greedy BART is parity and beam search trails slightly; Florence-2 leads (the
 paged, unpadded decoder avoids HF's padded batch decode).  FP32 trails because
@@ -399,6 +402,9 @@ FlashAttention-2 is fp16/bf16-only and the SDPA fallback is slower — use
 - The scheduler returns the whole running set each step; there is no token
   budget / chunked prefill. Keep `max_num_seqs >= num_beams` so a request's
   beams are always batched together.
+- The attention ops assume exactly one decoder prompt token per sequence (the
+  Context carries per-sequence cached lengths, not query lengths); `generate`
+  rejects a longer decoder prompt.
 - No prefix caching, no preemption/recompute, no CUDA graphs, no quantization.
 - The cross-attention cache is dense and scales with `batch × enc_len`; it is
   not counted against `num_blocks`. For Florence-2 the projected visual tokens

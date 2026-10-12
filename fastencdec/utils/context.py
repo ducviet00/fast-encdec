@@ -1,57 +1,42 @@
-"""Global step context read by the model's attention layers.
+"""Global per-step metadata read by the attention ops.
 
-The model runner calls :func:`set_context` once per forward; attention layers
-read the metadata with :func:`get_context`.  This avoids threading a dozen
-arguments through every module and keeps the model code close to the HF
-reference.
+The model runner calls :func:`set_context` once per forward; the device-agnostic
+attention ops in :mod:`fastencdec.layers.attention` read it with
+:func:`get_context`.  Every field is a plain tensor (or list) on the compute
+device, so the same context drives the vendored vLLM CPU kernel, FlashAttention-2
+on CUDA and the PyTorch SDPA fallback; the ops derive their kernel-specific
+metadata from it.
+
+The decoder is always fed a single token per sequence (the prompt is one
+``decoder_start_token_id``), so query lengths are implied by ``context_lens``.
 """
 
 from dataclasses import dataclass
 
+import torch
 
-@dataclass
+
+@dataclass(slots=True)
 class Context:
     """Metadata for one model forward pass.
 
     Attributes:
-        slot_mapping: Flat physical cache slots for the new tokens, ``[T]``.
-        query_start_loc: Cumulative new-token counts, length num_seqs + 1.
-        context_lens: Total cached length per sequence, length num_seqs.
-        request_ids: Request id per sequence (used for cross-attn cache).
-        num_seqs: Number of sequences in the batch.
-        attn_backend: ``"vllm"``, ``"flash"`` or ``"sdpa"``; selects the
-            attention implementation for this forward.
-        attn_isa: CPU kernel ISA (``"vec"``/``"vec16"``) or ``None``.
-        block_table: int32 ``[num_seqs, max_blocks]`` paged block ids.
-        key_slot_ids: ``(block_ids, pos_in_block)`` for every cached key,
-            ordered by sequence (SDPA/kernel gather).
-        cache_seqlens: int32 ``[num_seqs]`` cached length per sequence
-            (FlashAttention-2 paged self-attention).
-        cpu_query_start_loc / cpu_seq_lens / dynamic_causal / attn_metadata:
-            int32 inputs and scheduler metadata for the vendored CPU kernel.
-        cross_block_table / cross_cache_seqlens / cross_seq_lens / cross_metadata:
-            encoder (cross-attention) paged cache metadata; flash reads the
-            first two, the vLLM kernel the last two.
+        is_prefill: True when every sequence is fresh (nothing cached yet).
+        context_lens: int32 ``[num_seqs]`` cached length per sequence, after the
+            write.
+        block_tables: int32 ``[num_seqs, max_blocks]`` paged self-attention block
+            ids (a token at position ``p`` is in ``block_tables[i, p // bs]`` at
+            offset ``p % bs``).
+        slot_mapping: int64 ``[num_seqs]`` flat cache slots for the new tokens.
+        request_ids: ``[num_seqs]`` request id per sequence; cross-attention
+            looks up the layer's dense per-request encoder K/V by it.
     """
 
-    slot_mapping: object
-    query_start_loc: list
-    context_lens: list
-    request_ids: list
-    num_seqs: int
-    attn_backend: str = "sdpa"
-    attn_isa: str | None = None
-    block_table: object | None = None
-    key_slot_ids: object | None = None
-    cache_seqlens: object | None = None
-    cpu_query_start_loc: object | None = None
-    cpu_seq_lens: object | None = None
-    dynamic_causal: object | None = None
-    attn_metadata: object | None = None
-    cross_block_table: object | None = None
-    cross_cache_seqlens: object | None = None
-    cross_seq_lens: object | None = None
-    cross_metadata: object | None = None
+    is_prefill: bool = False
+    context_lens: torch.Tensor | None = None
+    block_tables: torch.Tensor | None = None
+    slot_mapping: torch.Tensor | None = None
+    request_ids: list[int] | None = None
 
 
 _CONTEXT: Context | None = None

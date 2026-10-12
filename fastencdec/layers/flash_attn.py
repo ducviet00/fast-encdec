@@ -22,10 +22,6 @@ KERNEL_ID = "kernels-community/flash-attn2"
 _HEAD_DIMS = {32, 64, 96, 128, 160, 192, 224, 256}
 _FLOAT_DTYPES = {torch.float16, torch.bfloat16}
 
-# Set by the model runner when it selects this backend, so the model's encoder
-# self-attention (which runs before the per-step context exists) can follow.
-_ACTIVE = False
-
 
 def supported(dtype: torch.dtype, head_dim: int) -> bool:
     """Whether FlashAttention-2 can run this ``(dtype, head_dim)`` pair."""
@@ -60,17 +56,3 @@ def require():
             "CUDA GPU, or use attn_backend='auto'/'sdpa'."
         )
     return mod
-
-
-def enable() -> None:
-    global _ACTIVE
-    _ACTIVE = True
-
-
-def disable() -> None:
-    global _ACTIVE
-    _ACTIVE = False
-
-
-def is_active() -> bool:
-    return _ACTIVE

@@ -5,7 +5,7 @@ Two checks, both skipped when there is no CUDA GPU or the kernel cannot load:
 1. paged self-attention: the flash paged-decode path and a plain SDPA reference,
    given the same page-major cache and metadata, must agree (bf16 tolerance).
 2. a tiny random BART (head dim 32, supported by the kernel) must decode the
-   same greedy/beam tokens through ``attn_backend="flash"`` and ``"sdpa"``.
+   same greedy/beam tokens through the flash and SDPA backends.
 
 Run with:  PYTHONPATH=. python tests/test_gpu_flash.py
 """
@@ -20,8 +20,7 @@ import torch.nn.functional as F
 
 from fastencdec.config import Config
 from fastencdec.engine.llm_engine import LLMEngine
-from fastencdec.layers import flash_attn
-from fastencdec.layers.attention import paged_attention
+from fastencdec.layers import attention
 from fastencdec.utils.context import set_context
 
 VOCAB = 256
@@ -48,15 +47,14 @@ def paged_parity(device):
     dtype = torch.bfloat16
     torch.manual_seed(0)
 
-    num_heads_dim = (B, BLOCK_SIZE, H, D)
-    k_cache = torch.randn(num_heads_dim, dtype=dtype, device=device)
-    v_cache = torch.randn(num_heads_dim, dtype=dtype, device=device)
+    k_cache = torch.randn(B, BLOCK_SIZE, H, D, dtype=dtype, device=device)
+    v_cache = torch.randn(B, BLOCK_SIZE, H, D, dtype=dtype, device=device)
     query = torch.randn(B, H, D, dtype=dtype, device=device)
     key = torch.randn(B, H, D, dtype=dtype, device=device)
     value = torch.randn(B, H, D, dtype=dtype, device=device)
 
     # Reference: each sequence's cache is positions 0..L-1 of its page, with the
-    # new token (written by paged_attention) as the last cached key.
+    # new token (written by the op) as the last cached key.
     want = []
     for i, length in enumerate(lengths):
         k_seq = k_cache[i, :length].clone()
@@ -66,23 +64,21 @@ def paged_parity(device):
         want.append(_sdpa_single(query[i], k_seq, v_seq, scale))
     want = torch.stack(want)
 
-    block_table = torch.arange(B, dtype=torch.int32, device=device).unsqueeze(1)
-    slot_mapping = torch.tensor(
-        [i * BLOCK_SIZE + (length - 1) for i, length in enumerate(lengths)],
-        dtype=torch.int64,
-        device=device,
-    )
     set_context(
-        slot_mapping=slot_mapping,
-        query_start_loc=list(range(B + 1)),
-        context_lens=list(lengths),
+        is_prefill=False,
+        context_lens=torch.tensor(lengths, dtype=torch.int32, device=device),
+        block_tables=torch.arange(B, dtype=torch.int32, device=device).unsqueeze(1),
+        slot_mapping=torch.tensor(
+            [i * BLOCK_SIZE + (length - 1) for i, length in enumerate(lengths)],
+            dtype=torch.int64,
+            device=device,
+        ),
         request_ids=list(range(B)),
-        num_seqs=B,
-        attn_backend="flash",
-        block_table=block_table,
-        cache_seqlens=torch.tensor(lengths, dtype=torch.int32, device=device),
     )
-    got = paged_attention(query, key, value, k_cache, v_cache, scale)
+    attention.set_backend("flash")
+    got = attention.decoder_self_attention(
+        query, key, value, k_cache, v_cache, scale, BLOCK_SIZE
+    )
 
     diff = (want.float() - got.float()).abs().max().item()
     ok = diff < 5e-2
@@ -117,10 +113,6 @@ def build_model():
 
 
 def decode(model, backend, requests, params, device):
-    if backend == "flash":
-        flash_attn.enable()
-    else:
-        flash_attn.disable()
     config = Config(
         num_blocks=32,
         block_size=BLOCK_SIZE,
@@ -130,9 +122,6 @@ def decode(model, backend, requests, params, device):
         device=device,
     )
     engine = LLMEngine(model, config, eos_token_id=EOS)
-    assert engine.runner.attn_backend == backend, (
-        f"{backend} backend unavailable (got {engine.runner.attn_backend})"
-    )
     ids = engine.generate(requests, params)
     return [engine.results[i] for i in ids]
 
@@ -163,6 +152,8 @@ def main():
     if not torch.cuda.is_available():
         print("SKIP: no CUDA device")
         return
+    from fastencdec.layers import flash_attn
+
     if flash_attn.module() is None:
         print("SKIP: kernels-community/flash-attn2 unavailable")
         return

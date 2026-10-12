@@ -34,7 +34,7 @@ class Config:
     def __post_init__(self) -> None:
         if self.block_size is None:
             cuda = str(self.device).startswith("cuda")
-            self.block_size = 256 if (cuda and self.attn_backend != "sdpa") else 16
+            self.block_size = 256 if cuda else 16
         if self.num_blocks <= 0:
             raise ValueError("num_blocks must be positive")
         if self.block_size <= 0:

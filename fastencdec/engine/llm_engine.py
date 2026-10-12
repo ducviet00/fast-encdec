@@ -83,6 +83,9 @@ class LLMEngine:
         prompt_len = len(requests[0][1])
         if any(len(decoder_ids) != prompt_len for _, decoder_ids, _ in requests):
             raise ValueError("decoder prompt length must be uniform across the batch")
+        if prompt_len != 1:
+            # The attention ops feed one token per sequence per step.
+            raise ValueError("the decoder prompt must be a single token")
         begin_index = prompt_len + int(
             params.forced_bos_token_id is not None and prompt_len == 1
         )
