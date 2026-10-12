@@ -32,7 +32,9 @@ placeholders; the decoder is unchanged.
 
 - No flash-attn **outside** the CUDA backend: CPU stays pure PyTorch + the
   vendored vLLM kernel.
-- No quantization, prefix caching, chunked prefill, or CUDA graphs.
+- No quantization, prefix caching or chunked prefill. CUDA graphs exist only as
+  an opt-in **decode-only** prototype (`Config.use_cudagraph`, default off) — see
+  `engine/cudagraph.py`; nothing on the default path depends on them.
 - **Vendored vLLM CPU attention kernel.** `csrc/cpu` is a copy of vLLM's
   `csrc/cpu` attention implementation (Apache-2.0, see `csrc/LICENSE`), built
   on first use by `fastencdec/layers/cpu_attn.py`. It is the default CPU
@@ -75,6 +77,7 @@ fastencdec/
     scheduler.py       continuous batching
     model_runner.py    batching, KV cache, encoder caching, forward
     llm_engine.py      LLMEngine: step loop, greedy/sampling, beam search
+    cudagraph.py       optional decode-only CUDA-graph capture/replay (prototype)
   layers/
     attention.py       device-agnostic attention ops (encoder/self/cross) + dispatch
     cpu_attn.py        JIT build + wrapper for the vendored vLLM CPU kernels
@@ -91,6 +94,11 @@ csrc/                  vendored vLLM CPU attention kernels (+ bindings.cpp)
 examples/summarize.py
 examples/florence2.py
 benchmarks/benchmark.py
+benchmarks/benchmark_florence2.py
+benchmarks/verify_parity.py
+benchmarks/throughput.py
+benchmarks/florence2_tasks.py
+benchmarks/profile_florence2.py
 tests/test_parity.py
 tests/test_attn_backend.py
 tests/test_florence2.py
@@ -108,6 +116,7 @@ ModelRunner.run(seqs)
     _prepare(seqs)                # input_ids/positions/slot_mapping; ensure blocks/CoW
     set_context(...)              # Context: is_prefill, context_lens, block_tables, slot_mapping, request_ids
     decoder forward               # ops dispatch to vLLM-CPU / flash-attn2-CUDA / SDPA
+                                  # (or, with use_cudagraph, replay a captured decode graph)
     compute_logits                # one row per sequence (one new token each)
 LLMEngine.step()                  # sample (greedy) or beam-expand; append; free finished
 ```
@@ -228,6 +237,14 @@ PYTHONPATH=. $P benchmarks/benchmark.py --quick --device cuda   # on a GPU box
 PYTHONPATH=. $P benchmarks/benchmark_florence2.py --quick
 PYTHONPATH=. $P benchmarks/benchmark_florence2.py --batches 3,6,12 --beams 1,3,5
 PYTHONPATH=. $P benchmarks/benchmark_florence2.py --quick --device cuda
+
+# decode throughput (nano-vllm-style: N requests, fixed enc length + output)
+PYTHONPATH=. $P benchmarks/throughput.py --requests 128 --enc-len 512 --max-tokens 512
+PYTHONPATH=. $P benchmarks/throughput.py --requests 32 --enc-len 512 --max-tokens 256 --use-cudagraph
+
+# Florence-2 token/padding accounting (8 images x 4 tasks) and profiling
+PYTHONPATH=. $P benchmarks/florence2_tasks.py --device cuda [--use-cudagraph]
+PYTHONPATH=. $P benchmarks/profile_florence2.py --engine ours --device cuda [--use-cudagraph]
 ```
 
 ### Benchmark baseline
@@ -243,20 +260,20 @@ never hand-edit or guess.**
 
 | sweep (bf16, enc=256 unless noted) | config | ours ms | speedup vs HF |
 |---|---|---:|---:|
-| batch, beams=1 | batch=1 | 991 | 1.18x |
-| batch, beams=1 | batch=2 | 1147 | 1.11x |
-| batch, beams=1 | batch=4 | 1248 | 1.17x |
-| batch, beams=1 | batch=8 | 1530 | 1.26x |
-| batch, beams=4 | batch=1 | 1113 | 1.36x |
-| batch, beams=4 | batch=2 | 1274 | 1.55x |
-| batch, beams=4 | batch=4 | 1577 | 1.90x |
-| batch, beams=4 | batch=8 | 2240 | 2.30x |
-| beams, batch=8 | beams=1 | 1545 | 1.24x |
-| beams, batch=8 | beams=4 | 2236 | 2.31x |
-| dtype, batch=8, beams=4 | float32 | 6039 | 2.14x |
-| dtype, batch=8, beams=4 | bfloat16 | 2247 | 2.31x |
-| enc length, batch=8, beams=1 | enc=128 | 1382 | 1.10x |
-| enc length, batch=8, beams=1 | enc=256 | 1545 | 1.25x |
+| batch, beams=1 | batch=1 | 952 | 1.22x |
+| batch, beams=1 | batch=2 | 1086 | 1.17x |
+| batch, beams=1 | batch=4 | 1201 | 1.21x |
+| batch, beams=1 | batch=8 | 1526 | 1.27x |
+| batch, beams=4 | batch=1 | 1102 | 1.36x |
+| batch, beams=4 | batch=2 | 1149 | 1.70x |
+| batch, beams=4 | batch=4 | 1565 | 1.91x |
+| batch, beams=4 | batch=8 | 2249 | 2.33x |
+| beams, batch=8 | beams=1 | 1525 | 1.29x |
+| beams, batch=8 | beams=4 | 2255 | 2.31x |
+| dtype, batch=8, beams=4 | float32 | 6058 | 2.03x |
+| dtype, batch=8, beams=4 | bfloat16 | 2251 | 2.30x |
+| enc length, batch=8, beams=1 | enc=128 | 1213 | 1.30x |
+| enc length, batch=8, beams=1 | enc=256 | 1527 | 1.29x |
 
 Snapshot of `PYTHONPATH=. $P benchmarks/benchmark_florence2.py --quick`
 (`florence-community/Florence-2-base`, bf16 for both engines, 8 threads,
@@ -265,12 +282,12 @@ projector on `torch.compile`, the new default). Refresh from a real run.
 
 | sweep (bf16) | config | ours ms | speedup vs HF |
 |---|---|---:|---:|
-| greedy batch | batch=3 | 1948 | 1.33x |
-| greedy batch | batch=6 | 3150 | 1.43x |
-| beam (batch=3) | beams=1 | 1733 | 1.30x |
-| beam (batch=3) | beams=3 | 1906 | 1.61x |
-| continuous (N=6) | w=3 | 3477 | 1.31x |
-| continuous (N=6) | w=6 | 3186 | 1.43x |
+| greedy batch | batch=3 | 1928 | 1.44x |
+| greedy batch | batch=6 | 3137 | 1.46x |
+| beam (batch=3) | beams=1 | 1708 | 1.29x |
+| beam (batch=3) | beams=3 | 1922 | 1.54x |
+| continuous (N=6) | w=3 | 3443 | 1.31x |
+| continuous (N=6) | w=6 | 3070 | 1.47x |
 
 Snapshot of `PYTHONPATH=. $P benchmarks/benchmark.py --quick --device cuda` on
 the L4 box (`bart-large-cnn`, bf16 for both engines unless noted, flash backend,
@@ -278,20 +295,20 @@ the L4 box (`bart-large-cnn`, bf16 for both engines unless noted, flash backend,
 
 | sweep (bf16, enc=256 unless noted) | config | ours ms | speedup vs HF |
 |---|---|---:|---:|
-| batch, beams=1 | batch=1 | 525 | 1.01x |
-| batch, beams=1 | batch=2 | 546 | 1.02x |
-| batch, beams=1 | batch=4 | 566 | 0.99x |
-| batch, beams=1 | batch=8 | 598 | 0.93x |
-| batch, beams=4 | batch=1 | 567 | 1.14x |
-| batch, beams=4 | batch=2 | 639 | 1.05x |
-| batch, beams=4 | batch=4 | 772 | 0.93x |
-| batch, beams=4 | batch=8 | 1049 | 0.77x |
-| beams, batch=8 | beams=1 | 607 | 0.93x |
-| beams, batch=8 | beams=4 | 1049 | 0.77x |
-| dtype, batch=8, beams=4 | float32 | 2120 | 0.54x |
-| dtype, batch=8, beams=4 | bfloat16 | 1050 | 0.76x |
-| enc length, batch=8, beams=1 | enc=128 | 597 | 0.93x |
-| enc length, batch=8, beams=1 | enc=256 | 608 | 0.93x |
+| batch, beams=1 | batch=1 | 543 | 1.02x |
+| batch, beams=1 | batch=2 | 569 | 1.02x |
+| batch, beams=1 | batch=4 | 563 | 1.02x |
+| batch, beams=1 | batch=8 | 582 | 1.00x |
+| batch, beams=4 | batch=1 | 566 | 1.17x |
+| batch, beams=4 | batch=2 | 637 | 1.08x |
+| batch, beams=4 | batch=4 | 761 | 0.97x |
+| batch, beams=4 | batch=8 | 1000 | 0.82x |
+| beams, batch=8 | beams=1 | 587 | 0.97x |
+| beams, batch=8 | beams=4 | 976 | 0.83x |
+| dtype, batch=8, beams=4 | float32 | 2091 | 0.55x |
+| dtype, batch=8, beams=4 | bfloat16 | 991 | 0.84x |
+| enc length, batch=8, beams=1 | enc=128 | 577 | 1.00x |
+| enc length, batch=8, beams=1 | enc=256 | 585 | 1.01x |
 
 Snapshot of `PYTHONPATH=. $P benchmarks/benchmark_florence2.py --quick
 --device cuda` (`Florence-2-base`, bf16 for both engines, image 640×480 → 768px,
@@ -299,18 +316,34 @@ vision tower compiled, `num_blocks=256`, `block_size=256`).
 
 | sweep (bf16) | config | ours ms | speedup vs HF |
 |---|---|---:|---:|
-| greedy batch | batch=3 | 625 | 1.21x |
-| greedy batch | batch=6 | 714 | 1.21x |
-| beam (batch=3) | beams=1 | 443 | 1.22x |
-| beam (batch=3) | beams=3 | 601 | 1.12x |
-| continuous (N=6) | w=3 | 898 | 0.94x |
-| continuous (N=6) | w=6 | 706 | 1.20x |
+| greedy batch | batch=3 | 604 | 1.22x |
+| greedy batch | batch=6 | 667 | 1.27x |
+| beam (batch=3) | beams=1 | 449 | 1.18x |
+| beam (batch=3) | beams=3 | 571 | 1.15x |
+| continuous (N=6) | w=3 | 867 | 0.96x |
+| continuous (N=6) | w=6 | 673 | 1.24x |
 
-On GPU the two engines are close (the engine's big CPU win was the fused vLLM
-kernel; HF's GPU attention is already fused, and a small-batch step is
-launch-bound). Greedy BART is parity, beam search trails, and Florence-2 leads
-because the paged decoder avoids HF's padded batch decode; fp32 trails because
-FlashAttention-2 needs fp16/bf16 and the SDPA fallback is slower.
+On GPU the engine matches HF on greedy BART and leads on Florence-2; it trails on
+beam search (the paged cache writes new K/V separately where HF's cache append is
+fused) and fp32 (FlashAttention-2 needs fp16/bf16 and the SDPA fallback is
+slower).
+
+Decode throughput (`benchmarks/throughput.py`, `bart-large-cnn`, bf16, enc=512,
+EOS suppressed, so both engines decode a fixed token count; `--use-cudagraph`
+captures the decode step):
+
+| requests | max_tokens | eager tok/s | cudagraph tok/s |
+|---|---:|---:|---:|
+| 32 | 256 | 2543 | 3224 |
+| 64 | 256 | 3945 | 3926 |
+| 128 | 256 | 4518 | 4482 |
+| 128 | 512 | 4346 | 4379 |
+
+At batch ≥ 32 the decode is GPU-bound and re-reads the KV cache every step
+(`flash_fwd_splitkv_kernel` is ~2/3 of the CUDA time), so eager and the CUDA
+graph converge and the graph's win is small-batch latency. For calibration,
+nano-vllm / Qwen3-0.6B (a 28-layer decoder, ~2.3x BART-large's) runs ~1780 tok/s
+on this box with the same kind of workload.
 
 ## 7. Gotchas
 
@@ -383,11 +416,23 @@ FlashAttention-2 needs fp16/bf16 and the SDPA fallback is slower.
   self-attention uses `flash_attn_func`. There is no per-backend flag: the ops
   in `layers/attention.py` choose the kernel from the tensor device/dtype/shape,
   and `attention.set_backend` only overrides that for tests.
-- **GPU decode is launch-bound.** A small-batch step is ~16k kernel launches, so
-  latency tracks Python/dispatch overhead, not FLOPs. With flash the engine
-  roughly matches HF `generate` at batch=1 greedy and trails it a little at
-  larger batches / beam search — on GPU HF already has a fast fused attention,
-  whereas the engine's big CPU win comes from the fused vLLM CPU kernel.
+- **GPU decode is KV-bandwidth-bound.** Every step re-reads each sequence's
+  key/value cache, so `flash_fwd_splitkv_kernel` is ~2/3 of all CUDA time (true
+  for nano-vllm too). At batch ≥ 32 the engine is GPU-bound (eager ≈ CUDA-graph);
+  small batches are host-bound. `benchmarks/throughput.py` reports decode tok/s
+  and `benchmarks/profile_florence2.py [--use-cudagraph]` breaks it down.
+- **CUDA graph (`use_cudagraph=True`, default off).** `engine/cudagraph.py`
+  captures `model.decoder` once per batch-size bucket (`[1,2,4,8,16,…,
+  max_num_seqs]`) into a shared pool and replays it — decode only, CUDA+flash
+  path only. The caches must be static: the self cache gets one extra scratch
+  row and the encoder cache is a fixed preallocated buffer, so an undersized
+  batch is padded with sentinel metadata (scratch block/slot, `cache_seqlens=1`)
+  whose rows write nothing real. The graph reads its inputs from the static
+  buffers only — the paged store must **not** use the per-step memo, because a
+  memoized temporary is computed outside the capture and freed (that caused
+  illegal indices), so `_self_derived` no longer precomputes `(block, pos)`. It
+  falls back to eager when `len(seqs) > max_bs` and re-captures if the
+  cross-cache capacity grows (new requests admitted mid-run).
 - **BF16 SDPA needs contiguous inputs on aarch64.** PyTorch's CPU SDPA with BF16
   *non-contiguous* (transposed) inputs takes a path ~20x slower than the
   contiguous one (Graviton: 86 ms vs 4 ms for a BART-large encoder block); x86

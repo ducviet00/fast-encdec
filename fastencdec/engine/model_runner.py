@@ -9,6 +9,7 @@ import torch
 
 from ..layers import attention
 from ..utils.context import set_context
+from .cudagraph import DecodeGraphRunner
 
 
 class ModelRunner:
@@ -21,6 +22,8 @@ class ModelRunner:
         dtype=torch.float32,
         attn_backend="auto",
         device="cpu",
+        max_num_seqs=32,
+        use_cudagraph=False,
     ):
         self.device = torch.device(device)
         self.model = model.eval()
@@ -36,13 +39,17 @@ class ModelRunner:
         self.cache_layers = [layer.self_attn for layer in self.decoder_layers]
         self.num_heads = self.cache_layers[0].num_heads
         self.head_dim = self.cache_layers[0].head_dim
+        # CUDA graphs capture the decoder step; only meaningful on the flash path.
+        self.use_cudagraph = use_cudagraph and (
+            self.device.type == "cuda"
+            and attention.backend(self.device, dtype, self.head_dim, self.block_size)
+            == "flash"
+        )
+        # The graph path reserves one extra cache row as a scratch block for the
+        # padded rows of an undersized batch.
+        rows = block_manager.num_blocks + int(self.use_cudagraph)
         shape = attention.self_cache_shape(
-            block_manager.num_blocks,
-            self.block_size,
-            self.num_heads,
-            self.head_dim,
-            self.device,
-            dtype,
+            rows, self.block_size, self.num_heads, self.head_dim, self.device, dtype
         )
         for layer in self.cache_layers:
             layer.k_cache = torch.zeros(shape, dtype=dtype, device=self.device)
@@ -50,6 +57,9 @@ class ModelRunner:
             layer.block_size = self.block_size
         for layer in self.decoder_layers:
             layer.encoder_attn.block_size = self.block_size
+        self.graph = (
+            DecodeGraphRunner(self, max_num_seqs) if self.use_cudagraph else None
+        )
 
     def _copy_block(self, src: int, dst: int) -> None:
         for layer in self.cache_layers:
@@ -91,6 +101,8 @@ class ModelRunner:
                     )
 
     def clear_request(self, request_id: int) -> None:
+        if self.graph is not None:
+            self.graph.req_blocks.pop(request_id, None)
         for layer in self.decoder_layers:
             attn = layer.encoder_attn
             attn.encoder_kv_cache.pop(request_id, None)
@@ -127,30 +139,35 @@ class ModelRunner:
             seq_block_tables.append(seq.block_table)
 
         max_blocks = max(len(table) for table in seq_block_tables)
-        block_tables = torch.zeros(
-            (len(seqs), max_blocks), dtype=torch.int32, device=self.device
+        # Pad the block tables into a rectangle so the whole batch is one copy.
+        padded = [table + [0] * (max_blocks - len(table)) for table in seq_block_tables]
+        # nano-vllm style: build the host tensor pinned, then copy with
+        # non_blocking (a pageable copy would synchronise the stream).  The
+        # pinned allocator is CUDA-only, so CPU builds the tensor directly.
+        pin = self.device.type == "cuda"
+        context_lens = torch.tensor(context_lens, dtype=torch.int32, pin_memory=pin).to(
+            self.device, non_blocking=True
         )
-        for i, table in enumerate(seq_block_tables):
-            block_tables[i, : len(table)] = torch.tensor(
-                table, dtype=torch.int32, device=self.device
-            )
-
+        block_tables = torch.tensor(padded, dtype=torch.int32, pin_memory=pin).to(
+            self.device, non_blocking=True
+        )
+        slot_mapping = torch.tensor(new_slots, dtype=torch.int64, pin_memory=pin).to(
+            self.device, non_blocking=True
+        )
+        input_ids = torch.tensor(input_ids, dtype=torch.long, pin_memory=pin).to(
+            self.device, non_blocking=True
+        )
+        positions = torch.tensor(positions, dtype=torch.long, pin_memory=pin).to(
+            self.device, non_blocking=True
+        )
         fields = {
             "is_prefill": is_prefill,
-            "context_lens": torch.tensor(
-                context_lens, dtype=torch.int32, device=self.device
-            ),
+            "context_lens": context_lens,
             "block_tables": block_tables,
-            "slot_mapping": torch.tensor(
-                new_slots, dtype=torch.int64, device=self.device
-            ),
+            "slot_mapping": slot_mapping,
             "request_ids": [seq.request_id for seq in seqs],
         }
-        return (
-            torch.tensor(input_ids, dtype=torch.long, device=self.device),
-            torch.tensor(positions, dtype=torch.long, device=self.device),
-            fields,
-        )
+        return input_ids, positions, fields
 
     @torch.no_grad()
     def run(self, seqs):
@@ -159,8 +176,15 @@ class ModelRunner:
             self._encode(fresh)
 
         input_ids, positions, fields = self._prepare(seqs)
-        set_context(**fields)
 
+        if self.graph is not None:
+            self.graph.stage(seqs)
+            if len(seqs) <= self.graph.max_bs and self.graph.ready():
+                self.graph.capture()
+                hidden = self.graph.replay(len(seqs), input_ids, positions, fields)
+                return self.model.compute_logits(hidden)
+
+        set_context(**fields)
         hidden = self.model.decoder(input_ids, positions)
         # One new token per sequence (the decoder prompt is a single token), so
         # the logits are just the rows in sequence order.

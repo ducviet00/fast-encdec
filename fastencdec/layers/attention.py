@@ -79,6 +79,11 @@ def _paged_backend(device, dtype, head_dim, block_size) -> str:
     return "sdpa"
 
 
+def backend(device, dtype, head_dim, block_size) -> str:
+    """The paged kernel the ops will pick: ``"flash"``, ``"vllm"`` or ``"sdpa"``."""
+    return _paged_backend(torch.device(device), dtype, head_dim, block_size)
+
+
 def self_cache_shape(
     num_blocks, block_size, num_heads, head_dim, device, dtype
 ) -> tuple:
@@ -87,14 +92,13 @@ def self_cache_shape(
     Page-major ``[blocks, block_size, heads, head_dim]`` for FlashAttention-2,
     head-major ``[blocks, heads, block_size, head_dim]`` otherwise.
     """
-    device = torch.device(device)
-    if _paged_backend(device, dtype, head_dim, block_size) == "flash":
+    if backend(device, dtype, head_dim, block_size) == "flash":
         return (num_blocks, block_size, num_heads, head_dim)
     return (num_blocks, num_heads, block_size, head_dim)
 
 
 def store_kvcache(key, value, k_cache, v_cache, slot_mapping, block_size, page_major):
-    """Scatter new K/V ``[T, H, D]`` into the paged cache."""
+    """Scatter new K/V ``[T, H, D]`` into the paged cache at ``slot_mapping``."""
     block = torch.div(slot_mapping, block_size, rounding_mode="floor")
     pos = slot_mapping % block_size
     if page_major:
@@ -106,7 +110,7 @@ def store_kvcache(key, value, k_cache, v_cache, slot_mapping, block_size, page_m
 
 
 def _store(key, value, k_cache, v_cache, slot_mapping, block_size, backend, isa=None):
-    """Write new K/V with the cheapest scatter for ``backend``."""
+    """Scatter new K/V with the cheapest path for ``backend``."""
     if backend == "vllm":
         # The vendored kernel does the scatter in C++ (much faster than the
         # Python advanced-index assignment).
@@ -197,9 +201,7 @@ def _self_derived(ctx, backend, num_heads, head_dim, dtype, block_size):
         "cache_seqlens": ctx.context_lens.to(torch.int32),
         "query_start_loc": torch.arange(num + 1, dtype=torch.int32, device=device),
     }
-    if backend == "sdpa":
-        data["key_slot_ids"] = _key_slot_ids(ctx, block_size)
-    elif backend == "vllm":
+    if backend == "vllm":
         isa = cpu_attn.select_isa(dtype, block_size, head_dim)
         data["isa"] = isa
         data["dynamic_causal"] = _dynamic_causal(ctx)
@@ -217,6 +219,9 @@ def _self_derived(ctx, backend, num_heads, head_dim, dtype, block_size):
             True,
             data["dynamic_causal"],
         )
+    else:
+        if backend == "sdpa":
+            data["key_slot_ids"] = _key_slot_ids(ctx, block_size)
     _DERIVED = (ctx, key, data)
     return data
 
@@ -371,6 +376,20 @@ def decoder_cross_attention(query, layer, scale, block_size):
     ctx = get_context()
     num_heads, head_dim = query.shape[1], query.shape[2]
     backend = _paged_backend(query.device, query.dtype, head_dim, block_size)
+    if ctx.cross_block_tables is not None:
+        # CUDA-graph path: the encoder cache is a fixed buffer and the metadata
+        # is static, so the op only reads (nothing is staged/reallocated here).
+        k_cache, v_cache = layer.cross_cache
+        out = flash_attn.require().flash_attn_with_kvcache(
+            query.unsqueeze(1),
+            k_cache,
+            v_cache,
+            cache_seqlens=ctx.cross_cache_seqlens,
+            block_table=ctx.cross_block_tables,
+            causal=False,
+            softmax_scale=scale,
+        )
+        return out.squeeze(1)
     if backend == "sdpa":
         return _cross_sdpa(query, layer, ctx, scale)
     k_cache, v_cache, block_table, cache_seqlens, metadata = _cross_staged(

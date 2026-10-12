@@ -56,6 +56,8 @@ class LLMEngine:
             config.dtype,
             attn_backend=config.attn_backend,
             device=config.device,
+            max_num_seqs=config.max_num_seqs,
+            use_cudagraph=config.use_cudagraph,
         )
         self.scheduler = Scheduler(config)
         self.sampler = Sampler()
@@ -136,6 +138,7 @@ class LLMEngine:
         # Greedy rows are independent, so requests at the same decoder length
         # are served by one processor call; beam needs the per-request ranking.
         device = logits.device
+        pin = device.type == "cuda"
         buckets: dict[int, list[int]] = {}
         for request_id, indices in groups.items():
             params = seqs[indices[0]].sampling
@@ -143,8 +146,8 @@ class LLMEngine:
                 input_ids = torch.tensor(
                     [seqs[i].token_ids for i in indices],
                     dtype=torch.long,
-                    device=device,
-                )
+                    pin_memory=pin,
+                ).to(device, non_blocking=True)
                 logprobs = processor(
                     input_ids, torch.log_softmax(logits[indices].float(), dim=-1)
                 )
@@ -156,19 +159,25 @@ class LLMEngine:
                 buckets.setdefault(length, []).extend(indices)
 
         for indices in buckets.values():
+            # pin_memory + non_blocking: a pageable copy would sync the stream.
             input_ids = torch.tensor(
-                [seqs[i].token_ids for i in indices], dtype=torch.long, device=device
-            )
+                [seqs[i].token_ids for i in indices],
+                dtype=torch.long,
+                pin_memory=pin,
+            ).to(device, non_blocking=True)
             scores = processor(input_ids, logits[indices].float())
+            # One batched sample (one device sync) for the whole bucket.
+            tokens = self.sampler(
+                scores, seqs[indices[0]].sampling.temperature
+            ).tolist()
             for row, i in enumerate(indices):
-                self._sample(seqs[i], seqs[i].sampling, scores[row])
+                self._sample(seqs[i], seqs[i].sampling, tokens[row])
 
     # -------------------------------------------------------------- sampling
     def _release(self, request_id: int) -> None:
         self.runner.clear_request(request_id)
 
-    def _sample(self, seq: Sequence, params, logits) -> None:
-        token = self.sampler(logits, params.temperature)
+    def _sample(self, seq: Sequence, params, token: int) -> None:
         seq.append_token(token)
         if token in params.eos_ids() or seq.num_completion_tokens >= params.max_tokens:
             self.scheduler.remove(seq)
@@ -205,6 +214,7 @@ class LLMEngine:
         top_scores, top_indices = torch.topk(scores, keep)
         parents = (top_indices // vocab).tolist()
         tokens = (top_indices % vocab).tolist()
+        top_values = top_scores.tolist()  # one sync for the whole beam block
 
         stopped = [
             token in eos_ids or beams[parent].num_generated + 1 >= params.max_tokens
@@ -214,12 +224,11 @@ class LLMEngine:
 
         # Build children before freeing parents (children share parent blocks).
         new_finished = [
-            self._fork(beams[parents[r]], tokens[r], top_scores[r].item())
+            self._fork(beams[parents[r]], tokens[r], top_values[r])
             for r in finished_ranks
         ]
         live = [
-            self._fork(beams[parents[r]], tokens[r], top_scores[r].item())
-            for r in live_ranks
+            self._fork(beams[parents[r]], tokens[r], top_values[r]) for r in live_ranks
         ]
 
         for beam in beams:

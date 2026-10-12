@@ -30,6 +30,9 @@ class Context:
         slot_mapping: int64 ``[num_seqs]`` flat cache slots for the new tokens.
         request_ids: ``[num_seqs]`` request id per sequence; cross-attention
             looks up the layer's dense per-request encoder K/V by it.
+        cross_cache_seqlens / cross_block_tables: static paged cross-attention
+            metadata (set only by the CUDA-graph path, where the encoder cache is
+            a fixed buffer the graph can reference).
     """
 
     is_prefill: bool = False
@@ -37,6 +40,8 @@ class Context:
     block_tables: torch.Tensor | None = None
     slot_mapping: torch.Tensor | None = None
     request_ids: list[int] | None = None
+    cross_cache_seqlens: torch.Tensor | None = None
+    cross_block_tables: torch.Tensor | None = None
 
 
 _CONTEXT: Context | None = None

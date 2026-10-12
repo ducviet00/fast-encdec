@@ -22,6 +22,8 @@ class Config:
             SDPA), ``"vllm"`` (require the CPU kernel), ``"flash"`` (require
             FlashAttention-2) or ``"sdpa"`` (force the pure-PyTorch path).
         device: ``"cpu"`` or ``"cuda"`` (``"cuda:N"`` also works).
+        use_cudagraph: capture the decoder step into a CUDA graph (CUDA +
+            FlashAttention-2 only; default off).  Prototype.
     """
 
     num_blocks: int = 512
@@ -30,6 +32,7 @@ class Config:
     dtype: torch.dtype = torch.float32
     attn_backend: str = "auto"
     device: str = "cpu"
+    use_cudagraph: bool = False
 
     def __post_init__(self) -> None:
         if self.block_size is None:

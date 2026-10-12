@@ -127,6 +127,12 @@ batch, so beams share it and never duplicate K/V. All the paging machinery
 (reference-counted blocks, copy-on-write, continuous batching, beam search) is
 identical on both devices.
 
+`use_cudagraph=True` (default off) additionally captures the decode step into a
+CUDA graph — one graph per batch-size bucket, replayed each step — which removes
+the per-step host launch overhead that dominates small-batch latency. It needs
+the CUDA + FlashAttention-2 path and keeps a fixed preallocated encoder cache;
+see `fastencdec/engine/cudagraph.py` and the AGENTS gotchas.
+
 ### Generation heuristics
 
 Decoding runs through HuggingFace's logits processors
@@ -280,6 +286,10 @@ PYTHONPATH=. python benchmarks/benchmark_florence2.py --quick --dtype float32
 PYTHONPATH=. python benchmarks/benchmark_florence2.py --quick --device cuda
 ```
 
+Decode throughput (a nano-vllm-style workload — N requests, fixed encoder length
+and output length, EOS suppressed) is measured with `benchmarks/throughput.py`;
+`--use-cudagraph` enables the decode CUDA graph:
+
 It compares fast-encdec against HuggingFace `generate` on the same machine, at
 the **same dtype, same inputs and same output tokens**, so both engines do
 identical work (latency, req/s, tok/s, speedup).  BART decodes a fixed length
@@ -373,22 +383,28 @@ by default.
 
 ### GPU (`--device cuda`, NVIDIA L4)
 
-On a GPU the two engines are much closer.  HF's attention is already fused and a
-small-batch step is launch-bound, so the engine no longer has its kernel
-advantage; FlashAttention-2 keeps it competitive:
+On a GPU the two engines are much closer.  HF's attention is already fused, so
+the engine no longer has its kernel advantage; FlashAttention-2 keeps it
+competitive:
 
 | sweep (BART, bf16, enc=256) | config | speedup vs HF |
 |---|---|---:|
-| batch, beams=1 | batch=1 / 2 / 4 / 8 | 1.01× / 1.02× / 0.99× / 0.93× |
-| batch, beams=4 | batch=1 / 2 / 4 / 8 | 1.14× / 1.05× / 0.93× / 0.77× |
-| beams, batch=8 | beams=1 / 4 | 0.93× / 0.77× |
-| dtype, batch=8, beams=4 | bf16 / fp32 | 0.76× / 0.54× |
+| batch, beams=1 | batch=1 / 2 / 4 / 8 | 1.02× / 1.02× / 1.02× / 1.00× |
+| batch, beams=4 | batch=1 / 2 / 4 / 8 | 1.17× / 1.08× / 0.97× / 0.82× |
+| beams, batch=8 | beams=1 / 4 | 0.97× / 0.83× |
+| dtype, batch=8, beams=4 | bf16 / fp32 | 0.84× / 0.55× |
 
 | sweep (Florence-2, bf16) | config | speedup vs HF |
 |---|---|---:|
-| greedy | batch=3 / 6 | 1.21× / 1.21× |
-| beam (batch=3) | beams=1 / 3 | 1.22× / 1.12× |
-| continuous (N=6) | window=3 / 6 | 0.94× / 1.20× |
+| greedy | batch=3 / 6 | 1.22× / 1.27× |
+| beam (batch=3) | beams=1 / 3 | 1.18× / 1.15× |
+| continuous (N=6) | window=3 / 6 | 0.96× / 1.24× |
+
+Decode throughput (`benchmarks/throughput.py`, `bart-large-cnn`, bf16, enc=512,
+EOS suppressed) is **2543 → 4518 tok/s** as the batch grows 32 → 128, and
+**3224 tok/s at batch 32 with `--use-cudagraph`** (1.27× the eager run).  At
+batch ≥ 32 the decode is GPU-bound re-reading the KV cache each step, so the
+graph only buys small-batch latency.
 
 Greedy BART is parity and beam search trails slightly; Florence-2 leads (the
 paged, unpadded decoder avoids HF's padded batch decode).  FP32 trails because

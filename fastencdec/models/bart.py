@@ -168,6 +168,8 @@ class BartDecoderCrossAttention(nn.Module):
         # Dense per request (not paged), shared by all beams of the request; the
         # attention op stages it into a paged cache for kernels that need one.
         self.encoder_kv_cache: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+        # Fixed page-major encoder cache used by the CUDA-graph path.
+        self.cross_cache = None
         self.block_size = 16
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:

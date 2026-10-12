@@ -50,6 +50,8 @@ class LLM:
         device: ``"cpu"`` (default) or ``"cuda"`` to run on a GPU.  On CUDA the
             decoder attention uses FlashAttention-2 (``attn_backend="flash"``)
             when it is available and the shape is supported, else SDPA.
+        use_cudagraph: capture the decoder step into a CUDA graph (CUDA +
+            FlashAttention-2 only; default off).  Prototype.
     """
 
     def __init__(
@@ -63,6 +65,7 @@ class LLM:
         attn_backend: str = "auto",
         compile_mm_encoder: bool = True,
         device: str = "cpu",
+        use_cudagraph: bool = False,
     ):
         hf_config = AutoConfig.from_pretrained(model_path)
         self.multimodal = hf_config.model_type == "florence2"
@@ -102,6 +105,7 @@ class LLM:
             dtype=dtype,
             attn_backend=attn_backend,
             device=device,
+            use_cudagraph=use_cudagraph,
         )
         self.engine = LLMEngine(self.model, config, eos_token_id=self.eos_token_id)
 
