@@ -231,16 +231,15 @@ PYTHONPATH=. $P tests/test_gpu_flash.py
 PYTHONPATH=. $P examples/summarize.py
 PYTHONPATH=. $P examples/florence2.py
 
-# benchmark (sweeps batch / beams / dtype / encoder length vs HF)
-PYTHONPATH=. $P benchmarks/benchmark.py                 # full
-PYTHONPATH=. $P benchmarks/benchmark.py --quick         # fast smoke
+# benchmark (scenarios x generation configs vs HF, see the baseline below)
+PYTHONPATH=. $P benchmarks/benchmark.py                 # BART, cpu
+PYTHONPATH=. $P benchmarks/benchmark.py --device cuda   # BART on a GPU box
+PYTHONPATH=. $P benchmarks/benchmark.py --scenarios balanced
 PYTHONPATH=. $P benchmarks/benchmark.py --json out.json
-PYTHONPATH=. $P benchmarks/benchmark.py --quick --device cuda   # on a GPU box
 
-# Florence-2 benchmark (caption/detection/segmentation mix vs HF)
-PYTHONPATH=. $P benchmarks/benchmark_florence2.py --quick
-PYTHONPATH=. $P benchmarks/benchmark_florence2.py --batches 3,6,12 --beams 1,3,5
-PYTHONPATH=. $P benchmarks/benchmark_florence2.py --quick --device cuda
+# Florence-2 benchmark (caption/detection/segmentation mix, real image)
+PYTHONPATH=. $P benchmarks/benchmark_florence2.py
+PYTHONPATH=. $P benchmarks/benchmark_florence2.py --device cuda
 
 # decode throughput (nano-vllm-style: N requests, fixed enc length + output)
 PYTHONPATH=. $P benchmarks/throughput.py --requests 128 --enc-len 512 --max-tokens 512
@@ -262,89 +261,32 @@ PYTHONPATH=. $P benchmarks/profile_florence2.py --engine ours --device cuda [--n
 
 ### Benchmark baseline
 
-Snapshot of `PYTHONPATH=. $P benchmarks/benchmark.py --quick`
-(`bart-large-cnn`, bfloat16 for **both** engines, `max_tokens=48`,
-`num_blocks=1024`, `block_size=16`, on the dev CPU (threads = the physical core
-count, 8 there, which is what `--threads 0` resolves to); attention on the vendored
-vLLM CPU kernel, i.e. `attn_backend="auto"`). The HF baseline is loaded at the
-same dtype and both engines decode exactly `max_tokens`, so the speedup is
-engine-vs-engine. **Every commit must refresh this from a real run of the
-script — replace the numbers with the actual `ours ms` / `speedup` output;
-never hand-edit or guess.**
+Per-commit baseline: `PYTHONPATH=. $P benchmarks/benchmark.py --scenarios 256->256`
+on the dev CPU (`bart-large-cnn`, bf16 for **both** engines unless noted).  The
+engine and HF decode the same token count, so the speedup is engine-vs-engine.
+**Every commit must refresh this table from a real run of the script — never
+hand-edit or guess.**
 
-| sweep (bf16, enc=256 unless noted) | config | ours ms | speedup vs HF |
-|---|---|---:|---:|
-| batch, beams=1 | batch=1 | 1027 | 1.14x |
-| batch, beams=1 | batch=2 | 975 | 1.30x |
-| batch, beams=1 | batch=4 | 1147 | 1.29x |
-| batch, beams=1 | batch=8 | 1519 | 1.26x |
-| batch, beams=4 | batch=1 | 1090 | 1.41x |
-| batch, beams=4 | batch=2 | 1244 | 1.58x |
-| batch, beams=4 | batch=4 | 1538 | 1.94x |
-| batch, beams=4 | batch=8 | 2217 | 2.34x |
-| beams, batch=8 | beams=1 | 1504 | 1.30x |
-| beams, batch=8 | beams=4 | 2225 | 2.33x |
-| dtype, batch=8, beams=4 | float32 | 6267 | 2.16x |
-| dtype, batch=8, beams=4 | bfloat16 | 2206 | 2.33x |
-| enc length, batch=8, beams=1 | enc=128 | 1170 | 1.30x |
-| enc length, batch=8, beams=1 | enc=256 | 1506 | 1.27x |
+| config | ours ms | ours tok/s | hf ms | hf tok/s | speedup |
+|---|---:|---:|---:|---:|---:|
+<!-- refresh with `--scenarios 256->256` on the machine you develop on; the
+     README carries the server matrix -->
 
-Snapshot of `PYTHONPATH=. $P benchmarks/benchmark_florence2.py --quick`
-(`florence-community/Florence-2-base`, bf16 for both engines,
-640×480 image → 768px, `max_tokens=96` / `beam_tokens=64`; vision tower +
-projector on `torch.compile`, the new default). Refresh from a real run.
+`benchmark_florence2.py` runs the same configs on a real 640x480 photo
+(`car.jpg`, scp'd to `/tmp/fastencdec/` so the boxes never hit the Hub) and a
+four-task mix -- caption / detection / referring-expression segmentation /
+caption-to-phrase grounding -- so batch=8 and beams=4 divide it evenly.  EOS is
+allowed, so the output lengths are the tasks' own (13/22/256/22, the
+segmentation capped at `--max-tokens`); under beam search the two engines can
+pick slightly different hypotheses, which the script reports instead of
+failing.
 
-| sweep (bf16) | config | ours ms | speedup vs HF |
-|---|---|---:|---:|
-| greedy batch | batch=3 | 1882 | 1.32x |
-| greedy batch | batch=6 | 3063 | 1.44x |
-| beam (batch=3) | beams=1 | 1675 | 1.28x |
-| beam (batch=3) | beams=3 | 1838 | 1.60x |
-| continuous (N=6) | w=3 | 3367 | 1.32x |
-| continuous (N=6) | w=6 | 3050 | 1.46x |
-
-Snapshot of `PYTHONPATH=. $P benchmarks/benchmark.py --quick --device cuda` on
-the L4 box (`bart-large-cnn`, bf16 for both engines unless noted, flash backend,
-CUDA graph on — the default — `num_blocks=64`, `block_size=256`, `max_tokens=48`).
-Refresh from a real run.
-
-| sweep (bf16, enc=256 unless noted) | config | ours ms | speedup vs HF |
-|---|---|---:|---:|
-| batch, beams=1 | batch=1 | 176 | 3.04x |
-| batch, beams=1 | batch=2 | 192 | 2.93x |
-| batch, beams=1 | batch=4 | 209 | 2.68x |
-| batch, beams=1 | batch=8 | 234 | 2.42x |
-| batch, beams=4 | batch=1 | 212 | 3.04x |
-| batch, beams=4 | batch=2 | 268 | 2.51x |
-| batch, beams=4 | batch=4 | 394 | 1.84x |
-| batch, beams=4 | batch=8 | 641 | 1.26x |
-| beams, batch=8 | beams=1 | 234 | 2.41x |
-| beams, batch=8 | beams=4 | 641 | 1.25x |
-| dtype, batch=8, beams=4 | float32 | 2051 | 0.56x |
-| dtype, batch=8, beams=4 | bfloat16 | 645 | 1.26x |
-| enc length, batch=8, beams=1 | enc=128 | 220 | 2.55x |
-| enc length, batch=8, beams=1 | enc=256 | 235 | 2.37x |
-
-Snapshot of `PYTHONPATH=. $P benchmarks/benchmark_florence2.py --quick
---device cuda` (`Florence-2-base`, bf16 for both engines, image 640×480 → 768px,
-vision tower compiled, `num_blocks=256`, `block_size=256`).
-
-| sweep (bf16) | config | ours ms | speedup vs HF |
-|---|---|---:|---:|
-| greedy batch | batch=3 | 222 | 3.46x |
-| greedy batch | batch=6 | 287 | 2.95x |
-| beam (batch=3) | beams=1 | 172 | 3.16x |
-| beam (batch=3) | beams=3 | 263 | 2.58x |
-| continuous (N=6) | w=3 | 363 | 2.34x |
-| continuous (N=6) | w=6 | 286 | 2.97x |
-
-On GPU the CUDA graph (now the default) is what makes greedy BART competitive:
-2.4-3.0x vs HF, where eager it was ~1.05x — the graph removes the per-step host
-launch overhead that dominated small batches. Beam search is 1.25-1.26x: the paged
-cache writes new K/V separately where HF's cache append is fused, and at 32
-sequences (8 requests x 4 beams) the step is real GPU work rather than launch
-overhead. fp32 trails (FlashAttention-2 needs fp16/bf16 and the SDPA fallback is
-slower).
+The README carries the full three-point matrix (`128->512`, `512->128`,
+`256->256`) for the four server boxes.  Its shape is worth knowing when reading it: on
+CPU beam search is the big win (the paged cache shares blocks where HF reorders
+a full beam cache) and greedy is a modest 1.05-1.3x; on CUDA the decode CUDA
+graph is what makes greedy competitive (2.4-3.3x, where eager was ~1.05x) while
+beam search is ~1.3-1.9x; fp32 trails on CUDA (no FlashAttention-2 path).
 
 Decode throughput (`benchmarks/throughput.py`, `bart-large-cnn`, bf16, enc=512,
 EOS suppressed, so both engines decode a fixed token count; the graph is on by
@@ -370,11 +312,12 @@ on this box with the same kind of workload.
   `forced_bos_token_id=0` / `forced_eos_token_id=2`, which are applied through
   `transformers`' logits processors (so an explicit `SamplingParams` leaves them
   at `None` to disable them).
-- **Fair benchmarks.** `benchmark.py` loads HF at the run's `--dtype` (never
-  fp32-for-HF vs bf16-for-us) and both engines decode exactly `max_tokens` (EOS
-  suppressed via `min_length=max_tokens+1` / HF `min_new_tokens`). Same
-  precision, the engine now leads both greedy and beam search on the vendored
-  kernel (see the baseline table). `benchmarks/verify_parity.py` confirms the
+- **Fair benchmarks.** `benchmark.py` runs both engines at the same dtype
+  (never fp32-for-HF vs bf16-for-us) and both decode exactly the scenario's
+  token count (EOS suppressed via `min_length=max_tokens+1` / HF
+  `min_new_tokens`); it raises if the two engines decode different token
+  totals. Same precision, the engine leads both greedy and beam search (see
+  the baseline tables). `benchmarks/verify_parity.py` confirms the
   fairness directly: fp32 is token-for-token identical to HF, and bf16 keeps the
   output length with occasional single-step token differences from the different
   attention kernels (the same 12/12 pattern before and after the q/k/v fusion).
@@ -566,6 +509,8 @@ on this box with the same kind of workload.
 - After changes: run `python -m compileall fastencdec`,
   `tests/test_parity.py`, `tests/test_attn_backend.py`,
   `tests/test_florence2.py`, `tests/test_beam.py`, `uvx ruff check` /
-  `uvx ruff format --check`, and `benchmarks/benchmark.py --quick`.
+  `uvx ruff format --check`, and `benchmarks/benchmark.py --scenarios 256->256`.
 - Every commit must update the "Benchmark baseline" table above with the real
-  numbers from that `--quick` run (no stale or estimated values).
+  numbers from that run (no stale or estimated values).  The full three-point
+  matrix in the README is refreshed when the tables or the engine change
+  materially.

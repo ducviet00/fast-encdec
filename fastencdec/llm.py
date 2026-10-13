@@ -115,7 +115,10 @@ class LLM:
         self.engine = LLMEngine(self.model, config, eos_token_id=self.eos_token_id)
 
     def _decode(self, token_ids: list[int]) -> str:
-        return self.tokenizer.decode(token_ids, skip_special_tokens=True)
+        # Florence-2's answer *is* special tokens -- the ``<loc_...>`` tokens
+        # carry the boxes -- so keep them (post-processing needs them); BART
+        # output is plain text.
+        return self.tokenizer.decode(token_ids, skip_special_tokens=not self.multimodal)
 
     def _parse_prompt(self, item):
         """Split one prompt into ``(text, prompt_token_ids, image)``.

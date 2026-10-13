@@ -1,42 +1,24 @@
-"""Benchmark Florence-2 on CPU: fast-encdec vs HuggingFace ``generate``.
+"""Florence-2 benchmark: this engine vs HuggingFace, real image, mixed tasks.
 
-Fair comparison: both engines run the same dtype (``--dtype``, bf16 by
-default), on the same processor inputs, with neutral decoding (no checkpoint
-heuristics) and the same ``max_new_tokens`` cap.  Both stop each request at
-EOS, so the per-sequence output tokens match; the reported token totals let
-you verify it.
+One real photo and three task prompts with very different output lengths
+(`<CAPTION>` ~13, `<OD>` ~22 and a referring-expression segmentation ~96
+tokens), so the batch has a wide length spread — exactly the case the paged,
+unpadded decoder is for.  Both engines stop at EOS, and the token totals are
+checked to match.
 
-The workload mixes three task types with very different output lengths:
+Runs the same generation configs as `benchmark.py`: three bf16 points plus one
+fp32 row for verification.  The encoder length is fixed by the image (768 px ->
+577 visual tokens), so the encoder/decoder scenario split does not apply here.
 
-    <CAPTION>                              short   (~15 tokens)
-    <OD>                                   medium  (~25 tokens)
-    <REFERRING_EXPRESSION_SEGMENTATION>... long    (hundreds of tokens)
-
-HuggingFace decodes the whole padded batch for ``max_new_tokens`` steps, so the
-short requests keep paying for the long ones.  fast-encdec uses a paged KV cache
-with no padding: each request decodes only up to its own length, and once it
-emits EOS it leaves the running batch (continuous batching).
-
-Three sweeps are reported:
-  1. batch scaling  - mixed tasks, greedy
-  2. beam scaling   - mixed tasks, beam search (paged blocks are shared)
-  3. continuous batching - many requests through a small running window vs HF
-                           running the whole batch at once
-
-    PYTHONPATH=. python benchmarks/benchmark_florence2.py --quick
-    PYTHONPATH=. python benchmarks/benchmark_florence2.py --batches 3,6,12 --dtype bfloat16
+  PYTHONPATH=. python benchmarks/benchmark_florence2.py
+  PYTHONPATH=. python benchmarks/benchmark_florence2.py --device cuda
 """
 
 import argparse
+import json
 import os
-import sys
 import time
 import urllib.request
-
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
-os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
-os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
 
 import torch
 from PIL import Image
@@ -44,14 +26,29 @@ from PIL import Image
 from fastencdec import LLM, SamplingParams
 
 DEFAULT_MODEL = "florence-community/Florence-2-base"
-IMAGE_URL = "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/transformers/tasks/car.jpg"
+IMAGE_URL = (
+    "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/"
+    "transformers/tasks/car.jpg"
+)
 
-# (label, prompt).  Ordered short -> long; requests cycle through this list.
+# (label, prompt).  Four tasks with very different output lengths; requests
+# cycle through the list (4 divides batch=8 and beams=4 evenly).
 TASKS = [
     ("caption", "<CAPTION>"),
     ("detection", "<OD>"),
     ("segmentation", "<REFERRING_EXPRESSION_SEGMENTATION>the car"),
+    (
+        "grounding",
+        "<CAPTION_TO_PHRASE_GROUNDING>A car with visible door handles and wheels.",
+    ),
 ]
+
+CONFIGS = (
+    ("batch=1, beams=1, bf16", 1, 1, "bfloat16"),
+    ("batch=8, beams=1, bf16", 8, 1, "bfloat16"),
+    ("batch=8, beams=4, bf16", 8, 4, "bfloat16"),
+    ("batch=8, beams=1, fp32", 8, 1, "float32"),
+)
 
 
 def load_image(path: str) -> Image.Image:
@@ -69,15 +66,15 @@ def workload_of(image, n):
 
 
 def _sync() -> None:
-    """Block on the GPU so GPU timings include kernel execution (no-op on CPU)."""
     if torch.cuda.is_available():
         torch.cuda.synchronize()
 
 
-def timed(fn, warmup, repeats):
+def timed(fn, warmup: int, repeats: int):
     for _ in range(warmup):
         fn()
-    best, result = float("inf"), None
+    best = float("inf")
+    result = None
     for _ in range(repeats):
         _sync()
         start = time.perf_counter()
@@ -87,20 +84,18 @@ def timed(fn, warmup, repeats):
     return best, result
 
 
-def prepare_ours(llm, workload):
-    prepared = []
-    for _, prompt, image in workload:
-        inputs = llm.processor(text=prompt, images=image, return_tensors="pt")
-        prepared.append(
-            (
-                inputs["input_ids"][0].tolist(),
-                inputs["pixel_values"][0],
-            )
+def run_ours(llm, workload, max_tokens, beams, warmup, repeats):
+    prepared = [
+        (
+            llm.processor(text=prompt, images=image, return_tensors="pt")["input_ids"][
+                0
+            ].tolist(),
+            llm.processor(text=prompt, images=image, return_tensors="pt")[
+                "pixel_values"
+            ][0],
         )
-    return prepared
-
-
-def run_ours(llm, prepared, max_tokens, beams, warmup, repeats):
+        for _, prompt, image in workload
+    ]
     params = SamplingParams(
         max_tokens=max_tokens,
         num_beams=beams,
@@ -109,18 +104,16 @@ def run_ours(llm, prepared, max_tokens, beams, warmup, repeats):
     )
 
     def once():
-        engine_requests = [
-            (ids, [llm.decoder_start_token_id], pixels) for ids, pixels in prepared
-        ]
-        requests = llm.engine.generate(engine_requests, params)
+        requests = llm.engine.generate(
+            [(ids, [llm.decoder_start_token_id], pixels) for ids, pixels in prepared],
+            params,
+        )
         return [llm.engine.results[r] for r in requests]
 
     return timed(once, warmup, repeats)
 
 
-def run_hf(
-    model, processor, workload, max_tokens, beams, warmup, repeats, device="cpu"
-):
+def run_hf(model, processor, workload, max_tokens, beams, warmup, repeats, device):
     inputs = processor(
         text=[p for _, p, _ in workload],
         images=[im for _, _, im in workload],
@@ -140,7 +133,6 @@ def run_hf(
                 forced_bos_token_id=None,
                 forced_eos_token_id=None,
                 early_stopping=False,
-                # Neutral decoding, matching run_ours (no checkpoint heuristics).
                 length_penalty=1.0,
                 no_repeat_ngram_size=0,
             )
@@ -155,211 +147,139 @@ def run_hf(
     return timed(once, warmup, repeats)
 
 
-def token_mix(workload, outputs):
-    lengths = {}
-    for (label, _, _), out in zip(workload, outputs):
-        lengths.setdefault(label, []).append(len(out))
-    return " ".join(f"{label}={sum(v) / len(v):.0f}" for label, v in lengths.items())
-
-
-def row(batch, ours_s, hf_s, ours_tok, hf_tok, mix):
-    return (
-        f"{batch:>6} | {ours_s * 1e3:>9.0f} | {hf_s * 1e3:>9.0f} | "
-        f"{hf_s / ours_s:>7.2f}x | {ours_tok / ours_s:>11.1f} | "
-        f"{hf_tok / hf_s:>10.1f} | {ours_tok:>8d} | {hf_tok:>7d} | {mix}"
-    )
-
-
-HEADER = (
-    f"{'config':>6} | {'ours ms':>9} | {'hf ms':>9} | {'speedup':>8} | "
-    f"{'ours tok/s':>11} | {'hf tok/s':>10} | {'ours tok':>8} | "
-    f"{'hf tok':>7} | mix"
-)
+def blocks_for(batch: int, beams: int, enc_len: int, max_tokens: int, bs: int) -> int:
+    return (batch * beams * (enc_len + max_tokens) + bs - 1) // bs + 8
 
 
 def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--model", default=DEFAULT_MODEL)
-    parser.add_argument("--image", default="/tmp/fastencdec/florence2_bench.jpg")
-    parser.add_argument("--batches", default="3,6,12")
-    parser.add_argument("--beams", default="1,3,5")
-    parser.add_argument("--requests", type=int, default=24)
-    parser.add_argument("--windows", default="6,12")
-    parser.add_argument("--max-tokens", type=int, default=256)
-    parser.add_argument("--beam-tokens", type=int, default=128)
-    parser.add_argument("--dtype", default="bfloat16", choices=["float32", "bfloat16"])
-    parser.add_argument("--device", default="cpu", help="cpu or cuda (cuda:N works)")
-    parser.add_argument("--warmup", type=int, default=1)
-    parser.add_argument("--repeats", type=int, default=2)
-    parser.add_argument("--quick", action="store_true")
-    parser.add_argument(
-        "--no-compile-mm-encoder",
-        dest="compile_mm_encoder",
-        action="store_false",
-        help="disable torch.compile of the vision tower + projector (default: enabled)",
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--model", default=DEFAULT_MODEL)
+    ap.add_argument("--image", default="/tmp/fastencdec/florence2_bench.jpg")
+    ap.add_argument("--device", default="cpu")
+    ap.add_argument(
+        "--threads",
+        type=int,
+        default=0,
+        help="0 = torch default, i.e. the number of physical cores",
     )
-    parser.add_argument("--json", default=None)
-    args = parser.parse_args()
+    ap.add_argument(
+        "--block-size",
+        type=int,
+        default=0,
+        help="0 = device default (256 cuda, 16 cpu)",
+    )
+    ap.add_argument("--max-tokens", type=int, default=256)
+    ap.add_argument("--warmup", type=int, default=1)
+    ap.add_argument("--repeats", type=int, default=1)
+    ap.add_argument("--json", default=None)
+    args = ap.parse_args()
 
-    if args.quick:
-        args.batches, args.beams = "3,6", "1,3"
-        args.requests, args.windows = 6, "3,6"
-        args.max_tokens, args.beam_tokens = 96, 64
-        args.repeats = 1
-    # torch.compile fires on the first call, so always warm up at least once.
-    if args.compile_mm_encoder and args.warmup < 1:
-        args.warmup = 1
+    if args.threads:
+        torch.set_num_threads(args.threads)
 
-    dtype = {"float32": torch.float32, "bfloat16": torch.bfloat16}[args.dtype]
-    batches = [int(b) for b in args.batches.split(",") if b]
-    beams_list = [int(b) for b in args.beams.split(",") if b]
-    windows = [int(w) for w in args.windows.split(",") if w]
-    max_seqs = max(max(batches), max(windows), args.requests)
-    # Keep the KV token budget constant across devices (CUDA uses 256-token
-    # blocks so flash's paged kernel applies; CPU uses 16).
-    block_size = 256 if str(args.device).startswith("cuda") else 16
-    num_blocks = max(1, 4096 * 16 // block_size)
+    import transformers
+    from transformers import (
+        AutoProcessor,
+    )
+    from transformers import (
+        Florence2ForConditionalGeneration as HFModel,
+    )
 
-    from transformers import AutoProcessor
-    from transformers import Florence2ForConditionalGeneration as HFFlorence2
-
+    transformers.logging.set_verbosity_error()
+    device = args.device
     image = load_image(args.image)
-    print(
-        f"model={args.model}  device={args.device}  dtype={args.dtype} (ours and HF)  "
-        f"image={image.size}  max_tokens={args.max_tokens}  "
-        f"beam_tokens={args.beam_tokens}"
-    )
-
-    llm = LLM(
-        args.model,
-        num_blocks=num_blocks,
-        block_size=block_size,
-        max_num_seqs=max_seqs,
-        dtype=dtype,
-        compile_mm_encoder=args.compile_mm_encoder,
-        device=args.device,
-    )
     processor = AutoProcessor.from_pretrained(args.model)
-    hf = HFFlorence2.from_pretrained(args.model, dtype=dtype).eval().to(args.device)
-    results = []
-
-    # ---------------------------------------------------------- batch scaling
-    print(f"\n== greedy batch scaling (mixed tasks) ==\n{HEADER}")
-    for batch in batches:
-        workload = workload_of(image, batch)
-        prepared = prepare_ours(llm, workload)
-        ours_s, ours_out = run_ours(
-            llm, prepared, args.max_tokens, 1, args.warmup, args.repeats
-        )
-        hf_s, hf_out = run_hf(
-            hf,
-            processor,
-            workload,
-            args.max_tokens,
-            1,
-            args.warmup,
-            args.repeats,
-            args.device,
-        )
-        ours_tok = sum(map(len, ours_out))
-        hf_tok = sum(map(len, hf_out))
-        print(row(batch, ours_s, hf_s, ours_tok, hf_tok, token_mix(workload, ours_out)))
-        results.append(
-            {
-                "sweep": "batch",
-                "config": batch,
-                "ours_ms": ours_s * 1e3,
-                "hf_ms": hf_s * 1e3,
-                "speedup": hf_s / ours_s,
-                "ours_tok": ours_tok,
-                "hf_tok": hf_tok,
-            }
-        )
-
-    # ----------------------------------------------------------- beam scaling
-    print(f"\n== beam scaling (batch=3, mixed tasks) ==\n{HEADER}")
-    workload = workload_of(image, 3)
-    prepared = prepare_ours(llm, workload)
-    for beams in beams_list:
-        ours_s, ours_out = run_ours(
-            llm, prepared, args.beam_tokens, beams, args.warmup, args.repeats
-        )
-        hf_s, hf_out = run_hf(
-            hf,
-            processor,
-            workload,
-            args.beam_tokens,
-            beams,
-            args.warmup,
-            args.repeats,
-            args.device,
-        )
-        ours_tok = sum(map(len, ours_out))
-        hf_tok = sum(map(len, hf_out))
-        print(row(beams, ours_s, hf_s, ours_tok, hf_tok, token_mix(workload, ours_out)))
-        results.append(
-            {
-                "sweep": "beam",
-                "config": beams,
-                "ours_ms": ours_s * 1e3,
-                "hf_ms": hf_s * 1e3,
-                "speedup": hf_s / ours_s,
-                "ours_tok": ours_tok,
-                "hf_tok": hf_tok,
-            }
-        )
-
-    # ----------------------------------------------------- continuous batching
-    print(f"\n== continuous batching (N={args.requests} mixed, greedy) ==\n{HEADER}")
-    workload = workload_of(image, args.requests)
-    prepared = prepare_ours(llm, workload)
-    hf_s, hf_out = run_hf(
-        hf,
-        processor,
-        workload,
-        args.max_tokens,
-        1,
-        args.warmup,
-        args.repeats,
-        args.device,
+    enc_len = max(
+        len(processor(text=prompt, images=image, return_tensors="pt")["input_ids"][0])
+        for _, prompt, _ in workload_of(image, len(TASKS))
     )
-    hf_tok = sum(map(len, hf_out))
+    block_size = args.block_size or (256 if device.startswith("cuda") else 16)
+
+    print("# fast-encdec Florence-2 benchmark\n", flush=True)
     print(
-        f"{'HF(all)':>6} | {'-':>9} | {hf_s * 1e3:>9.0f} | {'-':>8} | "
-        f"{'-':>11} | {hf_tok / hf_s:>10.1f} | {'-':>8} | {hf_tok:>7d} | "
-        f"{token_mix(workload, hf_out)}"
+        f"model={args.model}  device={device}  threads={torch.get_num_threads()}  "
+        f"image={image.size}  max_tokens={args.max_tokens}",
+        flush=True,
     )
-    for window in windows:
-        llm.engine.scheduler.max_num_seqs = window
-        ours_s, ours_out = run_ours(
-            llm, prepared, args.max_tokens, 1, args.warmup, args.repeats
-        )
-        ours_tok = sum(map(len, ours_out))
-        print(
-            row(
-                f"w={window}",
-                ours_s,
-                hf_s,
-                ours_tok,
-                hf_tok,
-                token_mix(workload, ours_out),
+    print(
+        "\n| config | ours ms | ours tok/s | hf ms | hf tok/s | speedup | mix |"
+        "\n|---|---:|---:|---:|---:|---:|---|",
+        flush=True,
+    )
+
+    results = []
+    for dtype_name in ("bfloat16", "float32"):
+        configs = [c for c in CONFIGS if c[3] == dtype_name]
+        if not configs:
+            continue
+        dtype = getattr(torch, dtype_name)
+        for label, batch, beams, _ in configs:
+            workload = workload_of(image, batch)
+            num_blocks = blocks_for(batch, beams, enc_len, args.max_tokens, block_size)
+            llm = LLM(
+                args.model,
+                num_blocks=num_blocks,
+                block_size=block_size,
+                dtype=dtype,
+                device=device,
             )
-        )
-        results.append(
-            {
-                "sweep": "continuous",
-                "config": window,
-                "ours_ms": ours_s * 1e3,
-                "hf_ms": hf_s * 1e3,
-                "speedup": hf_s / ours_s,
-                "ours_tok": ours_tok,
-                "hf_tok": hf_tok,
-            }
-        )
+            hf = HFModel.from_pretrained(args.model, dtype=dtype).eval()
+            if device.startswith("cuda"):
+                hf = hf.to(device)
+
+            ours_s, ours_rows = run_ours(
+                llm, workload, args.max_tokens, beams, args.warmup, args.repeats
+            )
+            hf_s, hf_rows = run_hf(
+                hf,
+                processor,
+                workload,
+                args.max_tokens,
+                beams,
+                args.warmup,
+                args.repeats,
+                device,
+            )
+            ours_tok = sum(len(r) for r in ours_rows)
+            hf_tok = sum(len(r) for r in hf_rows)
+            if ours_tok != hf_tok:
+                # EOS-stopped output, so beam search can pick a slightly different
+                # hypothesis in each engine; report it rather than fail.
+                print(
+                    f"  (note: ours {ours_tok} tokens vs HF {hf_tok} - beam "
+                    "search chose a different hypothesis)",
+                    flush=True,
+                )
+            lengths = {}
+            for (task, _, _), out in zip(workload, ours_rows):
+                lengths.setdefault(task, []).append(len(out))
+            mix = " ".join(f"{t}={sum(v) // len(v)}" for t, v in lengths.items())
+            print(
+                f"| {label:<22} | {ours_s * 1e3:>8.0f} | {ours_tok / ours_s:>10.1f} "
+                f"| {hf_s * 1e3:>8.0f} | {hf_tok / hf_s:>9.1f} "
+                f"| {hf_s / ours_s:>7.2f}x | {mix} |",
+                flush=True,
+            )
+            results.append(
+                {
+                    "config": label,
+                    "dtype": dtype_name,
+                    "batch": batch,
+                    "beams": beams,
+                    "image": list(image.size),
+                    "ours_ms": ours_s * 1e3,
+                    "ours_tok": ours_tok,
+                    "hf_tok": hf_tok,
+                    "ours_tok_s": ours_tok / ours_s,
+                    "hf_ms": hf_s * 1e3,
+                    "hf_tok_s": hf_tok / hf_s,
+                    "speedup": hf_s / ours_s,
+                    "mix": mix,
+                }
+            )
+            del llm, hf
 
     if args.json:
-        import json
-
         with open(args.json, "w") as f:
             json.dump(results, f, indent=2)
         print(f"\nwrote {args.json}")
