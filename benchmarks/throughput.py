@@ -21,6 +21,7 @@ os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
 import torch
 
 from fastencdec import LLM, SamplingParams
+from fastencdec.config import default_block_size
 
 TEXT = (
     "The quick brown fox jumps over the lazy dog. Scientists at the university "
@@ -67,7 +68,7 @@ def main():
 
     tokenizer = AutoTokenizer.from_pretrained(args.model)
 
-    block_size = args.block_size or (256 if str(args.device).startswith("cuda") else 16)
+    block_size = args.block_size or default_block_size(args.device)
     n = args.requests
     tokens_per_seq = args.enc_len + args.max_tokens
     num_blocks = n * ((tokens_per_seq + block_size - 1) // block_size) + 64

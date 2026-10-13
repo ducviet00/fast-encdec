@@ -32,6 +32,7 @@ from functools import partial
 import torch
 
 from fastencdec import LLM, SamplingParams
+from fastencdec.config import default_block_size
 
 MODEL = "facebook/bart-large-cnn"
 DECODE = {"length_penalty": 2.0, "no_repeat_ngram_size": 3}
@@ -180,7 +181,7 @@ def main():
         "--block-size",
         type=int,
         default=0,
-        help="0 = device default (256 cuda, 16 cpu)",
+        help="0 = device default (256 cuda, 32 x86 cpu, 16 aarch64)",
     )
     ap.add_argument("--scenarios", default="", help="comma list, default all")
     ap.add_argument("--warmup", type=int, default=1)
@@ -193,7 +194,7 @@ def main():
 
     from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
 
-    block_size = args.block_size or (256 if args.device.startswith("cuda") else 16)
+    block_size = args.block_size or default_block_size(args.device)
     tokenizer = AutoTokenizer.from_pretrained(args.model)
     wanted = {s.strip() for s in args.scenarios.split(",") if s.strip()}
     scenarios = [s for s in SCENARIOS if not wanted or s[0] in wanted]

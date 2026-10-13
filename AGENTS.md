@@ -299,20 +299,25 @@ hand-edit or guess.**
 
 | config | ours ms | ours tok/s | hf ms | hf tok/s | speedup |
 |---|---:|---:|---:|---:|---:|
-| batch=1, beams=1, bf16 | 5274 | 48.6 | 6139 | 41.7 | 1.16x |
-| batch=8, beams=1, bf16 | 6027 | 339.8 | 8965 | 228.5 | 1.49x |
-| batch=8, beams=4, bf16 | 9099 | 225.1 | 31329 | 65.4 | 3.44x |
-| batch=8, beams=1, fp32 | 23792 | 86.1 | 24556 | 83.4 | 1.03x |
+| batch=1, beams=1, bf16 | 4937 | 51.9 | 6067 | 42.2 | 1.23x |
+| batch=8, beams=1, bf16 | 6046 | 337.9 | 9041 | 226.6 | 1.49x |
+| batch=8, beams=4, bf16 | 9411 | 217.5 | 31479 | 65.1 | 3.34x |
+| batch=8, beams=1, fp32 | 23682 | 86.5 | 24514 | 83.6 | 1.04x |
 
 Mean of four runs (the batch=8 rows agree within 1%; the latency-bound batch=1
-row varies ~5% with this laptop's clock).  Absolute times are only comparable
-within one recording: the box ran ~20% slower here than when the previous table
-was taken, which moves the single-sequence row most, so on this box only the
-with-in-run speedup is meaningful.  Built with the vendored kernel — if
-`csrc/` fails to build (no `ninja`, see the gotcha) the same table reads
-0.85x / 0.85x / 1.29x / 0.91x, i.e. ~1.8x worse and slower than HF at greedy.
-With the kernel this laptop is the *fastest* box at these points (8 cores, high
-clocks), which is why its numbers beat the 4-core Xeons' in the README matrix.
+row varies ~5% with this laptop's clock — this recording ranged 4372-5178 ms, so
+its 1.23x is the least reliable cell).  This recording is at the x86 default
+`block_size=32`; at the previous 16 it read 1.16x / 1.49x / 3.44x / 1.03x — that
+page size is the greedy-vs-beam trade-off in the gotcha below.  Absolute times
+are only comparable within one recording: the box ran ~20% slower here than when
+the previous table was taken, which moves the single-sequence row most, so on
+this box only the with-in-run speedup is meaningful.  Built with the vendored
+kernel — if `csrc/` fails to build (no `ninja`, see the gotcha) the same table
+reads 1.02x / 0.89x / 1.33x / 0.91x: greedy loses its edge (0.89-1.02x) and the
+beams=4 win shrinks 3.34x → 1.33x, which is why `cpu_attn.module()` is worth
+checking before trusting any CPU number.  With the kernel this laptop is the
+*fastest* box at these points (8 cores, high clocks), which is why its numbers
+beat the 4-core Xeons' in the README matrix.
 
 `benchmark_florence2.py` runs the same configs on a real 640x480 photo
 (`car.jpg`, scp'd to `/tmp/fastencdec/` so the boxes never hit the Hub) and a
@@ -422,13 +427,13 @@ on this box with the same kind of workload.
   the tiny-random-BART test model, `head_dim=4`) fall back to SDPA. The first
   use compiles `csrc/` (~1-3 min) and caches the `.so` under torch's extensions
   dir; a missing compiler downgrades `"auto"` to SDPA but makes `"vllm"` fail.
-  `benchmarks/attn_backend.py` measures what the kernel is worth: measured on the
-  four CPU boxes (bf16, `block_size=16`) it is **3.7-84x faster per decoder op**
-  than the SDPA/"eager" fallbacks (84x at batch=8/ctx=256, ~5-20x at
-  batch=32/ctx=1024, where the fallback's per-sequence loop amortizes) and
-  **+39% to +93% end-to-end** over `attn_backend="sdpa"`; versus HF the engine's
-  margin is the one in the benchmark matrix above (0.93-3.47x depending on the
-  point and the beam width).
+  `benchmarks/attn_backend.py` measures what the kernel is worth: at the default
+  page size on the four CPU boxes (bf16) it is **~4-75x faster per decoder op**
+  than the SDPA/"eager" fallbacks (75x at batch=8/ctx=256 on the 8-core laptop,
+  ~10-21x at batch=32/ctx=1024, where the fallback's per-sequence loop
+  amortizes) and **+15% to +65% end-to-end** over `attn_backend="sdpa"`; versus
+  HF the engine's margin is the one in the benchmark matrix above (0.97-3.79x
+  depending on the point and the beam width).
   The CPU SDPA fallback is itself slower than HF (0.75-0.94x) because it attends
   one sequence at a time (CUDA uses the batched path), so `"auto"` resolving to
   the kernel matters a lot.  **Check `cpu_attn.module()` before trusting CPU
@@ -436,6 +441,25 @@ on this box with the same kind of workload.
   silently degrades to SDPA and gets *slower than HF* (0.75-0.94x) with no error
   — `ninja` is now in the `cpu` extra for exactly this reason, and a bare
   `uv sync` without it is the usual cause.
+- **CPU page size (`block_size`).** `block_size=None` picks the smallest page the
+  device's best kernel accepts (`fastencdec.config.default_block_size`): 256 on
+  CUDA, **32 on x86**, 16 on aarch64.  `csrc`'s full-width AVX-512 kernel
+  (`select_isa` → `"vec"`) only engages when `block_size % 32 == 0`, so the
+  old x86 default of 16 silently ran the half-width `"vec16"` one and left ~10%
+  of the attention kernel unused (`benchmarks/attn_backend.py --mode kernel` on
+  Emerald, batch=8: self/ctx=256 113.0 → 103.6 µs, cross/enc=1024 428.0 →
+  390.9 µs, and every other shape 8-11% faster).  It is not free: two costs grow
+  with the page size, both measured on the Xeons — the vendored kernel writes K
+  *column-major with stride `block_size`*, so the per-step KV store went 56 →
+  116 µs/call (Emerald), and a beam-search copy-on-write copies a whole page,
+  165 → 283 µs/event (copying only the used slots does *not* help: the copy is
+  dispatch-bound).  Net effect at 32 on x86 (`benchmarks/benchmark.py`, two runs
+  per box): greedy gains 0.02-0.08 of speedup (Emerald `512->128, batch=8,
+  beams=1` 0.95x → 1.00x, Granite `128->512, batch=8, beams=1` 1.10x → 1.18x)
+  while beams=4 loses 0.03-0.09 (2.52x → 2.42x, 3.91x → 3.79x, 2.21x → 2.14x on
+  Emerald).  aarch64 is unaffected (16 is already enough for `"neon"`, and a
+  smaller page is a cheaper copy).  The same `num_blocks` budget now covers
+  twice the KV tokens (and uses twice the memory).
 - **CUDA / FlashAttention-2.** `device="cuda"` needs the `kernels` package; the
   `kernels-community/flash-attn2` wheel is downloaded once (`get_kernel`, tries
   `version=3` then `2` then unversioned) and cached under the HF cache dir, so
@@ -444,7 +468,14 @@ on this box with the same kind of workload.
   block size divisible by 256 — hence the CUDA default `block_size` of 256. So
   fp32, an unsupported head dim (e.g. the tiny-random-BART `head_dim=4`), or an
   explicit `block_size=16` on CUDA silently demote `"auto"` to SDPA (`"flash"`
-  raises instead). The backend uses `flash_attn_with_kvcache` (page-major cache
+  raises instead).  So does an unavailable *kernel*: with `HF_HUB_OFFLINE=1`
+  and a cold ``kernels`` cache, `get_kernel` fails even though the Hub is
+  reachable, `flash_attn.module()` is `None`, `"auto"` runs SDPA and the decode
+  CUDA graph switches off with it — on the L4, `batch=8, beams=1, bf16` then
+  measured 347 tok/s where the flash path gives 1817.  Check
+  `flash_attn.module()` before trusting CUDA numbers, exactly as
+  `cpu_attn.module()` gates the CPU ones.
+  The backend uses `flash_attn_with_kvcache` (page-major cache
   read through the block table) for self- and cross-attention: the dedicated
   decode kernel is ~3x cheaper per call than `flash_attn_varlen_func`, which
   matters because GPU decode here is launch-bound. The BART encoder

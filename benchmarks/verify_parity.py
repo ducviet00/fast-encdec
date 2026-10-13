@@ -25,6 +25,7 @@ os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
 import torch
 
 from fastencdec import LLM, SamplingParams
+from fastencdec.config import default_block_size
 
 BART = "facebook/bart-large-cnn"
 FLORENCE = "florence-community/Florence-2-base"
@@ -34,7 +35,7 @@ IMAGE_URL = "https://huggingface.co/datasets/huggingface/documentation-images/re
 
 def block_config(device, tokens):
     """Scale ``num_blocks`` so the KV token budget is device-independent."""
-    block_size = 256 if str(device).startswith("cuda") else 16
+    block_size = default_block_size(device)
     return max(1, tokens // block_size), block_size
 
 

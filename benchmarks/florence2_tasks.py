@@ -28,6 +28,7 @@ import torch
 from PIL import Image, ImageEnhance
 
 from fastencdec import SamplingParams
+from fastencdec.config import default_block_size
 from fastencdec.llm import LLM
 
 MODEL = "florence-community/Florence-2-base"
@@ -143,7 +144,7 @@ def main():
     from transformers import Florence2ForConditionalGeneration as HFFlorence2
 
     processor = AutoProcessor.from_pretrained(MODEL)
-    block_size = 256 if str(args.device).startswith("cuda") else 16
+    block_size = default_block_size(args.device)
     num_blocks = max(1, args.num_blocks * 16 // block_size)
     llm = LLM(
         MODEL,

@@ -40,9 +40,10 @@ def make_runner(engine, args, dtype, workload):
     """Return a zero-arg ``run`` closure for ``engine`` on ``workload``."""
     if engine == "ours":
         from fastencdec import SamplingParams
+        from fastencdec.config import default_block_size
         from fastencdec.llm import LLM
 
-        block_size = 256 if str(args.device).startswith("cuda") else 16
+        block_size = default_block_size(args.device)
         llm = LLM(
             tasks.MODEL,
             num_blocks=max(1, args.num_blocks * 16 // block_size),

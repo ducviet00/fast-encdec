@@ -2,8 +2,9 @@
 
 Builds a tiny BART whose ``head_dim`` the kernel supports (32) and checks that
 greedy and beam decoding match the pure-PyTorch path token for token, for a
-batch of mixed encoder lengths.  Skips silently when the extension cannot
-build (no compiler / unsupported machine).
+batch of mixed encoder lengths and both CPU page sizes (16 = the 16-wide
+``vec16`` kernel, 32 = the full-width ``vec`` one).  Skips silently when the
+extension cannot build (no compiler / unsupported machine).
 
 Run with:  PYTHONPATH=. python tests/test_attn_backend.py
 """
@@ -47,10 +48,10 @@ def build_model():
     return BartForConditionalGeneration(config).eval()
 
 
-def decode(model, backend, requests, params):
+def decode(model, backend, requests, params, block_size):
     config = Config(
         num_blocks=256,
-        block_size=16,
+        block_size=block_size,
         max_num_seqs=8,
         dtype=torch.float32,
         attn_backend=backend,
@@ -61,7 +62,7 @@ def decode(model, backend, requests, params):
 
 
 def main():
-    if cpu_attn.select_isa(torch.float32, 16, 32) is None:
+    if cpu_attn.select_isa(torch.float32, 32, 32) is None:
         print("SKIP: no kernel for this machine")
         return
     model = build_model()
@@ -72,14 +73,17 @@ def main():
         (torch.randint(3, VOCAB, (9,)).tolist(), [1], None),
     ]
     failures = 0
-    for beams in (1, 2):
-        params = SamplingParams(max_tokens=10, num_beams=beams, temperature=0.0)
-        ref = decode(model, "sdpa", requests, params)
-        got = decode(model, "vllm", requests, params)
-        for i, (want, have) in enumerate(zip(ref, got)):
-            status = "OK" if want == have else "MISMATCH"
-            failures += status == "MISMATCH"
-            print(f"[{status}] beams={beams} seq={i}: {have}")
+    for block_size in (16, 32):
+        for beams in (1, 2):
+            params = SamplingParams(max_tokens=10, num_beams=beams, temperature=0.0)
+            ref = decode(model, "sdpa", requests, params, block_size)
+            got = decode(model, "vllm", requests, params, block_size)
+            for i, (want, have) in enumerate(zip(ref, got)):
+                status = "OK" if want == have else "MISMATCH"
+                failures += status == "MISMATCH"
+                print(
+                    f"[{status}] block_size={block_size} beams={beams} seq={i}: {have}"
+                )
     if failures:
         raise SystemExit(f"{failures} mismatches")
 

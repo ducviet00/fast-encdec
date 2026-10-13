@@ -29,6 +29,7 @@ from types import SimpleNamespace
 
 import torch
 
+from fastencdec.config import default_block_size
 from fastencdec.layers import attention
 from fastencdec.utils.context import set_context
 
@@ -300,7 +301,7 @@ def main():
         torch.set_num_threads(args.threads)
     threads = torch.get_num_threads()  # physical cores unless forced
     dtype = getattr(torch, args.dtype)
-    block_size = args.block_size or (256 if args.device.startswith("cuda") else 16)
+    block_size = args.block_size or default_block_size(args.device)
     print(
         f"attn_backend benchmark: device={args.device} dtype={args.dtype} "
         f"threads={threads} block_size={block_size}"

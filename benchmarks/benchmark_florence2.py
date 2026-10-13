@@ -24,6 +24,7 @@ import torch
 from PIL import Image
 
 from fastencdec import LLM, SamplingParams
+from fastencdec.config import default_block_size
 
 DEFAULT_MODEL = "florence-community/Florence-2-base"
 IMAGE_URL = (
@@ -166,7 +167,7 @@ def main():
         "--block-size",
         type=int,
         default=0,
-        help="0 = device default (256 cuda, 16 cpu)",
+        help="0 = device default (256 cuda, 32 x86 cpu, 16 aarch64)",
     )
     ap.add_argument("--max-tokens", type=int, default=256)
     ap.add_argument("--warmup", type=int, default=1)
@@ -193,7 +194,7 @@ def main():
         len(processor(text=prompt, images=image, return_tensors="pt")["input_ids"][0])
         for _, prompt, _ in workload_of(image, len(TASKS))
     )
-    block_size = args.block_size or (256 if device.startswith("cuda") else 16)
+    block_size = args.block_size or default_block_size(device)
 
     print("# fast-encdec Florence-2 benchmark\n", flush=True)
     print(

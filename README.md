@@ -84,40 +84,53 @@ the tokens and `benchmarks/throughput.py` measures decode-only throughput.
 
 | point | config | Xeon 8581C | Xeon 6975P-C | Graviton 5 | L4 |
 |---|---|---:|---:|---:|---:|
-| 128->512 | batch=1, beams=1 | 1.12x | 1.09x | 1.09x | 3.37x |
-| 128->512 | batch=8, beams=1 | 1.08x | 1.10x | 1.23x | 2.87x |
-| 128->512 | batch=8, beams=4 | 2.52x | 2.36x | 1.94x | 1.99x |
-| 512->128 | batch=1, beams=1 | 1.09x | 1.09x | 1.07x | 3.33x |
-| 512->128 | batch=8, beams=1 | 0.95x | 0.94x | 1.10x | 2.47x |
-| 512->128 | batch=8, beams=4 | 3.91x | 2.65x | 1.69x | 2.75x |
-| 256->256 | batch=1, beams=1 | 1.11x | 1.10x | 1.06x | 3.41x |
-| 256->256 | batch=8, beams=1 | 1.05x | 1.06x | 1.17x | 2.85x |
-| 256->256 | batch=8, beams=4 | 2.21x | 2.10x | 1.79x | 2.15x |
+| 128->512 | batch=1, beams=1 | 1.13x | 1.13x | 1.07x | 3.31x |
+| 128->512 | batch=8, beams=1 | 1.13x | 1.18x | 1.20x | 2.82x |
+| 128->512 | batch=8, beams=4 | 2.42x | 2.27x | 1.94x | 1.99x |
+| 512->128 | batch=1, beams=1 | 1.09x | 1.08x | 1.07x | 3.29x |
+| 512->128 | batch=8, beams=1 | 1.00x | 0.97x | 1.09x | 2.42x |
+| 512->128 | batch=8, beams=4 | 3.79x | 2.66x | 1.70x | 2.73x |
+| 256->256 | batch=1, beams=1 | 1.11x | 1.12x | 1.07x | 3.35x |
+| 256->256 | batch=8, beams=1 | 1.08x | 1.08x | 1.16x | 2.78x |
+| 256->256 | batch=8, beams=4 | 2.14x | 2.10x | 1.81x | 2.13x |
 
 **Throughput (tokens/s), 256->256**
 
 | config | engine | Xeon 8581C | Xeon 6975P-C | Graviton 5 | L4 |
 |---|---|---:|---:|---:|---:|
-| batch=8, beams=1 | fast-encdec | 345 | 333 | 514 | 1812 |
-| batch=8, beams=1 | transformers | 329 | 314 | 441 | 636 |
-| batch=8, beams=4 | fast-encdec | 234 | 228 | 297 | 938 |
-| batch=8, beams=4 | transformers | 106 | 109 | 166 | 436 |
+| batch=8, beams=1 | fast-encdec | 349 | 330 | 508 | 1810 |
+| batch=8, beams=1 | transformers | 325 | 307 | 440 | 652 |
+| batch=8, beams=4 | fast-encdec | 226 | 223 | 296 | 940 |
+| batch=8, beams=4 | transformers | 105 | 106 | 164 | 442 |
 
 Beam search is the biggest win: `transformers` reorders the whole beam cache every
 step, while blocks are shared here. Greedy with a long encoder (512->128) is the
-one case where the two engines are even, because the encoder is shared work.
+one case where the two engines are essentially even (0.97-1.09x), because the
+encoder is shared work.
+
+Each cell is the average of two independent runs, and every run writes its raw
+results with `--json`, so the numbers can be re-derived rather than trusted. The
+two x86 boxes run the engine's 32-token page size (see the page-size gotcha in
+`AGENTS.md`), which engages the full-width AVX-512 attention kernel: against the
+previous 16 it lifts the greedy rows (8581C `512->128, batch=8, beams=1` 0.95x ->
+1.00x, 6975P-C `128->512, batch=8, beams=1` 1.10x -> 1.18x) and costs the beams=4
+rows 0.03-0.09 (2.52x -> 2.42x, 3.91x -> 3.79x, 2.21x -> 2.14x on the 8581C).
+Graviton 5 and the L4 keep their page size (16 and 256 respectively) and
+reproduce their previous values within noise, i.e. the change is x86-only.
 
 **Florence-2** (real 640x480 photo, four tasks: caption, detection, referring
 segmentation and phrase grounding)
 
 | config | Xeon 8581C | Xeon 6975P-C | Graviton 5 | L4 |
 |---|---:|---:|---:|---:|
-| batch=1, beams=1 | 1.16x | 1.20x | 1.13x | 2.45x |
-| batch=8, beams=1 | 1.65x | 1.93x | 1.24x | 3.57x |
-| batch=8, beams=4 | 3.58x | 3.62x | 2.05x | 4.24x |
+| batch=1, beams=1 | 1.12x | 1.20x | 1.13x | 2.45x |
+| batch=8, beams=1 | 1.64x | 1.89x | 1.24x | 3.57x |
+| batch=8, beams=4 | 3.58x | 3.59x | 2.05x | 4.24x |
 
-Numbers are the average of two runs. In fp32 this engine reproduces
-`transformers` token for token; in bf16 the output length always matches.
+The Florence-2 numbers move less than BART's: the vision tower and encoder are
+shared work, so the page size only touches the decoder's attention.  In fp32
+this engine reproduces `transformers` token for token; in bf16 the output length
+always matches.
 
 ## Tests
 

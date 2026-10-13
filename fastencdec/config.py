@@ -1,8 +1,23 @@
 """Engine configuration shared by the scheduler and model runner."""
 
+import platform
 from dataclasses import dataclass
 
 import torch
+
+
+def default_block_size(device) -> int:
+    """Page size the best attention kernel for ``device`` wants.
+
+    CUDA's FlashAttention-2 needs a multiple of 256; the vendored CPU kernel
+    needs 32 on x86 (its ``vec`` AVX-512 path) but only 16 on aarch64 (its
+    NEON BFMMLA path), and a smaller page is a finer-grained copy-on-write.
+    """
+    if str(device).startswith("cuda"):
+        return 256
+    if platform.machine().lower() in ("arm64", "aarch64"):
+        return 16
+    return 32
 
 
 @dataclass
@@ -11,10 +26,9 @@ class Config:
 
     Args:
         num_blocks: number of paged KV blocks (total KV capacity).
-        block_size: tokens per KV block.  ``None`` picks a device-appropriate
-            default: 256 on CUDA (FlashAttention-2's paged kernel needs a page
-            size divisible by 256) and 16 on CPU (the vendored kernel needs a
-            multiple of 32).
+        block_size: tokens per KV block.  ``None`` picks the smallest page the
+            device's best attention kernel accepts, see
+            :func:`default_block_size`.
         max_num_seqs: maximum sequences (beams) in flight at once.
         dtype: ``torch.float32`` or ``torch.bfloat16``.
         attn_backend: ``"auto"`` (the best kernel for the device: the vendored
@@ -43,8 +57,7 @@ class Config:
 
     def __post_init__(self) -> None:
         if self.block_size is None:
-            cuda = str(self.device).startswith("cuda")
-            self.block_size = 256 if cuda else 16
+            self.block_size = default_block_size(self.device)
         if self.num_blocks <= 0:
             raise ValueError("num_blocks must be positive")
         if self.block_size <= 0:
