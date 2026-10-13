@@ -99,6 +99,7 @@ benchmarks/benchmark.py
 benchmarks/benchmark_florence2.py
 benchmarks/verify_parity.py
 benchmarks/throughput.py
+benchmarks/attn_backend.py
 benchmarks/florence2_tasks.py
 benchmarks/profile_florence2.py
 tests/test_parity.py
@@ -244,6 +245,11 @@ PYTHONPATH=. $P benchmarks/benchmark_florence2.py --quick --device cuda
 PYTHONPATH=. $P benchmarks/throughput.py --requests 128 --enc-len 512 --max-tokens 512
 PYTHONPATH=. $P benchmarks/throughput.py --requests 32 --enc-len 512 --max-tokens 256 --no-cudagraph
 PYTHONPATH=. $P benchmarks/throughput.py --requests 64 --enc-len 512 --max-tokens 256 --compile-model
+
+# attention implementation: vendored vLLM CPU kernel vs SDPA vs eager
+PYTHONPATH=. $P benchmarks/attn_backend.py                    # kernel + end-to-end
+PYTHONPATH=. $P benchmarks/attn_backend.py --mode kernel      # ops only, no weights
+PYTHONPATH=. $P benchmarks/attn_backend.py --mode e2e --device cuda
 
 # Florence-2 token/padding accounting (8 images x 4 tasks) and profiling
 PYTHONPATH=. $P benchmarks/florence2_tasks.py --device cuda [--no-cudagraph]
@@ -406,6 +412,14 @@ on this box with the same kind of workload.
   the tiny-random-BART test model, `head_dim=4`) fall back to SDPA. The first
   use compiles `csrc/` (~1-3 min) and caches the `.so` under torch's extensions
   dir; a missing compiler downgrades `"auto"` to SDPA but makes `"vllm"` fail.
+  `benchmarks/attn_backend.py` measures what the kernel is worth: measured on the
+  four CPU boxes (bf16, `block_size=16`) it is **5.7-80x faster per decoder op**
+  than the SDPA/"eager" fallbacks (80x at batch=8/ctx=256, ~10-20x at
+  batch=32/ctx=1024, where the fallback's per-sequence loop amortizes) and
+  **+39% to +93% end-to-end** over `attn_backend="sdpa"`, 1.04-1.53x over HF.
+  The CPU SDPA fallback is itself slower than HF (0.75-0.94x) because it attends
+  one sequence at a time (CUDA uses the batched path), so `"auto"` resolving to
+  the kernel matters a lot.
 - **CUDA / FlashAttention-2.** `device="cuda"` needs the `kernels` package; the
   `kernels-community/flash-attn2` wheel is downloaded once (`get_kernel`, tries
   `version=3` then `2` then unversioned) and cached under the HF cache dir, so

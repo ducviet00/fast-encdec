@@ -400,6 +400,61 @@ making BF16 **~2.3× faster than FP32** there — visible above as Graviton's fp
 holding up best (94.8 tok/s).  (The Ryzen box is a thermally-limited laptop, so its
 absolute numbers vary a few percent run-to-run.)
 
+### Attention implementation
+
+`benchmarks/attn_backend.py` isolates the decoder attention and runs it
+end-to-end.  Three implementations: the vendored **vLLM CPU kernel** (the
+engine's default), PyTorch **SDPA** (`attn_backend="sdpa"`) and **eager** — SDPA
+pinned to PyTorch's math kernel, i.e. the naive matmul/softmax/matmul, and HF's
+`attn_implementation="eager"`.
+
+Microseconds per decoder attention call (bf16, `block_size=16`, 8 threads).  On
+CPU our SDPA/eager paths are the per-sequence fallback loop (CUDA's is batched),
+so those columns include that Python overhead:
+
+| box | op | vllm | sdpa | eager | vllm vs eager |
+|---|---|---:|---:|---:|---:|
+| Ryzen 7 7840H | self, batch=8, ctx=256 | 32 | 2073 | 2549 | 80× |
+| | self, batch=8, ctx=1024 | 467 | 7471 | 9594 | 21× |
+| | self, batch=32, ctx=1024 | 2984 | 28210 | 29371 | 10× |
+| | cross, batch=8, enc=256 | 37 | 437 | 468 | 13× |
+| Xeon 8581C (Emerald Rapids) | self, batch=8, ctx=256 | 96 | 2223 | 3082 | 32× |
+| | self, batch=8, ctx=1024 | 387 | 5598 | 9990 | 26× |
+| | self, batch=32, ctx=1024 | 1814 | 17923 | 29025 | 16× |
+| | cross, batch=8, enc=256 | 102 | 220 | 737 | 7× |
+| Xeon 6975P-C (Granite Rapids) | self, batch=8, ctx=256 | 129 | 2004 | 3111 | 24× |
+| | self, batch=8, ctx=1024 | 494 | 7657 | 12402 | 25× |
+| | self, batch=32, ctx=1024 | 2199 | 27580 | 41405 | 19× |
+| | cross, batch=8, enc=256 | 134 | 217 | 763 | 6× |
+| Graviton 5 | self, batch=8, ctx=256 | 71 | 645 | 1491 | 21× |
+| | self, batch=8, ctx=1024 | 363 | 1667 | 3930 | 11× |
+| | self, batch=32, ctx=1024 | 1324 | 7005 | 15546 | 12× |
+| | cross, batch=8, enc=256 | 62 | 114 | 926 | 15× |
+
+End-to-end, batch=8, greedy, `ours` = this engine and `HF` = `generate` (tok/s):
+
+| box | workload | ours/vllm | ours/sdpa | ours/eager | HF/sdpa | HF/eager |
+|---|---|---:|---:|---:|---:|---:|
+| Ryzen 7 7840H | enc=256, out=48 | **256** | 184 | 155 | 199 | 202 |
+| | enc=64, out=256 | **400** | 225 | 192 | 262 | 274 |
+| Xeon 8581C | enc=256, out=48 | **306** | 247 | 173 | 282 | 253 |
+| | enc=64, out=256 | **437** | 275 | 200 | 368 | 332 |
+| Xeon 6975P-C | enc=256, out=48 | **283** | 230 | 163 | 273 | 244 |
+| | enc=64, out=256 | **409** | 258 | 181 | 345 | 315 |
+| Graviton 5 | enc=256, out=48 | **345** | 300 | 171 | 318 | 238 |
+| | enc=64, out=256 | **579** | 402 | 209 | 503 | 366 |
+
+The vendored kernel is **5.7–80× faster per op** than the SDPA/eager fallbacks
+(the ratio shrinks as the op grows, since the fallback's per-sequence loop
+amortizes while the GEMM work does not), which is worth **+39 % to +93 %
+end-to-end** over our own `attn_backend="sdpa"` and 1.04–1.53× over HF.  Our SDPA
+fallback is itself *slower* than HF (0.75–0.94×) because on CPU it attends one
+sequence at a time — hence the kernel is the default.  HF's own `eager` and
+`sdpa` are close on x86 (either can win by a few %), while on Graviton SDPA is
+clearly better than eager (503 vs 366 tok/s decode-heavy).  Graviton 5 and
+Emerald Rapids are the fastest boxes for the kernel; the Ryzen laptop wins the
+smallest case (ctx=256, 32 µs) on clock speed but falls behind at ctx=1024.
+
 ### Florence-2 (`florence-community/Florence-2-base`)
 
 Mixed `<CAPTION>` / `<OD>` / `<REFERRING_EXPRESSION_SEGMENTATION>the car` on a
