@@ -415,48 +415,55 @@ physical core count: 8 for Ryzen/Graviton, 4 for the Xeons).  On
 CPU our SDPA/eager paths are the per-sequence fallback loop (CUDA's is batched),
 so those columns include that Python overhead:
 
-| box | op | vllm | sdpa | eager | vllm vs eager |
+| box (threads, L3) | op | vllm | sdpa | eager | vllm vs eager |
 |---|---|---:|---:|---:|---:|
-| Ryzen 7 7840H | self, batch=8, ctx=256 | 32 | 2073 | 2549 | 80× |
-| | self, batch=8, ctx=1024 | 467 | 7471 | 9594 | 21× |
-| | self, batch=32, ctx=1024 | 2984 | 28210 | 29371 | 10× |
-| | cross, batch=8, enc=256 | 37 | 437 | 468 | 13× |
-| Xeon 8581C (Emerald Rapids, 4 threads) | self, batch=8, ctx=256 | 105 | 2189 | 3043 | 29× |
-| | self, batch=8, ctx=1024 | 447 | 5433 | 10213 | 23× |
-| | self, batch=32, ctx=1024 | 1896 | 23948 | 30963 | 16× |
-| | cross, batch=8, enc=256 | 114 | 173 | 618 | 5× |
-| Xeon 6975P-C (Granite Rapids, 4 threads) | self, batch=8, ctx=256 | 137 | 2236 | 2908 | 21× |
-| | self, batch=8, ctx=1024 | 591 | 7963 | 12433 | 21× |
-| | self, batch=32, ctx=1024 | 2520 | 32124 | 44251 | 18× |
-| | cross, batch=8, enc=256 | 136 | 181 | 637 | 5× |
-| Graviton 5 | self, batch=8, ctx=256 | 71 | 645 | 1491 | 21× |
-| | self, batch=8, ctx=1024 | 363 | 1667 | 3930 | 11× |
-| | self, batch=32, ctx=1024 | 1324 | 7005 | 15546 | 12× |
-| | cross, batch=8, enc=256 | 62 | 114 | 926 | 15× |
+| Ryzen 7 7840H (8, 16 MB) | self, batch=8, ctx=256 | **29** | 2102 | 2480 | 84× |
+| | self, batch=8, ctx=1024 | 460 | 7288 | 9414 | 20× |
+| | self, batch=32, ctx=1024 | 2936 | 27746 | 29277 | 10× |
+| | cross, batch=8, enc=256 | **30** | 405 | 410 | 14× |
+| | cross, batch=8, enc=1024 | 491 | 1625 | 1803 | 3.7× |
+| Xeon 8581C (4, 260 MB) | self, batch=8, ctx=256 | 106 | 2233 | 3158 | 30× |
+| | self, batch=8, ctx=1024 | 425 | 5716 | 10025 | 24× |
+| | self, batch=32, ctx=1024 | 2195 | 20905 | 30938 | 14× |
+| | cross, batch=8, enc=256 | 110 | 168 | 614 | 5.6× |
+| | cross, batch=8, enc=1024 | 420 | 478 | 2633 | 6.3× |
+| Xeon 6975P-C (4, 480 MB) | self, batch=8, ctx=256 | 128 | 2244 | 3098 | 24× |
+| | self, batch=8, ctx=1024 | 563 | 7602 | 11571 | 21× |
+| | self, batch=32, ctx=1024 | 2599 | 32032 | 44852 | 17× |
+| | cross, batch=8, enc=256 | 136 | 183 | 639 | 4.7× |
+| | cross, batch=8, enc=1024 | 574 | 569 | 3271 | 5.7× |
+| Graviton 5 (8, 48 MB) | self, batch=8, ctx=256 | 66 | 641 | 1462 | 22× |
+| | self, batch=8, ctx=1024 | **332** | 1673 | 3879 | 12× |
+| | self, batch=32, ctx=1024 | **1331** | 6941 | 15445 | 12× |
+| | cross, batch=8, enc=256 | 68 | 112 | 904 | 13× |
+| | cross, batch=8, enc=1024 | **335** | 247 | 2111 | 6.3× |
 
 End-to-end, batch=8, greedy, `ours` = this engine and `HF` = `generate` (tok/s):
 
 | box | workload | ours/vllm | ours/sdpa | ours/eager | HF/sdpa | HF/eager |
 |---|---|---:|---:|---:|---:|---:|
-| Ryzen 7 7840H | enc=256, out=48 | **256** | 184 | 155 | 199 | 202 |
-| | enc=64, out=256 | **400** | 225 | 192 | 262 | 274 |
-| Xeon 8581C | enc=256, out=48 | **312** | 267 | 189 | 294 | 260 |
-| | enc=64, out=256 | **411** | 275 | 211 | 368 | 329 |
-| Xeon 6975P-C | enc=256, out=48 | **306** | 264 | 182 | 290 | 259 |
-| | enc=64, out=256 | **390** | 263 | 200 | 346 | 315 |
-| Graviton 5 | enc=256, out=48 | **345** | 300 | 171 | 318 | 238 |
-| | enc=64, out=256 | **579** | 402 | 209 | 503 | 366 |
+| Ryzen 7 7840H | enc=256, out=48 | **253** | 184 | 154 | 202 | 205 |
+| | enc=64, out=256 | **393** | 228 | 193 | 269 | 270 |
+| Xeon 8581C | enc=256, out=48 | **312** | 268 | 188 | 300 | 259 |
+| | enc=64, out=256 | **409** | 274 | 210 | 365 | 327 |
+| Xeon 6975P-C | enc=256, out=48 | **284** | 247 | 176 | 288 | 249 |
+| | enc=64, out=256 | **383** | 260 | 199 | 345 | 314 |
+| Graviton 5 | enc=256, out=48 | **347** | 300 | 171 | 318 | 244 |
+| | enc=64, out=256 | **579** | 400 | 207 | 498 | 368 |
 
-The vendored kernel is **5.7–80× faster per op** than the SDPA/eager fallbacks
+The vendored kernel is **3.7–84× faster per op** than the SDPA/eager fallbacks
 (the ratio shrinks as the op grows, since the fallback's per-sequence loop
 amortizes while the GEMM work does not), which is worth **+39 % to +93 %
 end-to-end** over our own `attn_backend="sdpa"` and 1.04–1.53× over HF.  Our SDPA
 fallback is itself *slower* than HF (0.75–0.94×) because on CPU it attends one
 sequence at a time — hence the kernel is the default.  HF's own `eager` and
 `sdpa` are close on x86 (either can win by a few %), while on Graviton SDPA is
-clearly better than eager (503 vs 366 tok/s decode-heavy).  Graviton 5 and
-Emerald Rapids are the fastest boxes for the kernel; the Ryzen laptop wins the
-smallest case (ctx=256, 32 µs) on clock speed but falls behind at ctx=1024.
+clearly better than eager (503 vs 366 tok/s decode-heavy).  Among the servers
+Graviton 5 is fastest at every large shape (Emerald second), while the Ryzen
+laptop wins the smallest ones (ctx=256, 29 µs) on clock speed but falls behind at
+ctx=1024 — its scaling is super-linear (29 → 460 µs for 4× the keys) because its
+16 MB L3 cannot hold the staged cross/self cache, while the servers scale
+~linearly (Emerald 106 → 425), helped by their 48–480 MB L3s.
 
 ### GEMM throughput
 

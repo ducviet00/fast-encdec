@@ -164,6 +164,7 @@ def kernel_section(dtype, block_size, iters):
         ("self, batch=8 ctx=1024", _time_self, (8, 1024)),
         ("self, batch=32 ctx=1024", _time_self, (32, 1024)),
         ("cross, batch=8 enc=256", _time_cross, (8, 256)),
+        ("cross, batch=8 enc=1024", _time_cross, (8, 1024)),
     ]
     for label, fn, (num_seqs, length) in cases:
         times = {
