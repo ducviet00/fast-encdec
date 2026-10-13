@@ -133,10 +133,14 @@ the per-step host launch overhead that dominates small-batch latency. It needs
 the CUDA + FlashAttention-2 path and keeps a fixed preallocated encoder cache;
 see `fastencdec/engine/cudagraph.py` and the AGENTS gotchas.
 
-`compile_model=True` (default off) wraps the decoder in `torch.compile`.
-Measured on this stack it is a **net loss** (the flash wrapper graph-breaks on
-every call, so the decoder compiles into one tiny region per attention call and
-Dynamo's per-break overhead beats the fusion), which is why it is off by default.
+`compile_model=True` (default off) ports nano-vllm's `torch.compile` trick: it
+fuses the two tensor-only pointwise sequences a BART layer has — the residual
+add + layer norm and the gelu + fc1 — instead of wrapping the decoder (which
+fragments on the flash attention calls). It fuses cleanly (~7% fewer kernels,
+0 graph breaks) but is worth **~0 on GPU time** here, because BART's
+`native_layer_norm`/gelu are already single fused kernels and decode is bound by
+FlashAttention + GEMMs. It is off by default; nano-vllm gains 1.22× from the
+same trick because Qwen3 is full of RMSNorm / gated MLP / rotary ops to fuse.
 
 ### Generation heuristics
 
@@ -394,16 +398,16 @@ competitive:
 
 | sweep (BART, bf16, enc=256) | config | speedup vs HF |
 |---|---|---:|
-| batch, beams=1 | batch=1 / 2 / 4 / 8 | 1.02× / 1.02× / 1.02× / 1.00× |
-| batch, beams=4 | batch=1 / 2 / 4 / 8 | 1.17× / 1.08× / 0.97× / 0.82× |
-| beams, batch=8 | beams=1 / 4 | 0.97× / 0.83× |
-| dtype, batch=8, beams=4 | bf16 / fp32 | 0.84× / 0.55× |
+| batch, beams=1 | batch=1 / 2 / 4 / 8 | 1.04× / 1.03× / 1.05× / 1.00× |
+| batch, beams=4 | batch=1 / 2 / 4 / 8 | 1.17× / 1.11× / 0.98× / 0.84× |
+| beams, batch=8 | beams=1 / 4 | 0.99× / 0.83× |
+| dtype, batch=8, beams=4 | bf16 / fp32 | 0.83× / 0.56× |
 
 | sweep (Florence-2, bf16) | config | speedup vs HF |
 |---|---|---:|
-| greedy | batch=3 / 6 | 1.22× / 1.27× |
-| beam (batch=3) | beams=1 / 3 | 1.18× / 1.15× |
-| continuous (N=6) | window=3 / 6 | 0.96× / 1.24× |
+| greedy | batch=3 / 6 | 1.23× / 1.24× |
+| beam (batch=3) | beams=1 / 3 | 1.23× / 1.14× |
+| continuous (N=6) | window=3 / 6 | 0.99× / 1.28× |
 
 Decode throughput (`benchmarks/throughput.py`, `bart-large-cnn`, bf16, enc=512,
 EOS suppressed) is **2543 → 4518 tok/s** as the batch grows 32 → 128, and

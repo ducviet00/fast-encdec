@@ -52,7 +52,8 @@ class LLM:
             when it is available and the shape is supported, else SDPA.
         use_cudagraph: capture the decoder step into a CUDA graph (CUDA +
             FlashAttention-2 only; default off).  Prototype.
-        compile_model: ``torch.compile`` the decoder (default off).
+        compile_model: fuse the per-layer pointwise sequences with
+            ``torch.compile`` (default off).
     """
 
     def __init__(

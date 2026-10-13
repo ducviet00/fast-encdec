@@ -29,6 +29,39 @@ from ..layers.attention import (
 ACT2FN = {"gelu": F.gelu}
 
 
+# --------------------------------------------------------------- pointwise
+# Small tensor-only ops that ``torch.compile`` fuses into a single kernel
+# (nano-vllm style).  The layer forwards look these names up at call time, so
+# ``enable_compile`` can swap in compiled versions before the first forward.
+def _add_layer_norm_impl(norm, residual, x):
+    return norm(residual + x)
+
+
+def _activation_linear_impl(linear, activation, x):
+    return activation(linear(x))
+
+
+_add_layer_norm = _add_layer_norm_impl
+_activation_linear = _activation_linear_impl
+_COMPILED = False
+
+
+def enable_compile(enable: bool = True) -> None:
+    """Fuse the residual-add + layer-norm and the activation + fc1 with inductor.
+
+    Called by the model runner with its ``compile_model`` flag (CUDA only).
+    """
+    global _add_layer_norm, _activation_linear, _COMPILED
+    if enable and not _COMPILED:
+        _add_layer_norm = torch.compile(_add_layer_norm_impl)
+        _activation_linear = torch.compile(_activation_linear_impl)
+        _COMPILED = True
+    elif not enable and _COMPILED:
+        _add_layer_norm = _add_layer_norm_impl
+        _activation_linear = _activation_linear_impl
+        _COMPILED = False
+
+
 class BartLearnedPositionalEmbedding(nn.Embedding):
     """Learned positional embeddings; BART offsets ids by 2 (padding hack)."""
 
@@ -199,12 +232,15 @@ class BartEncoderLayer(nn.Module):
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         residual = hidden_states
         hidden_states = self.self_attn(hidden_states)
-        hidden_states = self.self_attn_layer_norm(residual + hidden_states)
+        hidden_states = _add_layer_norm(
+            self.self_attn_layer_norm, residual, hidden_states
+        )
 
         residual = hidden_states
-        hidden_states = self.activation_fn(self.fc1(hidden_states))
-        hidden_states = self.fc2(hidden_states)
-        return self.final_layer_norm(residual + hidden_states)
+        hidden_states = self.fc2(
+            _activation_linear(self.fc1, self.activation_fn, hidden_states)
+        )
+        return _add_layer_norm(self.final_layer_norm, residual, hidden_states)
 
 
 class BartDecoderLayer(nn.Module):
@@ -233,16 +269,21 @@ class BartDecoderLayer(nn.Module):
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         residual = hidden_states
         hidden_states = self.self_attn(hidden_states)
-        hidden_states = self.self_attn_layer_norm(residual + hidden_states)
+        hidden_states = _add_layer_norm(
+            self.self_attn_layer_norm, residual, hidden_states
+        )
 
         residual = hidden_states
         hidden_states = self.encoder_attn(hidden_states)
-        hidden_states = self.encoder_attn_layer_norm(residual + hidden_states)
+        hidden_states = _add_layer_norm(
+            self.encoder_attn_layer_norm, residual, hidden_states
+        )
 
         residual = hidden_states
-        hidden_states = self.activation_fn(self.fc1(hidden_states))
-        hidden_states = self.fc2(hidden_states)
-        return self.final_layer_norm(residual + hidden_states)
+        hidden_states = self.fc2(
+            _activation_linear(self.fc1, self.activation_fn, hidden_states)
+        )
+        return _add_layer_norm(self.final_layer_norm, residual, hidden_states)
 
 
 class BartEncoder(nn.Module):

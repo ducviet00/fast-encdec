@@ -8,6 +8,7 @@ and the KV caches; every attention op picks its own kernel (see
 import torch
 
 from ..layers import attention
+from ..models import bart
 from ..utils.context import set_context
 from .cudagraph import DecodeGraphRunner
 
@@ -32,9 +33,11 @@ class ModelRunner:
         self.block_size = block_manager.block_size
         self.dtype = dtype
         self.decoder_layers = list(model.decoder_layers)
-        # torch.compile the decoder (nano-vllm style); the paged attention ops
-        # graph-break, so this fuses the model's pointwise work around them.
-        self.decoder = torch.compile(model.decoder) if compile_model else model.decoder
+        # nano-vllm-style ``torch.compile``: fuse the small tensor-only pointwise
+        # sequences in each layer (residual add + layer norm, activation + fc1).
+        # Wrapping the whole decoder instead fragments on the attention ops.
+        bart.enable_compile(compile_model)
+        self.decoder = model.decoder
 
         attention.set_backend(attn_backend)
 

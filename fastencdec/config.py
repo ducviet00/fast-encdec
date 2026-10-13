@@ -24,9 +24,10 @@ class Config:
         device: ``"cpu"`` or ``"cuda"`` (``"cuda:N"`` also works).
         use_cudagraph: capture the decoder step into a CUDA graph (CUDA +
             FlashAttention-2 only; default off).  Prototype.
-        compile_model: ``torch.compile`` the decoder (default off), like
-            nano-vllm.  Ignored for Florence-2's vision tower, which has its own
-            ``compile_mm_encoder``.
+        compile_model: fuse the per-layer pointwise sequences (residual add +
+            layer norm, activation + fc1) with ``torch.compile`` (default off),
+            nano-vllm style.  Ignored for Florence-2's vision tower, which has
+            its own ``compile_mm_encoder``.
     """
 
     num_blocks: int = 512
