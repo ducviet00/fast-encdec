@@ -282,13 +282,18 @@ pick slightly different hypotheses, which the script reports instead of
 failing.
 
 The README carries the full three-point matrix (`128->512`, `512->128`,
-`256->256`) for the four server boxes.  Those numbers are the mean of two
-independent runs per box, and each run writes its raw results with `--json`,
-so every cell can be re-derived from the JSON instead of trusted.  Its shape is worth knowing when reading it: on
-CPU beam search is the big win (the paged cache shares blocks where HF reorders
-a full beam cache) and greedy is a modest 1.05-1.3x; on CUDA the decode CUDA
-graph is what makes greedy competitive (2.4-3.3x, where eager was ~1.05x) while
-beam search is ~1.3-1.9x; fp32 trails on CUDA (no FlashAttention-2 path).
+`256->256`) for the four server boxes.  Each cell is the mean of two independent
+runs, and every run writes its raw results with `--json`, so the numbers can be
+re-derived rather than trusted (an audit that recomputes all 16 rows from those
+JSONs and diffs them against the README passes).
+
+What to expect from those tables: on CPU greedy is 0.9-2.0x (the encoder is
+shared work and dominates the 512->128 point, where the Xeons sit at 0.93-0.95x)
+and beam search is 1.5-3.5x, because the paged cache shares blocks where HF
+reorders a full beam cache every step.  On CUDA greedy is 2.4-3.4x - the decode
+CUDA graph removes the per-step launch overhead that dominated small batches
+(eager it was ~1.05x) - while beam search is 1.1-3.3x.  fp32 trails on CUDA
+(there is no FlashAttention-2 path).
 
 Decode throughput (`benchmarks/throughput.py`, `bart-large-cnn`, bf16, enc=512,
 EOS suppressed, so both engines decode a fixed token count; the graph is on by
