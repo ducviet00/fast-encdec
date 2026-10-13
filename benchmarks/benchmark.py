@@ -197,6 +197,11 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained(args.model)
     wanted = {s.strip() for s in args.scenarios.split(",") if s.strip()}
     scenarios = [s for s in SCENARIOS if not wanted or s[0] in wanted]
+    if wanted - {s[0] for s in SCENARIOS}:
+        raise SystemExit(
+            f"unknown scenario(s) {sorted(wanted - {s[0] for s in SCENARIOS})}; "
+            f"choose from {[s[0] for s in SCENARIOS]} (quote the name: '256->256')"
+        )
 
     print("# fast-encdec benchmark\n", flush=True)
     print(

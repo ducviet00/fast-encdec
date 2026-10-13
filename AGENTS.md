@@ -4,9 +4,9 @@ Guidance for AI agents (and humans) working on this repository.
 
 ## 1. What this is
 
-`fast-encdec` is a **small, readable CPU inference library for BART** (seq2seq),
-in the spirit of nano-vllm. It implements only what matters for offline
-encoder-decoder decoding:
+`fast-encdec` is a **small, readable inference engine for BART and Florence-2**
+(CPU and CUDA), in the spirit of nano-vllm. It implements only what matters
+for offline encoder-decoder decoding:
 
 - **Paged KV cache** with block reference counting and copy-on-write.
 - **Continuous batching** (requests join/leave the running batch freely).
@@ -58,9 +58,25 @@ placeholders; the decoder is unchanged.
   there is no GPU on the dev box, so run `--device cuda` benchmarks there. Auth
   is flaky (public-key connections are sometimes refused) — retry. `build_essential`
   was installed for `torch.compile` of the Florence-2 vision tower.
+- CPU benchmarking boxes (the README matrix): `ssh ducviet00@35.247.129.222`
+  (Xeon 8581C, Emerald Rapids, `amx_bf16`, 8 vCPU = 4 cores), `ssh
+  ubuntu@54.252.169.176` (Xeon 6975P-C, Granite Rapids, `amx_bf16`, 8 vCPU = 4
+  cores) and `ssh ubuntu@3.26.21.19` (Graviton 5 / Neoverse-V3, 8 cores, no
+  SMT).  Each has the repo at `~/fast-encdec`, a `~/venv` (python 3.13/3.14,
+  torch 2.14.1+cpu, transformers 5.19) and `car.jpg` at
+  `/tmp/fastencdec/florence2_bench.jpg`.  `35.247` has **no rsync** — copy with
+  `tar czf - ... | ssh box 'tar xzf - -C ~/fast-encdec'` — and all three needed
+  `gcc g++ make ninja-build python3-dev` before `csrc/` would build (torch's
+  cpp_extension shells out to ninja, and the Python headers must be present).
+  Sync the whole tree, not just `benchmarks/`: a stale `fastencdec/` package
+  silently keeps producing numbers.
 - HF models are cached locally (`facebook/bart-large-cnn`,
-  `hf-internal-testing/tiny-random-BartForConditionalGeneration`).
-- Run from the repo root with `PYTHONPATH=.`, or `pip install -e .`.
+  `hf-internal-testing/tiny-random-BartForConditionalGeneration`,
+  `florence-community/Florence-2-base`, `hf-internal-testing/tiny-random-Florence2ForConditionalGeneration`).
+- Run from the repo root with `PYTHONPATH=.`, or install it: `uv sync --extra
+  cpu` (the project `.venv`, torch from the PyTorch CPU index) or `--extra
+  cu130` for CUDA.  `uv lock --check` and `uv sync --extra cpu --dry-run`
+  both pass.
 
 ## 3. Layout
 
@@ -79,7 +95,7 @@ fastencdec/
     scheduler.py       continuous batching
     model_runner.py    batching, KV cache, encoder caching, forward
     llm_engine.py      LLMEngine: step loop, greedy/sampling, beam search
-    cudagraph.py       optional decode-only CUDA-graph capture/replay (prototype)
+    cudagraph.py       decode-only CUDA-graph capture/replay (on by default on CUDA)
   layers/
     attention.py       device-agnostic attention ops (encoder/self/cross) + dispatch
     cpu_attn.py        JIT build + wrapper for the vendored vLLM CPU kernels
@@ -205,12 +221,18 @@ own kernel; the runner and the model never name a backend
     `(encoder length, image shape)` and the model scatters projected visual
     tokens into the `image_token_id` slots. `ModelRunner` reaches the model
     through `model.decoder`, `model.decoder_layers` and `model.encode(...)`,
-    which both BART and Florence-2 expose.
+    which both BART and Florence-2 expose.  `LLM` decodes text with
+    `skip_special_tokens=False` for multimodal models — Florence-2's answer *is*
+    special tokens (`<loc_...>` carries the boxes, and
+    `processor.post_process_generation` needs them) — and with `True` for BART.
 
 ## 6. Running things
 
 ```bash
-P=/home/ducviet00/.venvs/torch-cpu/bin/python
+# either the dev venv or the project one (uv sync --extra cpu)
+P=/home/ducviet00/.venvs/torch-cpu/bin/python   # or .venv/bin/python
+export HF_HUB_OFFLINE=1                        # the models are cached; the
+                                               # Hub rate-limits hard (429)
 
 # unit / parity (tiny random BART; greedy + beam vs HF)
 PYTHONPATH=. $P tests/test_parity.py
@@ -234,10 +256,11 @@ PYTHONPATH=. $P examples/florence2.py
 # benchmark (scenarios x generation configs vs HF, see the baseline below)
 PYTHONPATH=. $P benchmarks/benchmark.py                 # BART, cpu
 PYTHONPATH=. $P benchmarks/benchmark.py --device cuda   # BART on a GPU box
-PYTHONPATH=. $P benchmarks/benchmark.py --scenarios balanced
+PYTHONPATH=. $P benchmarks/benchmark.py --scenarios '256->256'
 PYTHONPATH=. $P benchmarks/benchmark.py --json out.json
 
-# Florence-2 benchmark (caption/detection/segmentation mix, real image)
+# Florence-2 benchmark (real image; caption / detection / segmentation /
+# phrase-grounding tasks, EOS-stopped)
 PYTHONPATH=. $P benchmarks/benchmark_florence2.py
 PYTHONPATH=. $P benchmarks/benchmark_florence2.py --device cuda
 
@@ -261,7 +284,7 @@ PYTHONPATH=. $P benchmarks/profile_florence2.py --engine ours --device cuda [--n
 
 ### Benchmark baseline
 
-Per-commit baseline: `PYTHONPATH=. $P benchmarks/benchmark.py --scenarios 256->256`
+Per-commit baseline: `PYTHONPATH=. $P benchmarks/benchmark.py --scenarios '256->256'`
 on the dev CPU (`bart-large-cnn`, bf16 for **both** engines unless noted).  The
 engine and HF decode the same token count, so the speedup is engine-vs-engine.
 **Every commit must refresh this table from a real run of the script — never
@@ -269,8 +292,16 @@ hand-edit or guess.**
 
 | config | ours ms | ours tok/s | hf ms | hf tok/s | speedup |
 |---|---:|---:|---:|---:|---:|
-<!-- refresh with `--scenarios 256->256` on the machine you develop on; the
-     README carries the server matrix -->
+| batch=1, beams=1, bf16 | 4358 | 58.8 | 5988 | 42.8 | 1.37x |
+| batch=8, beams=1, bf16 | 5886 | 348.0 | 8812 | 232.4 | 1.50x |
+| batch=8, beams=4, bf16 | 10037 | 204.1 | 31280 | 65.5 | 3.12x |
+| batch=8, beams=1, fp32 | 23661 | 86.6 | 24413 | 83.9 | 1.03x |
+
+Mean of two runs (they agree within 1%).  Built with the vendored kernel — if
+`csrc/` fails to build (no `ninja`, see the gotcha) the same table reads
+0.85x / 0.85x / 1.29x / 0.91x, i.e. ~1.8x worse and slower than HF at greedy.
+With the kernel this laptop is the *fastest* box at these points (8 cores, high
+clocks), which is why its numbers beat the 4-core Xeons' in the README matrix.
 
 `benchmark_florence2.py` runs the same configs on a real 640x480 photo
 (`car.jpg`, scp'd to `/tmp/fastencdec/` so the boxes never hit the Hub) and a
@@ -381,13 +412,19 @@ on this box with the same kind of workload.
   use compiles `csrc/` (~1-3 min) and caches the `.so` under torch's extensions
   dir; a missing compiler downgrades `"auto"` to SDPA but makes `"vllm"` fail.
   `benchmarks/attn_backend.py` measures what the kernel is worth: measured on the
-  four CPU boxes (bf16, `block_size=16`) it is **5.7-80x faster per decoder op**
-  than the SDPA/"eager" fallbacks (80x at batch=8/ctx=256, ~10-20x at
+  four CPU boxes (bf16, `block_size=16`) it is **3.7-84x faster per decoder op**
+  than the SDPA/"eager" fallbacks (84x at batch=8/ctx=256, ~5-20x at
   batch=32/ctx=1024, where the fallback's per-sequence loop amortizes) and
-  **+39% to +93% end-to-end** over `attn_backend="sdpa"`, 1.04-1.53x over HF.
+  **+39% to +93% end-to-end** over `attn_backend="sdpa"`; versus HF the engine's
+  margin is the one in the benchmark matrix above (0.93-3.47x depending on the
+  point and the beam width).
   The CPU SDPA fallback is itself slower than HF (0.75-0.94x) because it attends
   one sequence at a time (CUDA uses the batched path), so `"auto"` resolving to
-  the kernel matters a lot.
+  the kernel matters a lot.  **Check `cpu_attn.module()` before trusting CPU
+  numbers**: if `csrc/` cannot build (no `ninja`, no Python headers) the engine
+  silently degrades to SDPA and gets *slower than HF* (0.75-0.94x) with no error
+  — `ninja` is now in the `cpu` extra for exactly this reason, and a bare
+  `uv sync` without it is the usual cause.
 - **CUDA / FlashAttention-2.** `device="cuda"` needs the `kernels` package; the
   `kernels-community/flash-attn2` wheel is downloaded once (`get_kernel`, tries
   `version=3` then `2` then unversioned) and cached under the HF cache dir, so
@@ -494,8 +531,10 @@ on this box with the same kind of workload.
   no typical-p / min-p / epsilon / eta / bad-words / prefix-constrained.
 - Cross-attention could be paged to count against `num_blocks` (dense is
   intentional for simplicity).
-- Attention is a Python per-sequence loop; a batched SDPA path could help
-  large batches.
+- On **CPU** the SDPA fallback attends one sequence at a time, because the
+  batched block-diagonal path (`_sdpa_paged_batched`) is only taken on CUDA;
+  a batched CPU path would help there (this is why the vendored vLLM kernel
+  matters so much on CPU).
 - **T5** (encoder-decoder like BART, so the paged cache + continuous batching
   carry over): `T5LayerNorm` is RMS-without-mean, T5 v1.1 has a gated FFN
   (`T5DenseGatedActDense`) and T5 uses a relative-position bias instead of
@@ -515,7 +554,7 @@ on this box with the same kind of workload.
 - After changes: run `python -m compileall fastencdec`,
   `tests/test_parity.py`, `tests/test_attn_backend.py`,
   `tests/test_florence2.py`, `tests/test_beam.py`, `uvx ruff check` /
-  `uvx ruff format --check`, and `benchmarks/benchmark.py --scenarios 256->256`.
+  `uvx ruff format --check`, and `benchmarks/benchmark.py --scenarios '256->256'`.
 - Every commit must update the "Benchmark baseline" table above with the real
   numbers from that run (no stale or estimated values).  The full three-point
   matrix in the README is refreshed when the tables or the engine change
