@@ -5,7 +5,7 @@ A small, readable inference engine for **BART** and **Florence-2**, in the spiri
 
 ## Key Features
 
-* 🚀 **Fast offline inference** - up to 3.5x faster than `transformers.generate` on CPU and 3.4x on a GPU (beam search wins most; greedy on CPU is 0.9-2.0x)
+* 🚀 **Fast offline inference** - up to 3.9x faster than `transformers.generate` on CPU and 4.2x on a GPU (beam search wins most; greedy on CPU is 0.9-2.0x)
 * 📖 **Readable codebase** - paged KV cache, continuous batching and beam search in plain PyTorch
 * 🧩 **Two models, one engine** - BART for summarisation, Florence-2 for vision-language tasks
 * ⚡ **CPU and CUDA** - vendored vLLM CPU attention kernel; FlashAttention-2 and a CUDA graph on GPU
@@ -84,24 +84,24 @@ the tokens and `benchmarks/throughput.py` measures decode-only throughput.
 
 | point | config | Xeon 8581C | Xeon 6975P-C | Graviton 5 | L4 |
 |---|---|---:|---:|---:|---:|
-| 128->512 | batch=1, beams=1 | 1.12x | 1.10x | 1.05x | 3.19x |
-| 128->512 | batch=8, beams=1 | 1.08x | 1.13x | 1.18x | 2.73x |
-| 128->512 | batch=8, beams=4 | 2.23x | 2.10x | 1.78x | 1.09x |
-| 512->128 | batch=1, beams=1 | 1.09x | 1.09x | 1.08x | 3.20x |
-| 512->128 | batch=8, beams=1 | 0.95x | 0.93x | 1.12x | 2.37x |
-| 512->128 | batch=8, beams=4 | 3.47x | 2.42x | 1.49x | 1.45x |
-| 256->256 | batch=1, beams=1 | 1.10x | 1.10x | 1.10x | 3.27x |
-| 256->256 | batch=8, beams=1 | 1.08x | 1.07x | 1.19x | 2.70x |
-| 256->256 | batch=8, beams=4 | 1.99x | 1.86x | 1.64x | 1.15x |
+| 128->512 | batch=1, beams=1 | 1.12x | 1.09x | 1.09x | 3.37x |
+| 128->512 | batch=8, beams=1 | 1.08x | 1.10x | 1.23x | 2.87x |
+| 128->512 | batch=8, beams=4 | 2.52x | 2.36x | 1.94x | 1.99x |
+| 512->128 | batch=1, beams=1 | 1.09x | 1.09x | 1.07x | 3.33x |
+| 512->128 | batch=8, beams=1 | 0.95x | 0.94x | 1.10x | 2.47x |
+| 512->128 | batch=8, beams=4 | 3.91x | 2.65x | 1.69x | 2.75x |
+| 256->256 | batch=1, beams=1 | 1.11x | 1.10x | 1.06x | 3.41x |
+| 256->256 | batch=8, beams=1 | 1.05x | 1.06x | 1.17x | 2.85x |
+| 256->256 | batch=8, beams=4 | 2.21x | 2.10x | 1.79x | 2.15x |
 
 **Throughput (tokens/s), 256->256**
 
 | config | engine | Xeon 8581C | Xeon 6975P-C | Graviton 5 | L4 |
 |---|---|---:|---:|---:|---:|
-| batch=8, beams=1 | fast-encdec | 354 | 331 | 497 | 1841 |
-| batch=8, beams=1 | transformers | 328 | 308 | 418 | 681 |
-| batch=8, beams=4 | fast-encdec | 211 | 200 | 248 | 525 |
-| batch=8, beams=4 | transformers | 106 | 107 | 151 | 457 |
+| batch=8, beams=1 | fast-encdec | 345 | 333 | 514 | 1812 |
+| batch=8, beams=1 | transformers | 329 | 314 | 441 | 636 |
+| batch=8, beams=4 | fast-encdec | 234 | 228 | 297 | 938 |
+| batch=8, beams=4 | transformers | 106 | 109 | 166 | 436 |
 
 Beam search is the biggest win: `transformers` reorders the whole beam cache every
 step, while blocks are shared here. Greedy with a long encoder (512->128) is the
@@ -112,9 +112,9 @@ segmentation and phrase grounding)
 
 | config | Xeon 8581C | Xeon 6975P-C | Graviton 5 | L4 |
 |---|---:|---:|---:|---:|
-| batch=1, beams=1 | 1.12x | 1.20x | 1.13x | 2.73x |
-| batch=8, beams=1 | 1.66x | 1.95x | 1.24x | 3.41x |
-| batch=8, beams=4 | 3.40x | 3.43x | 2.03x | 3.34x |
+| batch=1, beams=1 | 1.16x | 1.20x | 1.13x | 2.45x |
+| batch=8, beams=1 | 1.65x | 1.93x | 1.24x | 3.57x |
+| batch=8, beams=4 | 3.58x | 3.62x | 2.05x | 4.24x |
 
 Numbers are the average of two runs. In fp32 this engine reproduces
 `transformers` token for token; in bf16 the output length always matches.

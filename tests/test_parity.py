@@ -42,16 +42,24 @@ def main():
         status = "OK" if ours == ref_text else "MISMATCH"
         print(f"[{status}] beams={beams}: {ours!r}")
 
-    # A batch with mixed encoder lengths must give the same tokens as running
-    # each prompt on its own (exercises the batched encoder + cross-attn cache).
-    params = SamplingParams(max_tokens=12, num_beams=1, temperature=0.0)
-    batched = [o.outputs[0].text for o in llm.generate(BATCH, sampling_params=params)]
-    single = [
-        llm.generate(text, sampling_params=params)[0].outputs[0].text for text in BATCH
-    ]
-    for i, (b, s) in enumerate(zip(batched, single)):
-        status = "OK" if b == s else "MISMATCH"
-        print(f"[{status}] batch-vs-single {i}: {b!r}")
+    # A batch must give the same tokens as running each prompt on its own
+    # (exercises the batched encoder + cross-attn cache, and for beams > 1 the
+    # grouped log_softmax/processor/topk).  EOS is suppressed so the requests
+    # stay the same decoder length and batch into one group.
+    for beams in (1, 2, 4):
+        params = SamplingParams(
+            max_tokens=12, num_beams=beams, temperature=0.0, min_length=13
+        )
+        batched = [
+            o.outputs[0].token_ids for o in llm.generate(BATCH, sampling_params=params)
+        ]
+        single = [
+            llm.generate(text, sampling_params=params)[0].outputs[0].token_ids
+            for text in BATCH
+        ]
+        for i, (b, s) in enumerate(zip(batched, single)):
+            status = "OK" if b == s else "MISMATCH"
+            print(f"[{status}] batch-vs-single beams={beams} seq={i}: {b!r}")
 
 
 if __name__ == "__main__":

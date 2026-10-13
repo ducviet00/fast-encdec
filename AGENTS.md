@@ -145,6 +145,13 @@ LLMEngine.step()                  # sample (greedy) or beam-expand; append; free
 `LLMEngine.generate(requests, params)` is the offline entrypoint: it adds the
 whole batch under a single `SamplingParams` and runs to completion.
 
+`LLMEngine._postprocess` groups sequences by request, then batches every beam
+request that shares a (beam width, live beam count, decoder length) into one
+`_beam_group`: a single `log_softmax` + logits-processor call + `topk` over
+`[num_requests, beam_count * vocab]`, with two `.tolist()` syncs for the whole
+group.  Beam postprocess is the host bottleneck on CUDA, so this batching is
+what keeps decode from being launch/sync-bound (see the L4 beam rows).
+
 `models/bart.py` calls three device-agnostic ops from
 `layers/attention.py` -- `encoder_self_attention` (dense, no cache),
 `decoder_self_attention` (paged growing cache) and `decoder_cross_attention`
@@ -292,12 +299,16 @@ hand-edit or guess.**
 
 | config | ours ms | ours tok/s | hf ms | hf tok/s | speedup |
 |---|---:|---:|---:|---:|---:|
-| batch=1, beams=1, bf16 | 4358 | 58.8 | 5988 | 42.8 | 1.37x |
-| batch=8, beams=1, bf16 | 5886 | 348.0 | 8812 | 232.4 | 1.50x |
-| batch=8, beams=4, bf16 | 10037 | 204.1 | 31280 | 65.5 | 3.12x |
-| batch=8, beams=1, fp32 | 23661 | 86.6 | 24413 | 83.9 | 1.03x |
+| batch=1, beams=1, bf16 | 5274 | 48.6 | 6139 | 41.7 | 1.16x |
+| batch=8, beams=1, bf16 | 6027 | 339.8 | 8965 | 228.5 | 1.49x |
+| batch=8, beams=4, bf16 | 9099 | 225.1 | 31329 | 65.4 | 3.44x |
+| batch=8, beams=1, fp32 | 23792 | 86.1 | 24556 | 83.4 | 1.03x |
 
-Mean of two runs (they agree within 1%).  Built with the vendored kernel — if
+Mean of four runs (the batch=8 rows agree within 1%; the latency-bound batch=1
+row varies ~5% with this laptop's clock).  Absolute times are only comparable
+within one recording: the box ran ~20% slower here than when the previous table
+was taken, which moves the single-sequence row most, so on this box only the
+with-in-run speedup is meaningful.  Built with the vendored kernel — if
 `csrc/` fails to build (no `ninja`, see the gotcha) the same table reads
 0.85x / 0.85x / 1.29x / 0.91x, i.e. ~1.8x worse and slower than HF at greedy.
 With the kernel this laptop is the *fastest* box at these points (8 cores, high
@@ -319,11 +330,11 @@ re-derived rather than trusted (an audit that recomputes all 16 rows from those
 JSONs and diffs them against the README passes).
 
 What to expect from those tables: on CPU greedy is 0.9-2.0x (the encoder is
-shared work and dominates the 512->128 point, where the Xeons sit at 0.93-0.95x)
-and beam search is 1.5-3.5x, because the paged cache shares blocks where HF
-reorders a full beam cache every step.  On CUDA greedy is 2.4-3.4x - the decode
+shared work and dominates the 512->128 point, where the Xeons sit at 0.94-0.95x)
+and beam search is 1.7-3.9x, because the paged cache shares blocks where HF
+reorders a full beam cache every step.  On CUDA greedy is 2.4-3.6x - the decode
 CUDA graph removes the per-step launch overhead that dominated small batches
-(eager it was ~1.05x) - while beam search is 1.1-3.3x.  fp32 trails on CUDA
+(eager it was ~1.05x) - while beam search is 2.0-4.2x.  fp32 trails on CUDA
 (there is no FlashAttention-2 path).
 
 Decode throughput (`benchmarks/throughput.py`, `bart-large-cnn`, bf16, enc=512,
