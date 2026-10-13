@@ -1,5 +1,0 @@
-# fast-encdec benchmark
-
-model=facebook/bart-large-cnn  device=cpu  threads=8
-
-wrote /tmp/devbox_256.json
