@@ -351,8 +351,7 @@ on this box with the same kind of workload.
   `[8x1024]x[1024x4096]` gives Ryzen 940, Graviton 754, Granite 520, Emerald 471
   GFLOP/s — which is why the engine's decode benchmarks rank Graviton above the
   Xeons.  The benchmark scripts therefore default to `--threads 0` = torch's
-  default = the number of *physical* cores (8 on the dev box, 4 on the Xeons),
-  which is why the per-box tables in the README use different thread counts.
+  default = the number of *physical* cores (8 on the dev box, 4 on the Xeons).
   For the *engine* itself 8 threads is still defensible on the Xeons (it has
   non-GEMM parallel work too): Emerald's decode-heavy run is 436 tok/s at 8
   threads vs 411 at 4.
