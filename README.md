@@ -1,7 +1,7 @@
 # fast-encdec
 
-A tiny, readable BART inference library for **CPU offline inference**, in the
-spirit of [nano-vllm](https://github.com/GeeeekExplorer/nano-vllm).
+A tiny, readable BART inference library for **offline inference on CPU and GPU**,
+in the spirit of [nano-vllm](https://github.com/GeeeekExplorer/nano-vllm).
 
 It implements the pieces that actually matter for seq2seq decoding:
 
@@ -11,14 +11,18 @@ It implements the pieces that actually matter for seq2seq decoding:
   batches waste nothing.
 - **Beam search** — implemented on top of the same paged cache; beams share
   blocks and only copy a block when they write into a shared one.
-- **One fused attention kernel per step** — the decoder self- and
-  cross-attention run on vLLM's hand-written CPU kernels (NEON BFMMLA on
-  aarch64, AVX-512 VEC/VEC16 on x86), vendored in `csrc/` and compiled on first
-  use. A pure PyTorch `scaled_dot_product_attention` path is the fallback
-  (`attn_backend="sdpa"`); BF16 GEMMs go through oneDNN.
+- **One fused attention kernel per step** — on CPU the decoder self- and
+  cross-attention run on vLLM's hand-written kernels (NEON BFMMLA on aarch64,
+  AVX-512 VEC/VEC16 on x86), vendored in `csrc/` and compiled on first use; on
+  CUDA they run on **FlashAttention-2** (`flash_attn_with_kvcache`, reading the
+  paged block table directly, no per-step gather). A pure PyTorch
+  `scaled_dot_product_attention` path is the fallback (`attn_backend="sdpa"`);
+  BF16 GEMMs go through oneDNN on CPU.
 
-The model code is a near-verbatim copy of the HuggingFace BART reference; only
-the attention kernels are swapped.  **Florence-2** is supported too: the same
+The model code is a near-verbatim copy of the HuggingFace BART reference; the
+attention kernels are swapped and the attention q/k/v projections are fused into
+one GEMM (`utils/loader` concatenates HF's parts, so the weights still load 1:1).
+**Florence-2** is supported too: the same
 paged BART decoder is paired with the DaViT vision encoder and the multimodal
 projector imported verbatim from `transformers`.
 
@@ -39,9 +43,11 @@ fastencdec/
     scheduler.py     # continuous batching
     model_runner.py  # batching, KV cache, encoder caching, forward
     llm_engine.py    # LLMEngine: step loop, sampling, beam search
+    cudagraph.py     # optional decode-only CUDA graph (prototype)
   layers/
     attention.py     # paged self-attention + cached cross-attention dispatch
     cpu_attn.py      # JIT build + wrapper for the vendored vLLM CPU kernels
+    flash_attn.py    # lazy loader for kernels-community/flash-attn2 (CUDA)
     logits_processor.py # transformers LogitsProcessorList from SamplingParams
     sampler.py       # greedy / multinomial sampling (Sampler)
   models/
@@ -127,11 +133,14 @@ batch, so beams share it and never duplicate K/V. All the paging machinery
 (reference-counted blocks, copy-on-write, continuous batching, beam search) is
 identical on both devices.
 
-`use_cudagraph=True` (default off) additionally captures the decode step into a
-CUDA graph — one graph per batch-size bucket, replayed each step — which removes
-the per-step host launch overhead that dominates small-batch latency. It needs
-the CUDA + FlashAttention-2 path and keeps a fixed preallocated encoder cache;
-see `fastencdec/engine/cudagraph.py` and the AGENTS gotchas.
+The decode step is additionally captured into a **CUDA graph** — one graph per
+batch-size bucket, replayed each step — which removes the per-step host launch
+overhead that dominates small-batch latency. It is **on by default** and only
+takes effect on CUDA with the FlashAttention-2 backend (the runner ANDs the flag
+with the device/backend check, so CPU and SDPA runs silently use the eager path);
+it keeps a fixed preallocated encoder cache. Pass `use_cudagraph=False` to opt
+out, e.g. for eager-vs-graph comparisons. See `fastencdec/engine/cudagraph.py` and
+the AGENTS gotchas.
 
 `compile_model=True` (default off) ports nano-vllm's `torch.compile` trick: it
 fuses the two tensor-only pointwise sequences a BART layer has — the residual
@@ -301,20 +310,28 @@ PYTHONPATH=. python benchmarks/benchmark_florence2.py --quick --dtype float32
 PYTHONPATH=. python benchmarks/benchmark_florence2.py --quick --device cuda
 ```
 
+The scripts compare fast-encdec against HuggingFace `generate` on the same
+machine, at the **same dtype, same inputs and same output tokens**, so both
+engines do identical work.  Every row reports the end-to-end decode throughput of
+both engines and the speedup.  BART decodes a fixed length (EOS suppressed via
+`min_length` / `min_new_tokens`); Florence-2 stops at EOS, and the reported token
+totals confirm both engines emitted the same number.
+
+The tables below are sets of **sweeps**.  A *sweep* varies one knob — batch size,
+beam width, encoder length or dtype — while the rest are held fixed, and each row
+is one *config*: a point in that sweep.  So "config" fully describes the point
+(batch, beams, encoder length and dtype), and the last column is
+`speedup = ours tok/s ÷ HF tok/s`.
+
+On CPU, attention runs on the vendored vLLM kernel by default, so the whole
+batch's self- and cross-attention is one fused call per step instead of a
+per-sequence SDPA loop; the paged cache and block sharing keep the beam-search win
+(each step avoids HF's per-step cache reordering).
+
 Decode throughput (a nano-vllm-style workload — N requests, fixed encoder length
-and output length, EOS suppressed) is measured with `benchmarks/throughput.py`;
-`--use-cudagraph` enables the decode CUDA graph:
-
-It compares fast-encdec against HuggingFace `generate` on the same machine, at
-the **same dtype, same inputs and same output tokens**, so both engines do
-identical work (latency, req/s, tok/s, speedup).  BART decodes a fixed length
-(EOS suppressed via `min_length` / `min_new_tokens`); Florence-2 stops at EOS and
-the reported token totals confirm both engines emitted the same number.
-
-Attention runs on the vendored vLLM CPU kernel by default, so the whole batch's
-self- and cross-attention is one fused call per step instead of a per-sequence
-SDPA loop; the paged cache and block sharing keep the beam-search win (each step
-avoids HF's per-step cache reordering).
+and output length, EOS suppressed) is measured separately with
+`benchmarks/throughput.py` (the decode CUDA graph is on by default on CUDA;
+`--no-cudagraph` disables it).
 
 ### Fairness
 
@@ -333,59 +350,70 @@ The same holds with `--device cuda` for BART (fp32 and bf16 token-for-token
 against HF on the L4); Florence-2 in bf16 can differ in a few tokens because the
 compiled vision tower shifts the encoder features.
 
-### Hardware
+### CPU
 
-| box | CPU | threads | kernel |
-|---|---|---|---|
-| x86 dev | AMD Ryzen 7 7840H (Zen 4, AVX-512 + `avx512_bf16`, no AMX) | 8 | `vec16` |
-| Graviton 5 | AWS Graviton 5, 8× Arm Neoverse-V3 (BF16 / I8MM / SVE2) | 8 | `neon` |
-| L4 GPU | NVIDIA L4 (sm89, 24 GB) + 4 vCPU (`--device cuda`) | — | flash-attn2 |
+`benchmarks/benchmark.py --quick --threads 8` on `facebook/bart-large-cnn`, bf16
+for both engines (fp32 where noted), 48 output tokens, encoder length 256 unless
+noted.  fast-encdec runs the vendored vLLM CPU kernel (`vec16` on x86, `neon` on
+aarch64), HF its own batched SDPA; "ours" and "HF" are end-to-end decode
+throughput, and `speedup = ours ÷ HF`:
 
-Both boxes run torch 2.14 CPU with `block_size=16` and the vendored kernel
-(`attn_backend="auto"`).
+| box | config | HF tok/s | ours tok/s | speedup |
+|---|---|---:|---:|---:|
+| **AMD Ryzen 7 7840H** (Zen 4, `avx512_bf16`, 16 CPUs) | batch=1, beams=1 | 41.1 | 46.7 | 1.14× |
+| | batch=8, beams=1 | 200.6 | 252.8 | 1.26× |
+| | batch=8, beams=4 | 74.0 | 173.2 | 2.34× |
+| | batch=8, beams=1, enc=128 | 251.5 | 328.1 | 1.30× |
+| | batch=8, beams=4, fp32 | 28.4 | 61.3 | 2.16× |
+| **Intel Xeon 8581C** (Emerald Rapids, `amx_bf16`, c4-standard-8) | batch=1, beams=1 | 50.0 | 56.8 | 1.14× |
+| | batch=8, beams=1 | 283.2 | 306.2 | 1.08× |
+| | batch=8, beams=4 | 112.0 | 185.4 | 1.66× |
+| | batch=8, beams=1, enc=128 | 342.8 | 362.8 | 1.06× |
+| | batch=8, beams=4, fp32 | 25.6 | 63.2 | 2.47× |
+| **Intel Xeon 6975P-C** (Granite Rapids, `amx_bf16`, m8i.2xlarge) | batch=1, beams=1 | 46.1 | 51.4 | 1.12× |
+| | batch=8, beams=1 | 264.4 | 285.4 | 1.08× |
+| | batch=8, beams=4 | 108.7 | 178.2 | 1.64× |
+| | batch=8, beams=1, enc=128 | 317.0 | 346.6 | 1.09× |
+| | batch=8, beams=4, fp32 | 29.4 | 63.6 | 2.17× |
+| **AWS Graviton 5** (Neoverse-V3, BF16/I8MM/SVE2, m9g.2xlarge) | batch=1, beams=1 | 42.6 | 46.2 | 1.08× |
+| | batch=8, beams=1 | 316.3 | 346.3 | 1.09× |
+| | batch=8, beams=4 | 160.7 | 214.5 | 1.33× |
+| | batch=8, beams=1, enc=128 | 389.9 | 450.8 | 1.16× |
+| | batch=8, beams=4, fp32 | 71.2 | 94.8 | 1.33× |
 
-### BART (`facebook/bart-large-cnn`)
+Every box runs 8 threads (`--threads 8`) with `block_size=16` and the vendored
+kernel (`attn_backend="auto"`).  Beam search is the big win (1.3–2.3×) because the
+paged cache shares blocks instead of reordering a full beam cache each step;
+greedy is a modest 1.06–1.30× (HF's batched SDPA is already good and the encoder
+is GEMM-bound on both engines).  Graviton 5 has the highest absolute throughput and
+the smallest *relative* win — HF is fast there too — while fp32 leaves the least
+headroom (HF is compute-bound rather than kernel-bound), so its greedy rows are
+near parity and only beam search still pays.
 
-Speedup vs HuggingFace `generate` at the same dtype, 48 output tokens, encoder
-length 256 unless noted (`benchmark.py --quick`):
-
-| sweep | config | x86 bf16 | x86 fp32 | Graviton bf16 | Graviton fp32 |
-|---|---|---:|---:|---:|---:|
-| batch, beams=1 | batch=1 | 1.13× | 1.21× | 1.31× | 1.07× |
-| batch, beams=1 | batch=8 | 1.28× | 1.06× | 2.55× | 1.00× |
-| batch, beams=4 | batch=8 | 2.35× | 2.14× | 3.67× | 1.34× |
-| beams, batch=8 | beams=4 | 2.36× | 2.12× | 3.68× | 1.35× |
-| enc length, beams=1 | enc=128 | 1.19× | 1.07× | 2.10× | 1.01× |
-| enc length, beams=1 | enc=256 | 1.39× | 1.05× | 2.60× | 1.01× |
-
-Greedy is a modest win (HF's batched SDPA is already good and the encoder is
-GEMM-bound on both engines); beam search wins big, because the paged cache shares
-blocks instead of reordering a full beam cache each step.  FP32 leaves less
-headroom — HF is compute-bound there rather than kernel-bound — so the beam win
-is smaller than in BF16.
-
-**BF16 vs FP32.** On the x86 box BF16 is ~2.4× faster than FP32; on Graviton it
-was only ~1.2× until a fix. The cause was PyTorch's CPU SDPA, which on aarch64
-runs ~20× slower for BF16 *non-contiguous* inputs — and the encoder self-attention
-fed it transposed views. Calling `.contiguous()` there (and in the SDPA fallback)
-took the Graviton BF16 batch=8/beams=1 run from 2237 ms to 1207 ms, making BF16
-**~2.3× faster than FP32** on Graviton.  (The x86 box is a thermally-limited
-laptop, so its absolute fp32 numbers vary a few percent run-to-run.)
+**BF16 vs FP32.** On the x86 boxes BF16 is ~3× faster than FP32 (the fp32 rows
+above are batch=8/beams=4: 2.16–2.47× vs HF, but ~60 tok/s against ~175 tok/s in
+bf16). On Graviton BF16 was only ~1.2× faster than FP32 until a fix: PyTorch's CPU
+SDPA runs ~20× slower for BF16 *non-contiguous* inputs on aarch64, and the encoder
+self-attention fed it transposed views. Calling `.contiguous()` there (and in the
+SDPA fallback) took the Graviton BF16 batch=8/beams=1 run from 2237 ms to 1207 ms,
+making BF16 **~2.3× faster than FP32** there — visible above as Graviton's fp32 row
+holding up best (94.8 tok/s).  (The Ryzen box is a thermally-limited laptop, so its
+absolute numbers vary a few percent run-to-run.)
 
 ### Florence-2 (`florence-community/Florence-2-base`)
 
 Mixed `<CAPTION>` / `<OD>` / `<REFERRING_EXPRESSION_SEGMENTATION>the car` on a
 real 640×480 photo, so the batch has a wide output-length spread
-(`benchmark_florence2.py --quick`).  `ours tok == hf tok` in every row, i.e. both
-engines emitted the same number of tokens:
+(`benchmark_florence2.py --quick`, Ryzen + Graviton 5).  `ours tok == hf tok` in
+every row, i.e. both engines emitted the same number of tokens:
 
-| sweep | config | x86 bf16 | x86 fp32 | Graviton bf16 | Graviton fp32 |
-|---|---|---:|---:|---:|---:|
-| greedy | batch=3 | 1.21× | 1.05× | 1.26× | 1.03× |
-| greedy | batch=6 | 1.19× | 1.25× | 1.37× | 1.02× |
-| beam | beams=1 | 1.19× | 1.05× | 1.25× | 1.00× |
-| beam | beams=3 | 1.51× | 1.37× | 1.44× | 1.10× |
-| continuous | window=6 | 1.21× | 1.25× | 1.37× | 1.02× |
+| config | Ryzen bf16 | Ryzen fp32 | Graviton bf16 | Graviton fp32 |
+|---|---:|---:|---:|---:|
+| greedy, batch=3 | 1.27× | 1.08× | 1.26× | 1.03× |
+| greedy, batch=6 | 1.27× | 1.37× | 1.37× | 1.02× |
+| beam, batch=3, beams=1 | 1.27× | 1.11× | 1.25× | 1.00× |
+| beam, batch=3, beams=3 | 1.21× | 1.41× | 1.44× | 1.10× |
+| continuous, N=6, window=6 | 1.32× | 1.37× | 1.37× | 1.02× |
 
 The win comes from **not padding**: the mixed batch has a 13/22/96-token spread,
 and fast-encdec never decodes the padding positions HF carries; beam search
@@ -396,37 +424,52 @@ is a large cost shared by both engines, which caps the end-to-end gain.
 (~1.3–1.5×, ≈1.15× end-to-end); it may change the decoded tokens, so it is off
 by default.
 
-### GPU (`--device cuda`, NVIDIA L4)
+### GPU (CUDA, NVIDIA L4)
 
-On a GPU the two engines are much closer.  HF's attention is already fused, so
-the engine no longer has its kernel advantage; FlashAttention-2 keeps it
-competitive:
+`benchmarks/benchmark.py --quick --device cuda` — same workload, bf16 unless
+noted, FlashAttention-2 backend, `block_size=256`, `num_blocks=64`.  The decode
+step is captured into a **CUDA graph** (on by default on CUDA + flash — see the
+CUDA usage section above):
 
-| sweep (BART, bf16, enc=256) | config | speedup vs HF |
-|---|---|---:|
-| batch, beams=1 | batch=1 / 2 / 4 / 8 | 1.08× / 1.10× / 1.05× / 1.04× |
-| batch, beams=4 | batch=1 / 2 / 4 / 8 | 1.22× / 1.14× / 1.04× / 0.86× |
-| beams, batch=8 | beams=1 / 4 | 1.07× / 0.85× |
-| dtype, batch=8, beams=4 | bf16 / fp32 | 0.85× / 0.57× |
+| box | config | HF tok/s | ours tok/s | speedup |
+|---|---|---:|---:|---:|
+| **NVIDIA L4** (sm89, 24 GB, 4 vCPU) | batch=1, beams=1 | 88.0 | 145.5 | 1.65× |
+| | batch=8, beams=1 | 664.1 | 985.4 | 1.48× |
+| | batch=8, beams=4 | 473.7 | 480.9 | 1.02× |
+| | batch=8, beams=1, enc=128 | 679.5 | 1017.7 | 1.50× |
+| | batch=8, beams=4, fp32 | 337.7 | 189.0 | 0.56× |
 
-| sweep (Florence-2, bf16) | config | speedup vs HF |
-|---|---|---:|
-| greedy | batch=3 / 6 | 1.27× / 1.27× |
-| beam (batch=3) | beams=1 / 3 | 1.27× / 1.21× |
-| continuous (N=6) | window=3 / 6 | 1.03× / 1.32× |
+Greedy is now well ahead of HF (1.48–1.65×): the CUDA graph removes the per-step
+host launch overhead that dominated small batches — eager, the same rows were
+~1.05× (see the AGENTS baseline).  Beam search is ~parity (1.02×) because the paged
+cache writes new K/V separately where HF's cache append is fused.  FP32 trails
+(0.56×) because FlashAttention-2 is fp16/bf16-only and the SDPA fallback is slower
+— use `dtype=torch.bfloat16` on a GPU.
 
 Decode throughput (`benchmarks/throughput.py`, `bart-large-cnn`, bf16, enc=512,
-EOS suppressed) is **2673 → 4509 tok/s** as the batch grows 32 → 128, and
-**3237 tok/s at batch 32 with `--use-cudagraph`** (1.21× the eager run).  At
-batch ≥ 32 the decode is GPU-bound re-reading the KV cache each step, so the
-graph only buys small-batch latency.
+EOS suppressed, so both engines decode a fixed token count; the graph is on by
+default, `--no-cudagraph` disables it):
 
-Greedy BART is parity and beam search trails slightly; Florence-2 leads (the
-paged, unpadded decoder avoids HF's padded batch decode).  FP32 trails because
-FlashAttention-2 is fp16/bf16-only and the SDPA fallback is slower — use
-`dtype=torch.bfloat16` on a GPU.  Run the GPU benchmarks with
-`--device cuda` (see the commands above); the run above uses `num_blocks=64`,
-`block_size=256`.
+| requests | max_tokens | eager tok/s | cudagraph tok/s |
+|---|---:|---:|---:|
+| 32 | 256 | 2695 | 3258 |
+| 128 | 256 | 4514 | 4533 |
+| 128 | 512 | 4391 | 4396 |
+
+At batch ≥ 32 the decode is GPU-bound re-reading the KV cache each step
+(`flash_fwd_splitkv_kernel` is ~2/3 of the CUDA time), so eager and the graph
+converge; the graph's win is small-batch latency.
+
+Florence-2 on the same box (`benchmark_florence2.py --quick --device cuda`, mixed
+caption/detection/segmentation batch, vision tower compiled):
+
+| box | config | HF tok/s | ours tok/s | speedup |
+|---|---|---:|---:|---:|
+| **NVIDIA L4** | greedy, batch=3 | 171.8 | 498.9 | 2.90× |
+| | greedy, batch=6 | 294.6 | 793.5 | 2.69× |
+| | beam, batch=3, beams=1 | 183.3 | 452.7 | 2.47× |
+| | beam, batch=3, beams=3 | 141.4 | 287.8 | 2.04× |
+| | continuous, N=6, window=6 | 302.5 | 772.8 | 2.56× |
 
 ## Limitations
 
@@ -436,7 +479,9 @@ FlashAttention-2 is fp16/bf16-only and the SDPA fallback is slower — use
 - The attention ops assume exactly one decoder prompt token per sequence (the
   Context carries per-sequence cached lengths, not query lengths); `generate`
   rejects a longer decoder prompt.
-- No prefix caching, no preemption/recompute, no CUDA graphs, no quantization.
+- No prefix caching, no preemption/recompute, no quantization.  The decode CUDA
+  graph is on by default on CUDA + FlashAttention-2 (see the GPU section); the CPU
+  path never uses it.
 - The cross-attention cache is dense and scales with `batch × enc_len`; it is
   not counted against `num_blocks`. For Florence-2 the projected visual tokens
   are part of that encoder sequence (577 tokens for a 768px image at base), so

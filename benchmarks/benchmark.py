@@ -147,8 +147,8 @@ def bench_hf(hf, tokenizer, prompts, max_new, beams, warmup, repeats, device="cp
 
 def row(label, ours_dt, ours_tok, hf_dt, hf_tok, n):
     return (
-        f"| {label:<22} | {ours_dt * 1e3:>9.0f} | {n / ours_dt:>8.2f} "
-        f"| {ours_tok / ours_dt:>8.1f} | {hf_dt * 1e3:>9.0f} | {n / hf_dt:>8.2f} "
+        f"| {label:<22} | {ours_dt * 1e3:>9.0f} | {ours_tok / ours_dt:>10.1f} "
+        f"| {hf_dt * 1e3:>9.0f} | {hf_tok / hf_dt:>9.1f} "
         f"| {hf_dt / ours_dt:>7.2f}x |"
     )
 
@@ -157,8 +157,8 @@ def table(title, results):
     lines = [
         f"\n### {title}",
         "",
-        "| config | ours ms | ours req/s | ours tok/s | hf ms | hf req/s | speedup |",
-        "|---|---:|---:|---:|---:|---:|---:|",
+        "| config | ours ms | ours tok/s | hf ms | hf tok/s | speedup |",
+        "|---|---:|---:|---:|---:|---:|",
     ]
     lines += results
     print("\n".join(lines), flush=True)

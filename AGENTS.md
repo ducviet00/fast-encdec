@@ -34,9 +34,9 @@ placeholders; the decoder is unchanged.
 
 - No flash-attn **outside** the CUDA backend: CPU stays pure PyTorch + the
   vendored vLLM kernel.
-- No quantization, prefix caching or chunked prefill. CUDA graphs exist only as
-  an opt-in **decode-only** prototype (`Config.use_cudagraph`, default off) — see
-  `engine/cudagraph.py`; nothing on the default path depends on them.
+- No quantization, prefix caching or chunked prefill.  The decode CUDA graph is
+  **on by default** on CUDA with the FlashAttention-2 backend (`Config.use_cudagraph`;
+  ignored elsewhere) — see `engine/cudagraph.py`.  The CPU path never uses it.
 - **Vendored vLLM CPU attention kernel.** `csrc/cpu` is a copy of vLLM's
   `csrc/cpu` attention implementation (Apache-2.0, see `csrc/LICENSE`), built
   on first use by `fastencdec/layers/cpu_attn.py`. It is the default CPU
@@ -242,12 +242,12 @@ PYTHONPATH=. $P benchmarks/benchmark_florence2.py --quick --device cuda
 
 # decode throughput (nano-vllm-style: N requests, fixed enc length + output)
 PYTHONPATH=. $P benchmarks/throughput.py --requests 128 --enc-len 512 --max-tokens 512
-PYTHONPATH=. $P benchmarks/throughput.py --requests 32 --enc-len 512 --max-tokens 256 --use-cudagraph
+PYTHONPATH=. $P benchmarks/throughput.py --requests 32 --enc-len 512 --max-tokens 256 --no-cudagraph
 PYTHONPATH=. $P benchmarks/throughput.py --requests 64 --enc-len 512 --max-tokens 256 --compile-model
 
 # Florence-2 token/padding accounting (8 images x 4 tasks) and profiling
-PYTHONPATH=. $P benchmarks/florence2_tasks.py --device cuda [--use-cudagraph]
-PYTHONPATH=. $P benchmarks/profile_florence2.py --engine ours --device cuda [--use-cudagraph]
+PYTHONPATH=. $P benchmarks/florence2_tasks.py --device cuda [--no-cudagraph]
+PYTHONPATH=. $P benchmarks/profile_florence2.py --engine ours --device cuda [--no-cudagraph]
 ```
 
 ### Benchmark baseline
@@ -263,20 +263,20 @@ never hand-edit or guess.**
 
 | sweep (bf16, enc=256 unless noted) | config | ours ms | speedup vs HF |
 |---|---|---:|---:|
-| batch, beams=1 | batch=1 | 1057 | 1.10x |
-| batch, beams=1 | batch=2 | 1028 | 1.26x |
-| batch, beams=1 | batch=4 | 1176 | 1.29x |
-| batch, beams=1 | batch=8 | 1581 | 1.23x |
-| batch, beams=4 | batch=1 | 1122 | 1.39x |
-| batch, beams=4 | batch=2 | 1246 | 1.60x |
-| batch, beams=4 | batch=4 | 1580 | 1.88x |
-| batch, beams=4 | batch=8 | 2223 | 2.31x |
-| beams, batch=8 | beams=1 | 1542 | 1.27x |
-| beams, batch=8 | beams=4 | 2208 | 2.34x |
-| dtype, batch=8, beams=4 | float32 | 6246 | 2.22x |
-| dtype, batch=8, beams=4 | bfloat16 | 2188 | 2.35x |
-| enc length, batch=8, beams=1 | enc=128 | 1215 | 1.29x |
-| enc length, batch=8, beams=1 | enc=256 | 1541 | 1.28x |
+| batch, beams=1 | batch=1 | 1027 | 1.14x |
+| batch, beams=1 | batch=2 | 975 | 1.30x |
+| batch, beams=1 | batch=4 | 1147 | 1.29x |
+| batch, beams=1 | batch=8 | 1519 | 1.26x |
+| batch, beams=4 | batch=1 | 1090 | 1.41x |
+| batch, beams=4 | batch=2 | 1244 | 1.58x |
+| batch, beams=4 | batch=4 | 1538 | 1.94x |
+| batch, beams=4 | batch=8 | 2217 | 2.34x |
+| beams, batch=8 | beams=1 | 1504 | 1.30x |
+| beams, batch=8 | beams=4 | 2225 | 2.33x |
+| dtype, batch=8, beams=4 | float32 | 6267 | 2.16x |
+| dtype, batch=8, beams=4 | bfloat16 | 2206 | 2.33x |
+| enc length, batch=8, beams=1 | enc=128 | 1170 | 1.30x |
+| enc length, batch=8, beams=1 | enc=256 | 1506 | 1.27x |
 
 Snapshot of `PYTHONPATH=. $P benchmarks/benchmark_florence2.py --quick`
 (`florence-community/Florence-2-base`, bf16 for both engines, 8 threads,
@@ -294,24 +294,25 @@ projector on `torch.compile`, the new default). Refresh from a real run.
 
 Snapshot of `PYTHONPATH=. $P benchmarks/benchmark.py --quick --device cuda` on
 the L4 box (`bart-large-cnn`, bf16 for both engines unless noted, flash backend,
-`num_blocks=64`, `block_size=256`, `max_tokens=48`). Refresh from a real run.
+CUDA graph on — the default — `num_blocks=64`, `block_size=256`, `max_tokens=48`).
+Refresh from a real run.
 
 | sweep (bf16, enc=256 unless noted) | config | ours ms | speedup vs HF |
 |---|---|---:|---:|
-| batch, beams=1 | batch=1 | 491 | 1.08x |
-| batch, beams=1 | batch=2 | 511 | 1.10x |
-| batch, beams=1 | batch=4 | 521 | 1.05x |
-| batch, beams=1 | batch=8 | 533 | 1.04x |
-| batch, beams=4 | batch=1 | 532 | 1.22x |
-| batch, beams=4 | batch=2 | 589 | 1.14x |
-| batch, beams=4 | batch=4 | 695 | 1.04x |
-| batch, beams=4 | batch=8 | 945 | 0.86x |
-| beams, batch=8 | beams=1 | 541 | 1.07x |
-| beams, batch=8 | beams=4 | 935 | 0.85x |
-| dtype, batch=8, beams=4 | float32 | 2009 | 0.57x |
-| dtype, batch=8, beams=4 | bfloat16 | 944 | 0.85x |
-| enc length, batch=8, beams=1 | enc=128 | 539 | 1.02x |
-| enc length, batch=8, beams=1 | enc=256 | 549 | 1.02x |
+| batch, beams=1 | batch=1 | 330 | 1.65x |
+| batch, beams=1 | batch=2 | 346 | 1.65x |
+| batch, beams=1 | batch=4 | 362 | 1.57x |
+| batch, beams=1 | batch=8 | 390 | 1.48x |
+| batch, beams=4 | batch=1 | 367 | 1.79x |
+| batch, beams=4 | batch=2 | 427 | 1.60x |
+| batch, beams=4 | batch=4 | 548 | 1.32x |
+| batch, beams=4 | batch=8 | 799 | 1.02x |
+| beams, batch=8 | beams=1 | 384 | 1.52x |
+| beams, batch=8 | beams=4 | 802 | 1.02x |
+| dtype, batch=8, beams=4 | float32 | 2031 | 0.56x |
+| dtype, batch=8, beams=4 | bfloat16 | 797 | 1.03x |
+| enc length, batch=8, beams=1 | enc=128 | 377 | 1.50x |
+| enc length, batch=8, beams=1 | enc=256 | 388 | 1.48x |
 
 Snapshot of `PYTHONPATH=. $P benchmarks/benchmark_florence2.py --quick
 --device cuda` (`Florence-2-base`, bf16 for both engines, image 640×480 → 768px,
@@ -319,28 +320,28 @@ vision tower compiled, `num_blocks=256`, `block_size=256`).
 
 | sweep (bf16) | config | ours ms | speedup vs HF |
 |---|---|---:|---:|
-| greedy batch | batch=3 | 617 | 1.27x |
-| greedy batch | batch=6 | 688 | 1.27x |
-| beam (batch=3) | beams=1 | 422 | 1.27x |
-| beam (batch=3) | beams=3 | 561 | 1.21x |
-| continuous (N=6) | w=3 | 838 | 1.03x |
-| continuous (N=6) | w=6 | 655 | 1.32x |
+| greedy batch | batch=3 | 263 | 2.90x |
+| greedy batch | batch=6 | 330 | 2.69x |
+| beam (batch=3) | beams=1 | 219 | 2.47x |
+| beam (batch=3) | beams=3 | 344 | 2.04x |
+| continuous (N=6) | w=3 | 551 | 1.57x |
+| continuous (N=6) | w=6 | 339 | 2.56x |
 
-On GPU the engine matches HF on greedy BART and leads on Florence-2; it trails on
-beam search (the paged cache writes new K/V separately where HF's cache append is
-fused) and fp32 (FlashAttention-2 needs fp16/bf16 and the SDPA fallback is
-slower).
+On GPU the CUDA graph (now the default) is what makes greedy BART competitive:
+1.48-1.79x vs HF, where eager it was ~1.05x — the graph removes the per-step
+host launch overhead that dominated small batches. Beam search is ~parity (the
+paged cache writes new K/V separately where HF's cache append is fused) and fp32
+trails (FlashAttention-2 needs fp16/bf16 and the SDPA fallback is slower).
 
 Decode throughput (`benchmarks/throughput.py`, `bart-large-cnn`, bf16, enc=512,
-EOS suppressed, so both engines decode a fixed token count; `--use-cudagraph`
-captures the decode step):
+EOS suppressed, so both engines decode a fixed token count; the graph is on by
+default, `--no-cudagraph` disables it):
 
 | requests | max_tokens | eager tok/s | cudagraph tok/s |
 |---|---:|---:|---:|
-| 32 | 256 | 2673 | 3237 |
-| 64 | 256 | 3981 | 3978 |
-| 128 | 256 | 4509 | 4507 |
-| 128 | 512 | 4388 | 4407 |
+| 32 | 256 | 2695 | 3258 |
+| 128 | 256 | 4514 | 4533 |
+| 128 | 512 | 4391 | 4396 |
 
 At batch ≥ 32 the decode is GPU-bound and re-reads the KV cache every step
 (`flash_fwd_splitkv_kernel` is ~2/3 of the CUDA time), so eager and the CUDA
@@ -423,8 +424,8 @@ on this box with the same kind of workload.
   key/value cache, so `flash_fwd_splitkv_kernel` is ~2/3 of all CUDA time (true
   for nano-vllm too). At batch ≥ 32 the engine is GPU-bound (eager ≈ CUDA-graph);
   small batches are host-bound. `benchmarks/throughput.py` reports decode tok/s
-  and `benchmarks/profile_florence2.py [--use-cudagraph]` breaks it down.
-- **CUDA graph (`use_cudagraph=True`, default off).** `engine/cudagraph.py`
+  and `benchmarks/profile_florence2.py [--no-cudagraph]` breaks it down.
+- **CUDA graph (on by default on CUDA + flash).** `engine/cudagraph.py`
   captures `model.decoder` once per batch-size bucket (`[1,2,4,8,16,…,
   max_num_seqs]`) into a shared pool and replays it — decode only, CUDA+flash
   path only. The caches must be static: the self cache gets one extra scratch

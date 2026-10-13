@@ -5,7 +5,7 @@ suppressed, so the whole run is decode-dominated and tokens/s is comparable
 across engines.
 
     PYTHONPATH=. python benchmarks/throughput.py --requests 64 --enc-len 512 --max-tokens 256
-    PYTHONPATH=. python benchmarks/throughput.py --requests 64 --enc-len 512 --max-tokens 256 --use-cudagraph
+    PYTHONPATH=. python benchmarks/throughput.py --requests 64 --enc-len 512 --max-tokens 256 --no-cudagraph
 """
 
 import argparse
@@ -46,7 +46,13 @@ def main():
     ap.add_argument("--block-size", type=int, default=0, help="0 = device default")
     ap.add_argument("--dtype", default="bfloat16", choices=["float32", "bfloat16"])
     ap.add_argument("--device", default="cuda")
-    ap.add_argument("--use-cudagraph", action="store_true")
+    ap.add_argument(
+        "--cudagraph",
+        dest="use_cudagraph",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="decode CUDA graph (default on; CUDA + flash only)",
+    )
     ap.add_argument(
         "--compile-model", action="store_true", help="torch.compile decoder"
     )

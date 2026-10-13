@@ -50,8 +50,9 @@ class LLM:
         device: ``"cpu"`` (default) or ``"cuda"`` to run on a GPU.  On CUDA the
             decoder attention uses FlashAttention-2 (``attn_backend="flash"``)
             when it is available and the shape is supported, else SDPA.
-        use_cudagraph: capture the decoder step into a CUDA graph (CUDA +
-            FlashAttention-2 only; default off).  Prototype.
+        use_cudagraph: capture the decoder step into a CUDA graph (on by
+            default; only takes effect on CUDA + FlashAttention-2, ignored
+            elsewhere).
         compile_model: fuse the per-layer pointwise sequences with
             ``torch.compile`` (default off).
     """
@@ -67,7 +68,7 @@ class LLM:
         attn_backend: str = "auto",
         compile_mm_encoder: bool = True,
         device: str = "cpu",
-        use_cudagraph: bool = False,
+        use_cudagraph: bool = True,
         compile_model: bool = False,
     ):
         hf_config = AutoConfig.from_pretrained(model_path)

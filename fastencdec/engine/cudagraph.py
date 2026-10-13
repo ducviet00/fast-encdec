@@ -33,7 +33,10 @@ class DecodeGraphRunner:
         self.dtype = runner.dtype
         self.block_size = runner.block_size
         self.max_bs = max(1, min(max_num_seqs, 512))
-        buckets = [1, 2, 4, 8] + list(range(16, self.max_bs + 1, 16))
+        # Buckets: small powers of two, then multiples of 16, plus ``max_bs``
+        # itself so every batch up to the cap has one (for ``max_num_seqs`` < 16
+        # the multiples-of-16 sweep is empty, e.g. 6 -> [1, 2, 4, 6]).
+        buckets = [1, 2, 4, 8, *range(16, self.max_bs + 1, 16), self.max_bs]
         self.graph_bs = sorted({b for b in buckets if b <= self.max_bs})
         # Reserved self-attention cache row the padded rows write to (the block
         # manager only ever hands out ``num_blocks`` rows).

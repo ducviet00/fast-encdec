@@ -24,7 +24,7 @@ class ModelRunner:
         attn_backend="auto",
         device="cpu",
         max_num_seqs=32,
-        use_cudagraph=False,
+        use_cudagraph=True,
         compile_model=False,
     ):
         self.device = torch.device(device)

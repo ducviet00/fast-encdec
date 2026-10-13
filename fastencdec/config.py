@@ -22,8 +22,10 @@ class Config:
             SDPA), ``"vllm"`` (require the CPU kernel), ``"flash"`` (require
             FlashAttention-2) or ``"sdpa"`` (force the pure-PyTorch path).
         device: ``"cpu"`` or ``"cuda"`` (``"cuda:N"`` also works).
-        use_cudagraph: capture the decoder step into a CUDA graph (CUDA +
-            FlashAttention-2 only; default off).  Prototype.
+        use_cudagraph: capture the decoder step into a CUDA graph.  On by
+            default, but it only takes effect on CUDA with the FlashAttention-2
+            backend; everywhere else it is ignored (the runner ANDs it with the
+            device/backend check) and the eager path runs.
         compile_model: fuse the per-layer pointwise sequences (residual add +
             layer norm, activation + fc1) with ``torch.compile`` (default off),
             nano-vllm style.  Ignored for Florence-2's vision tower, which has
@@ -36,7 +38,7 @@ class Config:
     dtype: torch.dtype = torch.float32
     attn_backend: str = "auto"
     device: str = "cpu"
-    use_cudagraph: bool = False
+    use_cudagraph: bool = True
     compile_model: bool = False
 
     def __post_init__(self) -> None:

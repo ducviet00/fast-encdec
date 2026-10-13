@@ -122,7 +122,13 @@ def main():
     ap.add_argument("--warmup", type=int, default=1)
     ap.add_argument("--repeats", type=int, default=2)
     ap.add_argument("--compile-mm-encoder", action="store_true")
-    ap.add_argument("--use-cudagraph", action="store_true", help="decode CUDA graph")
+    ap.add_argument(
+        "--cudagraph",
+        dest="use_cudagraph",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="decode CUDA graph (default on; CUDA + flash only)",
+    )
     ap.add_argument("--json", default=None)
     args = ap.parse_args()
 

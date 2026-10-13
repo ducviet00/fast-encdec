@@ -112,11 +112,11 @@ def build_model():
     return BartForConditionalGeneration(config).eval()
 
 
-def decode(model, backend, requests, params, device):
+def decode(model, backend, requests, params, device, max_num_seqs=8):
     config = Config(
         num_blocks=32,
         block_size=BLOCK_SIZE,
-        max_num_seqs=8,
+        max_num_seqs=max_num_seqs,
         dtype=torch.bfloat16,
         attn_backend=backend,
         device=device,
@@ -148,6 +148,26 @@ def model_parity(device):
     return ok
 
 
+def graph_buckets(device):
+    """A batch that fills a non-bucket ``max_num_seqs`` still decodes.
+
+    The CUDA graph buckets are ``[1, 2, 4, 8, ...]``, so ``max_num_seqs=6`` used
+    to leave no bucket for the full batch and ``replay`` raised ``StopIteration``.
+    """
+    from fastencdec.sampling_params import SamplingParams
+
+    model = build_model().to(torch.bfloat16).to(device)
+    torch.manual_seed(2)
+    lengths = (17, 31, 9, 12, 5, 21)
+    requests = [(torch.randint(3, VOCAB, (n,)).tolist(), [1], None) for n in lengths]
+    params = SamplingParams(max_tokens=8, num_beams=1, temperature=0.0)
+    want = decode(model, "sdpa", requests, params, device, max_num_seqs=6)
+    got = decode(model, "flash", requests, params, device, max_num_seqs=6)
+    ok = want == got
+    print(f"[{'OK' if ok else 'MISMATCH'}] graph buckets, max_num_seqs=6 batch=6")
+    return ok
+
+
 def main():
     if not torch.cuda.is_available():
         print("SKIP: no CUDA device")
@@ -160,6 +180,7 @@ def main():
     device = "cuda"
     ok = paged_parity(device)
     ok &= model_parity(device)
+    ok &= graph_buckets(device)
     if not ok:
         raise SystemExit("flash parity failed")
 

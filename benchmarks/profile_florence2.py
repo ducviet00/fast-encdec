@@ -161,7 +161,13 @@ def main():
     ap.add_argument("--max-tokens", type=int, default=128)
     ap.add_argument("--num-blocks", type=int, default=4096)
     ap.add_argument("--compile-mm-encoder", action="store_true")
-    ap.add_argument("--use-cudagraph", action="store_true", help="decode CUDA graph")
+    ap.add_argument(
+        "--cudagraph",
+        dest="use_cudagraph",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="decode CUDA graph (default on; CUDA + flash only)",
+    )
     ap.add_argument("--rows", type=int, default=20, help="rows per profiler table")
     ap.add_argument("--out", default=None, help="write the raw tables to this file")
     args = ap.parse_args()
