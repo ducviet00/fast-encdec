@@ -81,7 +81,13 @@ class DecodeGraphRunner:
             added = True
         if added:
             self._write_cross()
-            self._alloc_bufs()
+            # ``_alloc_bufs`` also drops the captured graphs (they read the static
+            # buffers), so only rebuild when the width actually changed --
+            # ``_alloc_cross`` sets ``bufs = None`` for that.  A new request set
+            # with the same capacity only rewrites the cross cache, which the
+            # graph reads in place, so the capture stays valid.
+            if self.bufs is None:
+                self._alloc_bufs()
         ids = tuple(seq.request_id for seq in seqs)
         if added or ids != self._staged_ids:
             self._rows(seqs)

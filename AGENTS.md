@@ -299,20 +299,20 @@ Refresh from a real run.
 
 | sweep (bf16, enc=256 unless noted) | config | ours ms | speedup vs HF |
 |---|---|---:|---:|
-| batch, beams=1 | batch=1 | 330 | 1.65x |
-| batch, beams=1 | batch=2 | 346 | 1.65x |
-| batch, beams=1 | batch=4 | 362 | 1.57x |
-| batch, beams=1 | batch=8 | 390 | 1.48x |
-| batch, beams=4 | batch=1 | 367 | 1.79x |
-| batch, beams=4 | batch=2 | 427 | 1.60x |
-| batch, beams=4 | batch=4 | 548 | 1.32x |
-| batch, beams=4 | batch=8 | 799 | 1.02x |
-| beams, batch=8 | beams=1 | 384 | 1.52x |
-| beams, batch=8 | beams=4 | 802 | 1.02x |
-| dtype, batch=8, beams=4 | float32 | 2031 | 0.56x |
-| dtype, batch=8, beams=4 | bfloat16 | 797 | 1.03x |
-| enc length, batch=8, beams=1 | enc=128 | 377 | 1.50x |
-| enc length, batch=8, beams=1 | enc=256 | 388 | 1.48x |
+| batch, beams=1 | batch=1 | 176 | 3.04x |
+| batch, beams=1 | batch=2 | 192 | 2.93x |
+| batch, beams=1 | batch=4 | 209 | 2.68x |
+| batch, beams=1 | batch=8 | 234 | 2.42x |
+| batch, beams=4 | batch=1 | 212 | 3.04x |
+| batch, beams=4 | batch=2 | 268 | 2.51x |
+| batch, beams=4 | batch=4 | 394 | 1.84x |
+| batch, beams=4 | batch=8 | 641 | 1.26x |
+| beams, batch=8 | beams=1 | 234 | 2.41x |
+| beams, batch=8 | beams=4 | 641 | 1.25x |
+| dtype, batch=8, beams=4 | float32 | 2051 | 0.56x |
+| dtype, batch=8, beams=4 | bfloat16 | 645 | 1.26x |
+| enc length, batch=8, beams=1 | enc=128 | 220 | 2.55x |
+| enc length, batch=8, beams=1 | enc=256 | 235 | 2.37x |
 
 Snapshot of `PYTHONPATH=. $P benchmarks/benchmark_florence2.py --quick
 --device cuda` (`Florence-2-base`, bf16 for both engines, image 640×480 → 768px,
@@ -320,18 +320,20 @@ vision tower compiled, `num_blocks=256`, `block_size=256`).
 
 | sweep (bf16) | config | ours ms | speedup vs HF |
 |---|---|---:|---:|
-| greedy batch | batch=3 | 263 | 2.90x |
-| greedy batch | batch=6 | 330 | 2.69x |
-| beam (batch=3) | beams=1 | 219 | 2.47x |
-| beam (batch=3) | beams=3 | 344 | 2.04x |
-| continuous (N=6) | w=3 | 551 | 1.57x |
-| continuous (N=6) | w=6 | 339 | 2.56x |
+| greedy batch | batch=3 | 222 | 3.46x |
+| greedy batch | batch=6 | 287 | 2.95x |
+| beam (batch=3) | beams=1 | 172 | 3.16x |
+| beam (batch=3) | beams=3 | 263 | 2.58x |
+| continuous (N=6) | w=3 | 363 | 2.34x |
+| continuous (N=6) | w=6 | 286 | 2.97x |
 
 On GPU the CUDA graph (now the default) is what makes greedy BART competitive:
-1.48-1.79x vs HF, where eager it was ~1.05x — the graph removes the per-step
-host launch overhead that dominated small batches. Beam search is ~parity (the
-paged cache writes new K/V separately where HF's cache append is fused) and fp32
-trails (FlashAttention-2 needs fp16/bf16 and the SDPA fallback is slower).
+2.4-3.0x vs HF, where eager it was ~1.05x — the graph removes the per-step host
+launch overhead that dominated small batches. Beam search is 1.25-1.26x: the paged
+cache writes new K/V separately where HF's cache append is fused, and at 32
+sequences (8 requests x 4 beams) the step is real GPU work rather than launch
+overhead. fp32 trails (FlashAttention-2 needs fp16/bf16 and the SDPA fallback is
+slower).
 
 Decode throughput (`benchmarks/throughput.py`, `bart-large-cnn`, bf16, enc=512,
 EOS suppressed, so both engines decode a fixed token count; the graph is on by
@@ -339,9 +341,8 @@ default, `--no-cudagraph` disables it):
 
 | requests | max_tokens | eager tok/s | cudagraph tok/s |
 |---|---:|---:|---:|
-| 32 | 256 | 2695 | 3258 |
-| 128 | 256 | 4514 | 4533 |
-| 128 | 512 | 4391 | 4396 |
+| 32 | 256 | 2601 | 3395 |
+| 128 | 256 | 4546 | 4654 |
 
 At batch ≥ 32 the decode is GPU-bound and re-reads the KV cache every step
 (`flash_fwd_splitkv_kernel` is ~2/3 of the CUDA time), so eager and the CUDA
@@ -436,7 +437,12 @@ on this box with the same kind of workload.
   memoized temporary is computed outside the capture and freed (that caused
   illegal indices), so `_self_derived` no longer precomputes `(block, pos)`. It
   falls back to eager when `len(seqs) > max_bs` and re-captures if the
-  cross-cache capacity grows (new requests admitted mid-run).
+  cross-cache capacity grows (new requests admitted mid-run).  The buffers are
+  rebuilt — and therefore the capture redone — **only when `bufs is None`**, i.e.
+  after `_alloc_cross` grew the cross cache; a new request set with the same
+  capacity just rewrites the cross rows in place, so the capture survives across
+  `generate()` calls.  (Rebuilding the buffers for every new request set
+  re-captured all buckets on every call: ~100 ms of the L4's 176-641 ms rows.)
 - **`torch.compile` (`compile_model=True`, default off) fuses the pointwise
   sequences but does not pay off for BART.** How nano-vllm uses it: not a
   whole-model compile, but `@torch.compile` on four tensor-only functions —

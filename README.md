@@ -433,18 +433,19 @@ CUDA usage section above):
 
 | box | config | HF tok/s | ours tok/s | speedup |
 |---|---|---:|---:|---:|
-| **NVIDIA L4** (sm89, 24 GB, 4 vCPU) | batch=1, beams=1 | 88.0 | 145.5 | 1.65× |
-| | batch=8, beams=1 | 664.1 | 985.4 | 1.48× |
-| | batch=8, beams=4 | 473.7 | 480.9 | 1.02× |
-| | batch=8, beams=1, enc=128 | 679.5 | 1017.7 | 1.50× |
-| | batch=8, beams=4, fp32 | 337.7 | 189.0 | 0.56× |
+| **NVIDIA L4** (sm89, 24 GB, 4 vCPU) | batch=1, beams=1 | 89.4 | 272.1 | 3.04× |
+| | batch=8, beams=1 | 677.8 | 1641.0 | 2.42× |
+| | batch=8, beams=4 | 474.7 | 598.9 | 1.26× |
+| | batch=8, beams=1, enc=128 | 686.2 | 1747.8 | 2.55× |
+| | batch=8, beams=4, fp32 | 332.3 | 187.2 | 0.56× |
 
-Greedy is now well ahead of HF (1.48–1.65×): the CUDA graph removes the per-step
+Greedy is now well ahead of HF (2.4–3.0×): the CUDA graph removes the per-step
 host launch overhead that dominated small batches — eager, the same rows were
-~1.05× (see the AGENTS baseline).  Beam search is ~parity (1.02×) because the paged
-cache writes new K/V separately where HF's cache append is fused.  FP32 trails
-(0.56×) because FlashAttention-2 is fp16/bf16-only and the SDPA fallback is slower
-— use `dtype=torch.bfloat16` on a GPU.
+~1.05× (see the AGENTS baseline).  Beam search is 1.26× because the paged cache
+writes new K/V separately where HF's cache append is fused, and at 32 sequences
+(8 requests × 4 beams) the step is real GPU work rather than launch overhead.
+FP32 trails (0.56×) because FlashAttention-2 is fp16/bf16-only and the SDPA
+fallback is slower — use `dtype=torch.bfloat16` on a GPU.
 
 Decode throughput (`benchmarks/throughput.py`, `bart-large-cnn`, bf16, enc=512,
 EOS suppressed, so both engines decode a fixed token count; the graph is on by
@@ -452,9 +453,8 @@ default, `--no-cudagraph` disables it):
 
 | requests | max_tokens | eager tok/s | cudagraph tok/s |
 |---|---:|---:|---:|
-| 32 | 256 | 2695 | 3258 |
-| 128 | 256 | 4514 | 4533 |
-| 128 | 512 | 4391 | 4396 |
+| 32 | 256 | 2601 | 3395 |
+| 128 | 256 | 4546 | 4654 |
 
 At batch ≥ 32 the decode is GPU-bound re-reading the KV cache each step
 (`flash_fwd_splitkv_kernel` is ~2/3 of the CUDA time), so eager and the graph
@@ -465,11 +465,11 @@ caption/detection/segmentation batch, vision tower compiled):
 
 | box | config | HF tok/s | ours tok/s | speedup |
 |---|---|---:|---:|---:|
-| **NVIDIA L4** | greedy, batch=3 | 171.8 | 498.9 | 2.90× |
-| | greedy, batch=6 | 294.6 | 793.5 | 2.69× |
-| | beam, batch=3, beams=1 | 183.3 | 452.7 | 2.47× |
-| | beam, batch=3, beams=3 | 141.4 | 287.8 | 2.04× |
-| | continuous, N=6, window=6 | 302.5 | 772.8 | 2.56× |
+| **NVIDIA L4** | greedy, batch=3 | 170.2 | 589.8 | 3.46× |
+| | greedy, batch=6 | 308.8 | 911.5 | 2.95× |
+| | beam, batch=3, beams=1 | 181.8 | 574.8 | 3.16× |
+| | beam, batch=3, beams=3 | 146.0 | 376.9 | 2.58× |
+| | continuous, N=6, window=6 | 308.7 | 916.9 | 2.97× |
 
 ## Limitations
 
