@@ -167,7 +167,12 @@ def table(title, results):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", default="facebook/bart-large-cnn")
-    ap.add_argument("--threads", type=int, default=8)
+    ap.add_argument(
+        "--threads",
+        type=int,
+        default=0,
+        help="0 = torch default, i.e. the number of physical cores",
+    )
     ap.add_argument("--device", default="cpu", help="cpu or cuda (cuda:N works)")
     ap.add_argument("--dtype", default="bfloat16", choices=["float32", "bfloat16"])
     ap.add_argument("--max-tokens", type=int, default=48)
@@ -185,7 +190,9 @@ def main():
     ap.add_argument("--json", default=None, help="write raw results to a JSON file")
     args = ap.parse_args()
 
-    torch.set_num_threads(args.threads)
+    if args.threads:
+        torch.set_num_threads(args.threads)
+    threads = torch.get_num_threads()  # physical cores unless forced
     dtype = getattr(torch, args.dtype)
 
     # Keep the KV token budget (num_blocks * block_size) constant across
@@ -263,7 +270,7 @@ def main():
 
     print("# fast-encdec benchmark\n", flush=True)
     print(
-        f"model={args.model}  device={args.device}  threads={args.threads}  "
+        f"model={args.model}  device={args.device}  threads={threads}  "
         f"dtype={args.dtype} (ours and HF)  max_tokens={args.max_tokens}  "
         f"num_blocks={num_blocks}  block_size={block_size}",
         flush=True,

@@ -279,7 +279,12 @@ def main():
     ap.add_argument("--mode", default="both", choices=["kernel", "e2e", "both"])
     ap.add_argument("--device", default="cpu")
     ap.add_argument("--dtype", default="bfloat16", choices=["float32", "bfloat16"])
-    ap.add_argument("--threads", type=int, default=8)
+    ap.add_argument(
+        "--threads",
+        type=int,
+        default=0,
+        help="0 = torch default, i.e. the number of physical cores",
+    )
     ap.add_argument("--block-size", type=int, default=0, help="0 = device default")
     ap.add_argument("--num-blocks", type=int, default=1024)
     ap.add_argument("--batch", type=int, default=8)
@@ -290,12 +295,14 @@ def main():
     ap.add_argument("--cudagraph", action=argparse.BooleanOptionalAction, default=True)
     args = ap.parse_args()
 
-    torch.set_num_threads(args.threads)
+    if args.threads:
+        torch.set_num_threads(args.threads)
+    threads = torch.get_num_threads()  # physical cores unless forced
     dtype = getattr(torch, args.dtype)
     block_size = args.block_size or (256 if args.device.startswith("cuda") else 16)
     print(
         f"attn_backend benchmark: device={args.device} dtype={args.dtype} "
-        f"threads={args.threads} block_size={block_size}"
+        f"threads={threads} block_size={block_size}"
     )
     if args.mode in ("kernel", "both"):
         kernel_section(dtype, block_size, args.iters)

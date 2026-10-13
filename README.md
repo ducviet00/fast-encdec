@@ -352,7 +352,7 @@ compiled vision tower shifts the encoder features.
 
 ### CPU
 
-`benchmarks/benchmark.py --quick --threads 8` on `facebook/bart-large-cnn`, bf16
+`benchmarks/benchmark.py --quick` on `facebook/bart-large-cnn`, bf16
 for both engines (fp32 where noted), 48 output tokens, encoder length 256 unless
 noted.  fast-encdec runs the vendored vLLM CPU kernel (`vec16` on x86, `neon` on
 aarch64), HF its own batched SDPA; "ours" and "HF" are end-to-end decode
@@ -360,29 +360,31 @@ throughput, and `speedup = ours ÷ HF`:
 
 | box | config | HF tok/s | ours tok/s | speedup |
 |---|---|---:|---:|---:|
-| **AMD Ryzen 7 7840H** (Zen 4, `avx512_bf16`, 16 CPUs) | batch=1, beams=1 | 41.1 | 46.7 | 1.14× |
+| **AMD Ryzen 7 7840H** (Zen 4, `avx512_bf16`, 8 cores / 16 threads) | batch=1, beams=1 | 41.1 | 46.7 | 1.14× |
 | | batch=8, beams=1 | 200.6 | 252.8 | 1.26× |
 | | batch=8, beams=4 | 74.0 | 173.2 | 2.34× |
 | | batch=8, beams=1, enc=128 | 251.5 | 328.1 | 1.30× |
 | | batch=8, beams=4, fp32 | 28.4 | 61.3 | 2.16× |
-| **Intel Xeon 8581C** (Emerald Rapids, `amx_bf16`, c4-standard-8) | batch=1, beams=1 | 50.0 | 56.8 | 1.14× |
-| | batch=8, beams=1 | 283.2 | 306.2 | 1.08× |
-| | batch=8, beams=4 | 112.0 | 185.4 | 1.66× |
-| | batch=8, beams=1, enc=128 | 342.8 | 362.8 | 1.06× |
-| | batch=8, beams=4, fp32 | 25.6 | 63.2 | 2.47× |
-| **Intel Xeon 6975P-C** (Granite Rapids, `amx_bf16`, m8i.2xlarge) | batch=1, beams=1 | 46.1 | 51.4 | 1.12× |
-| | batch=8, beams=1 | 264.4 | 285.4 | 1.08× |
-| | batch=8, beams=4 | 108.7 | 178.2 | 1.64× |
-| | batch=8, beams=1, enc=128 | 317.0 | 346.6 | 1.09× |
-| | batch=8, beams=4, fp32 | 29.4 | 63.6 | 2.17× |
-| **AWS Graviton 5** (Neoverse-V3, BF16/I8MM/SVE2, m9g.2xlarge) | batch=1, beams=1 | 42.6 | 46.2 | 1.08× |
+| **Intel Xeon 8581C** (Emerald Rapids, `amx_bf16`, c4-standard-8, 4 cores) | batch=1, beams=1 | 54.5 | 59.7 | 1.10× |
+| | batch=8, beams=1 | 301.4 | 312.0 | 1.04× |
+| | batch=8, beams=4 | 116.8 | 201.7 | 1.73× |
+| | batch=8, beams=1, enc=128 | 349.3 | 368.6 | 1.06× |
+| | batch=8, beams=4, fp32 | 28.6 | 71.9 | 2.52× |
+| **Intel Xeon 6975P-C** (Granite Rapids, `amx_bf16`, m8i.2xlarge, 4 cores) | batch=1, beams=1 | 53.0 | 57.2 | 1.08× |
+| | batch=8, beams=1 | 287.0 | 291.7 | 1.02× |
+| | batch=8, beams=4 | 120.0 | 200.2 | 1.67× |
+| | batch=8, beams=1, enc=128 | 338.3 | 351.1 | 1.04× |
+| | batch=8, beams=4, fp32 | 31.7 | 74.8 | 2.36× |
+| **AWS Graviton 5** (Neoverse-V3, BF16/I8MM/SVE2, m9g.2xlarge, 8 cores) | batch=1, beams=1 | 42.6 | 46.2 | 1.08× |
 | | batch=8, beams=1 | 316.3 | 346.3 | 1.09× |
 | | batch=8, beams=4 | 160.7 | 214.5 | 1.33× |
 | | batch=8, beams=1, enc=128 | 389.9 | 450.8 | 1.16× |
 | | batch=8, beams=4, fp32 | 71.2 | 94.8 | 1.33× |
 
-Every box runs 8 threads (`--threads 8`) with `block_size=16` and the vendored
-kernel (`attn_backend="auto"`).  Beam search is the big win (1.3–2.3×) because the
+Every box runs with `block_size=16`, the vendored kernel (`attn_backend="auto"`)
+and **its own physical-core count** of threads — the scripts default to
+`--threads 0`, i.e. torch's default, which is 8 on the Ryzen/Graviton and **4** on
+the 4-core Xeons.  Beam search is the big win (1.3–2.3×) because the
 paged cache shares blocks instead of reordering a full beam cache each step;
 greedy is a modest 1.06–1.30× (HF's batched SDPA is already good and the encoder
 is GEMM-bound on both engines).  Graviton 5 has the highest absolute throughput and
@@ -408,7 +410,8 @@ engine's default), PyTorch **SDPA** (`attn_backend="sdpa"`) and **eager** — SD
 pinned to PyTorch's math kernel, i.e. the naive matmul/softmax/matmul, and HF's
 `attn_implementation="eager"`.
 
-Microseconds per decoder attention call (bf16, `block_size=16`, 8 threads).  On
+Microseconds per decoder attention call (bf16, `block_size=16`, each box at its
+physical core count: 8 for Ryzen/Graviton, 4 for the Xeons).  On
 CPU our SDPA/eager paths are the per-sequence fallback loop (CUDA's is batched),
 so those columns include that Python overhead:
 
@@ -418,14 +421,14 @@ so those columns include that Python overhead:
 | | self, batch=8, ctx=1024 | 467 | 7471 | 9594 | 21× |
 | | self, batch=32, ctx=1024 | 2984 | 28210 | 29371 | 10× |
 | | cross, batch=8, enc=256 | 37 | 437 | 468 | 13× |
-| Xeon 8581C (Emerald Rapids) | self, batch=8, ctx=256 | 96 | 2223 | 3082 | 32× |
-| | self, batch=8, ctx=1024 | 387 | 5598 | 9990 | 26× |
-| | self, batch=32, ctx=1024 | 1814 | 17923 | 29025 | 16× |
-| | cross, batch=8, enc=256 | 102 | 220 | 737 | 7× |
-| Xeon 6975P-C (Granite Rapids) | self, batch=8, ctx=256 | 129 | 2004 | 3111 | 24× |
-| | self, batch=8, ctx=1024 | 494 | 7657 | 12402 | 25× |
-| | self, batch=32, ctx=1024 | 2199 | 27580 | 41405 | 19× |
-| | cross, batch=8, enc=256 | 134 | 217 | 763 | 6× |
+| Xeon 8581C (Emerald Rapids, 4 threads) | self, batch=8, ctx=256 | 105 | 2189 | 3043 | 29× |
+| | self, batch=8, ctx=1024 | 447 | 5433 | 10213 | 23× |
+| | self, batch=32, ctx=1024 | 1896 | 23948 | 30963 | 16× |
+| | cross, batch=8, enc=256 | 114 | 173 | 618 | 5× |
+| Xeon 6975P-C (Granite Rapids, 4 threads) | self, batch=8, ctx=256 | 137 | 2236 | 2908 | 21× |
+| | self, batch=8, ctx=1024 | 591 | 7963 | 12433 | 21× |
+| | self, batch=32, ctx=1024 | 2520 | 32124 | 44251 | 18× |
+| | cross, batch=8, enc=256 | 136 | 181 | 637 | 5× |
 | Graviton 5 | self, batch=8, ctx=256 | 71 | 645 | 1491 | 21× |
 | | self, batch=8, ctx=1024 | 363 | 1667 | 3930 | 11× |
 | | self, batch=32, ctx=1024 | 1324 | 7005 | 15546 | 12× |
@@ -437,10 +440,10 @@ End-to-end, batch=8, greedy, `ours` = this engine and `HF` = `generate` (tok/s):
 |---|---|---:|---:|---:|---:|---:|
 | Ryzen 7 7840H | enc=256, out=48 | **256** | 184 | 155 | 199 | 202 |
 | | enc=64, out=256 | **400** | 225 | 192 | 262 | 274 |
-| Xeon 8581C | enc=256, out=48 | **306** | 247 | 173 | 282 | 253 |
-| | enc=64, out=256 | **437** | 275 | 200 | 368 | 332 |
-| Xeon 6975P-C | enc=256, out=48 | **283** | 230 | 163 | 273 | 244 |
-| | enc=64, out=256 | **409** | 258 | 181 | 345 | 315 |
+| Xeon 8581C | enc=256, out=48 | **312** | 267 | 189 | 294 | 260 |
+| | enc=64, out=256 | **411** | 275 | 211 | 368 | 329 |
+| Xeon 6975P-C | enc=256, out=48 | **306** | 264 | 182 | 290 | 259 |
+| | enc=64, out=256 | **390** | 263 | 200 | 346 | 315 |
 | Graviton 5 | enc=256, out=48 | **345** | 300 | 171 | 318 | 238 |
 | | enc=64, out=256 | **579** | 402 | 209 | 503 | 366 |
 

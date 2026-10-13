@@ -263,8 +263,9 @@ PYTHONPATH=. $P benchmarks/profile_florence2.py --engine ours --device cuda [--n
 ### Benchmark baseline
 
 Snapshot of `PYTHONPATH=. $P benchmarks/benchmark.py --quick`
-(`bart-large-cnn`, 8 threads, bfloat16 for **both** engines, `max_tokens=48`,
-`num_blocks=1024`, `block_size=16`, on the dev CPU; attention on the vendored
+(`bart-large-cnn`, bfloat16 for **both** engines, `max_tokens=48`,
+`num_blocks=1024`, `block_size=16`, on the dev CPU (threads = the physical core
+count, 8 there, which is what `--threads 0` resolves to); attention on the vendored
 vLLM CPU kernel, i.e. `attn_backend="auto"`). The HF baseline is loaded at the
 same dtype and both engines decode exactly `max_tokens`, so the speedup is
 engine-vs-engine. **Every commit must refresh this from a real run of the
@@ -289,7 +290,7 @@ never hand-edit or guess.**
 | enc length, batch=8, beams=1 | enc=256 | 1506 | 1.27x |
 
 Snapshot of `PYTHONPATH=. $P benchmarks/benchmark_florence2.py --quick`
-(`florence-community/Florence-2-base`, bf16 for both engines, 8 threads,
+(`florence-community/Florence-2-base`, bf16 for both engines,
 640×480 image → 768px, `max_tokens=96` / `beam_tokens=64`; vision tower +
 projector on `torch.compile`, the new default). Refresh from a real run.
 
@@ -406,9 +407,12 @@ on this box with the same kind of workload.
   memory/latency-bound, so AMX buys nothing and physical cores win: 8-thread
   `[8x1024]x[1024x4096]` gives Ryzen 940, Graviton 754, Granite 520, Emerald 471
   GFLOP/s — which is why the engine's decode benchmarks rank Graviton above the
-  Xeons.  That said, `--threads 8` is still right for the *engine* (it has
-  non-GEMM parallel work too): on Emerald the decode-heavy run is 436 tok/s at 8
-  threads vs 409 at 4.
+  Xeons.  The benchmark scripts therefore default to `--threads 0` = torch's
+  default = the number of *physical* cores (8 on the dev box, 4 on the Xeons),
+  which is why the per-box tables in the README use different thread counts.
+  For the *engine* itself 8 threads is still defensible on the Xeons (it has
+  non-GEMM parallel work too): Emerald's decode-heavy run is 436 tok/s at 8
+  threads vs 411 at 4.
 - **Florence-2 image input** needs `Pillow` (approved dependency) for
   `AutoProcessor`. Use `florence-community/Florence-2-base` / `-large`; the
   `hf-tiny-v2/...` tiny checkpoint is inconsistent (config `image_token_id=4`

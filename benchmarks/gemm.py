@@ -6,7 +6,7 @@ per-step time: the decoder projects one token per sequence (batch 1-32) through
 and a large square GEMM gives a peak-ish reference.  ``torch.nn.functional.linear``
 with a bias is used because that is what the model calls (addmm).
 
-    PYTHONPATH=. python benchmarks/gemm.py                       # bf16, 8 threads
+    PYTHONPATH=. python benchmarks/gemm.py                       # bf16, physical cores
     PYTHONPATH=. python benchmarks/gemm.py --threads 4,8         # thread sweep
     PYTHONPATH=. python benchmarks/gemm.py --dtype float32
 """
@@ -57,7 +57,11 @@ def bench(m, n, k, dtype, iters: int, warmup: int = 3) -> float:
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--dtype", default="bfloat16", choices=["bfloat16", "float32"])
-    ap.add_argument("--threads", default="8", help="comma-separated thread counts")
+    ap.add_argument(
+        "--threads",
+        default="0",
+        help="comma-separated thread counts; 0 = torch default (physical cores)",
+    )
     ap.add_argument("--iters", type=int, default=50)
     args = ap.parse_args()
     dtype = getattr(torch, args.dtype)
@@ -73,7 +77,11 @@ def main():
     print(f"host: {cpu} ({platform.machine()})")
     print(f"torch {torch.__version__}, {args.dtype}, addmm with bias\n")
 
-    for threads in (int(t) for t in str(args.threads).split(",")):
+    default_threads = torch.get_num_threads()  # physical cores unless forced
+    counts = [
+        default_threads if int(t) == 0 else int(t) for t in str(args.threads).split(",")
+    ]
+    for threads in counts:
         torch.set_num_threads(threads)
         print(f"== threads={threads} ==")
         print(f"{'shape':<34} {'ms':>9} {'GFLOP/s':>9}")
