@@ -100,6 +100,7 @@ benchmarks/benchmark_florence2.py
 benchmarks/verify_parity.py
 benchmarks/throughput.py
 benchmarks/attn_backend.py
+benchmarks/gemm.py
 benchmarks/florence2_tasks.py
 benchmarks/profile_florence2.py
 tests/test_parity.py
@@ -251,6 +252,9 @@ PYTHONPATH=. $P benchmarks/attn_backend.py                    # kernel + end-to-
 PYTHONPATH=. $P benchmarks/attn_backend.py --mode kernel      # ops only, no weights
 PYTHONPATH=. $P benchmarks/attn_backend.py --mode e2e --device cuda
 
+# bf16 GEMM throughput at the engine's BART-large shapes (decode is GEMM-bound)
+PYTHONPATH=. $P benchmarks/gemm.py --threads 4,8
+
 # Florence-2 token/padding accounting (8 images x 4 tasks) and profiling
 PYTHONPATH=. $P benchmarks/florence2_tasks.py --device cuda [--no-cudagraph]
 PYTHONPATH=. $P benchmarks/profile_florence2.py --engine ours --device cuda [--no-cudagraph]
@@ -394,6 +398,17 @@ on this box with the same kind of workload.
   exhausted.
 - **BF16 vs FP32**: BF16 ≈ 2× on GEMM-heavy work via oneDNN; attention is
   FP32-accumulate in both.
+- **Box choice / threads** (`benchmarks/gemm.py`, bf16 addmm at the engine's
+  shapes).  The 4-core Xeons' AMX only pays on the large prefill GEMMs, and SMT
+  *hurts* it there: Emerald does 5455 GFLOP/s on `[2048x1024]x[1024x4096]` at 4
+  threads but 3051 at 8 (Granite 6263 -> 2737), while the 8-core boxes nearly
+  double.  At decode shapes (one token per sequence) the GEMMs are
+  memory/latency-bound, so AMX buys nothing and physical cores win: 8-thread
+  `[8x1024]x[1024x4096]` gives Ryzen 940, Graviton 754, Granite 520, Emerald 471
+  GFLOP/s — which is why the engine's decode benchmarks rank Graviton above the
+  Xeons.  That said, `--threads 8` is still right for the *engine* (it has
+  non-GEMM parallel work too): on Emerald the decode-heavy run is 436 tok/s at 8
+  threads vs 409 at 4.
 - **Florence-2 image input** needs `Pillow` (approved dependency) for
   `AutoProcessor`. Use `florence-community/Florence-2-base` / `-large`; the
   `hf-tiny-v2/...` tiny checkpoint is inconsistent (config `image_token_id=4`

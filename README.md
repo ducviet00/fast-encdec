@@ -455,6 +455,37 @@ clearly better than eager (503 vs 366 tok/s decode-heavy).  Graviton 5 and
 Emerald Rapids are the fastest boxes for the kernel; the Ryzen laptop wins the
 smallest case (ctx=256, 32 µs) on clock speed but falls behind at ctx=1024.
 
+### GEMM throughput
+
+`benchmarks/gemm.py` runs bf16 `addmm` (with bias) at the engine's BART-large
+shapes; GFLOP/s, best of 50.  The Xeons only have **4 physical cores** (8 vCPU
+with SMT), Graviton 5 and the Ryzen have 8, so the thread count matters:
+
+| shape (bf16) | Ryzen 7 7840H | Xeon 8581C | Xeon 6975P-C | Graviton 5 |
+|---|---:|---:|---:|---:|
+| **4 threads** | | | | |
+| decode batch=8: fc1 `[8x1024]x[1024x4096]` | 517 | 458 | 501 | 365 |
+| decode batch=32: fc1 `[32x1024]x[1024x4096]` | 911 | 1471 | 1615 | 609 |
+| prefill 2048: fc1 `[2048x1024]x[1024x4096]` | 1053 | 5455 | **6263** | 1154 |
+| square 4096³ | 1009 | 4988 | 4396 | 1047 |
+| **8 threads** | | | | |
+| decode batch=8: fc1 `[8x1024]x[1024x4096]` | **940** | 471 | 520 | 754 |
+| decode batch=32: fc1 `[32x1024]x[1024x4096]` | **1714** | 1360 | 1477 | 1552 |
+| prefill 2048: fc1 `[2048x1024]x[1024x4096]` | 1898 | 3051 | 2737 | 2165 |
+| square 4096³ | 1758 | 2782 | 2140 | 1966 |
+
+Two things explain the engine results above:
+
+- **AMX only pays on the large prefill GEMMs**, and SMT *hurts* it there: the
+  Emerald Xeon does 5455 GFLOP/s at 4 threads but only 3051 at 8 (Granite 6263 →
+  2737), while the 8-core boxes nearly double.  That is why the Xeons look
+  competitive on the `enc=256` rows but not on decode.
+- **At decode shapes (one token per sequence) the GEMMs are memory/latency-bound**,
+  so AMX buys nothing and physical cores win: the Ryzen laptop leads at 8 threads,
+  then Graviton 5, then the Xeons — which is exactly the engine's decode ranking.
+  The Xeons gain ~nothing from 4→8 threads (4 physical cores) whereas the 8-core
+  boxes gain 1.7–1.9×.
+
 ### Florence-2 (`florence-community/Florence-2-base`)
 
 Mixed `<CAPTION>` / `<OD>` / `<REFERRING_EXPRESSION_SEGMENTATION>the car` on a
