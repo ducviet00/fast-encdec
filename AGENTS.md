@@ -513,11 +513,6 @@ on this box with the same kind of workload.
   learned positional embeddings. Those per-layer pointwise ops are the
   multi-kernel kind `torch.compile` collapses, so re-measure `compile_model`
   there (see the gotcha) — BART has nothing to fuse, T5 does.
-- A **gated** MLP (T5 v1.1's `T5DenseGatedActDense`, or any gate/up pair) would
-  halve its GEMMs exactly like the q/k/v fusion: give the MLP module
-  `fused_projections = {"gate_up_proj": ("gate_proj", "up_proj")}` and split the
-  output — the loader already handles the concatenation.  BART and the DaViT
-  tower have no gate (`fc2(gelu(fc1(x)))`), so there is nothing to fuse today.
 
 ## 9. Style
 

@@ -17,8 +17,8 @@ def fuse_projections(model, state_dict: dict) -> None:
     """Stack the HuggingFace parts of every fused projection into its target.
 
     A module may hold one fused projection where HF has several parallel ones:
-    ``q_proj``/``k_proj``/``v_proj`` -> ``qkv_proj``, or a gated MLP's
-    ``gate_proj``/``up_proj`` -> ``gate_up_proj``.  The module declares it as
+    ``q_proj``/``k_proj``/``v_proj`` -> ``qkv_proj`` (or ``k_proj``/``v_proj`` ->
+    ``kv_proj``).  The module declares it as
     ``fused_projections = {target: (source, ...)}`` and the parts are
     concatenated along the output dimension, so the name match in
     :func:`load_hf_weights` still finds a target for every checkpoint tensor.
