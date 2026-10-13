@@ -140,7 +140,8 @@ fragments on the flash attention calls). It fuses cleanly (~7% fewer kernels,
 0 graph breaks) but is worth **~0 on GPU time** here, because BART's
 `native_layer_norm`/gelu are already single fused kernels and decode is bound by
 FlashAttention + GEMMs. It is off by default; nano-vllm gains 1.22× from the
-same trick because Qwen3 is full of RMSNorm / gated MLP / rotary ops to fuse.
+same trick because Qwen3 is full of RMSNorm / gated MLP / rotary ops to fuse, and
+a T5 model here (RMS norm + gated FFN) would have the same kind of ops.
 
 ### Generation heuristics
 

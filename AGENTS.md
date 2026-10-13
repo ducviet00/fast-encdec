@@ -440,8 +440,9 @@ on this box with the same kind of workload.
   `RMSNorm.rms_forward` / `add_rms_forward`, `SiluAndMul.forward`,
   `RotaryEmbedding.forward` and `Sampler.forward` — each of which Dynamo turns
   into one fused kernel (0 graph breaks). Measured on the L4 by patching the
-  decorators out, that is worth **1.22x** for Qwen3-0.6B, on top of either mode
-  (eager 892 → 1092 tok/s, with the CUDA graph 1760 → 2144). Our flag ports the
+  decorators out (n=64, out=64, eager): 119876 → 26116 kernel launches (**−78%**),
+  2334 → 1743 ms CUDA, and it is worth **1.22x** on top of either mode (eager
+  892 → 1092 tok/s, with their CUDA graph 1760 → 2144). Our flag ports the
   same idea at BART's granularity: `models/bart.py` compiles `_add_layer_norm`
   (residual add + layer norm) and `_activation_linear` (gelu + fc1), the only
   pointwise sequences a layer has. Wrapping the whole `decoder` instead
@@ -452,7 +453,14 @@ on this box with the same kind of workload.
   add and gelu are already single fused aten kernels, and decode is bound by
   `flash_fwd_splitkv_kernel` (~1/3) + GEMMs. Eager 3911 → 3195 tok/s at n=64
   (Dynamo's per-call wrapper across ~48 calls/step), with the graph 3925 → 3902.
-  Off by default — BART has no RMSNorm / gated MLP / rotary to fuse. Two changes
+  Off by default — BART has no RMSNorm / gated MLP / rotary to fuse (ours saves
+  7% of launches, 16161 → 14985, for ~0 GPU time). **Revisit it when a T5 model
+  lands:** T5 is `T5LayerNorm` (RMS) + a relative-position bias + a gated FFN
+  (`T5DenseGatedActDense`, T5 v1.1), i.e. the same hand-written multi-kernel
+  elementwise chains (6-8 kernels each) that inductor collapses into one — the
+  reason nano-vllm gets 1.22x. Wire `_add_layer_norm`/`_activation_linear`
+  equivalents (or new helpers) for the T5 layers and re-measure; keep the
+  plumbing until then. Two changes
   made while getting there are kept: `flash_attn.module()` is a resolved-once
   global rather than `functools.lru_cache` (Dynamo inlines an `lru_cache` body and
   would trace the Hub download), and the flash self-attention path reads the
@@ -485,6 +493,15 @@ on this box with the same kind of workload.
   intentional for simplicity).
 - Attention is a Python per-sequence loop; a batched SDPA path could help
   large batches.
+- **T5** (encoder-decoder like BART, so the paged cache + continuous batching
+  carry over): `T5LayerNorm` is RMS-without-mean, T5 v1.1 has a gated FFN
+  (`T5DenseGatedActDense`) and T5 uses a relative-position bias instead of
+  learned positional embeddings. Those per-layer pointwise ops are the
+  multi-kernel kind `torch.compile` collapses, so re-measure `compile_model`
+  there (see the gotcha) — BART has nothing to fuse, T5 does.
+- Merge the decoder q/k/v projections into one GEMM (nano-vllm's
+  `QKVParallelLinear`): GEMMs are ~40% of GPU decode time, and BART's HF layout
+  does three separate `Linear`s where vLLM does one.
 
 ## 9. Style
 
