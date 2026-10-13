@@ -9,12 +9,15 @@ only swaps the attention kernels:
   :class:`~fastencdec.utils.context.Context`,
 * decoder cross-attention uses encoder K/V cached per request on the layer.
 
-Everything else (projections, LayerNorms, embeddings, residual layout, the
-``+2`` positional-embedding offset and the logits bias) is unchanged so the
-HuggingFace weights load 1:1.
+Everything else (LayerNorms, embeddings, residual layout, the ``+2``
+positional-embedding offset and the logits bias) is unchanged so the
+HuggingFace weights load 1:1.  The one deviation is the fused attention
+projections (``qkv_proj`` / ``kv_proj``): one GEMM instead of the reference's
+separate q/k/v ones, which ``utils/loader`` builds from the HF parts.
 """
 
 import math
+from typing import ClassVar
 
 import torch
 import torch.nn.functional as F
@@ -93,6 +96,14 @@ class BartScaledWordEmbedding(nn.Embedding):
 class BartEncoderSelfAttention(nn.Module):
     """Non-causal multi-head self-attention for the encoder (no cache)."""
 
+    # One ``[D -> 3D]`` GEMM instead of three ``[D -> D]`` ones.  The small
+    # per-projection GEMMs are launch-bound, so fusing q/k/v is ~3x faster at
+    # decode shapes (~parity for the encoder's wide GEMMs); ``utils/loader``
+    # concatenates HuggingFace's q/k/v_proj into it, so weights still load 1:1.
+    fused_projections: ClassVar[dict[str, tuple[str, ...]]] = {
+        "qkv_proj": ("q_proj", "k_proj", "v_proj")
+    }
+
     def __init__(
         self,
         embed_dim: int,
@@ -109,21 +120,20 @@ class BartEncoderSelfAttention(nn.Module):
             raise ValueError("embed_dim must be divisible by num_heads")
         self.scaling = self.head_dim**-0.5
 
-        self.k_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
-        self.v_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
-        self.q_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
+        self.qkv_proj = nn.Linear(embed_dim, 3 * embed_dim, bias=bias)
         self.out_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         # hidden_states: [batch, seq, dim] -> [batch, heads, seq, head_dim]
         shape = (*hidden_states.shape[:-1], -1, self.head_dim)
+        query, key, value = self.qkv_proj(hidden_states).chunk(3, dim=-1)
         # ``.contiguous()`` matters: on aarch64, SDPA with BF16 *non-contiguous*
         # (transposed) inputs falls into a path ~20x slower than the contiguous
         # one (Graviton: 86 ms vs 4 ms for a BART-large encoder block), while x86
         # is unaffected.  The copy is negligible next to the attention.
-        query = self.q_proj(hidden_states).view(shape).transpose(1, 2).contiguous()
-        key = self.k_proj(hidden_states).view(shape).transpose(1, 2).contiguous()
-        value = self.v_proj(hidden_states).view(shape).transpose(1, 2).contiguous()
+        query = query.reshape(shape).transpose(1, 2).contiguous()
+        key = key.reshape(shape).transpose(1, 2).contiguous()
+        value = value.reshape(shape).transpose(1, 2).contiguous()
         out = encoder_self_attention(query, key, value)
         out = out.transpose(1, 2).reshape(*hidden_states.shape[:-1], -1).contiguous()
         return self.out_proj(out)
@@ -132,6 +142,10 @@ class BartEncoderSelfAttention(nn.Module):
 class BartDecoderSelfAttention(nn.Module):
     """Causal multi-head self-attention backed by the paged KV cache."""
 
+    fused_projections: ClassVar[dict[str, tuple[str, ...]]] = {
+        "qkv_proj": ("q_proj", "k_proj", "v_proj")
+    }
+
     def __init__(
         self,
         embed_dim: int,
@@ -148,9 +162,7 @@ class BartDecoderSelfAttention(nn.Module):
             raise ValueError("embed_dim must be divisible by num_heads")
         self.scaling = self.head_dim**-0.5
 
-        self.k_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
-        self.v_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
-        self.q_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
+        self.qkv_proj = nn.Linear(embed_dim, 3 * embed_dim, bias=bias)
         self.out_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
 
         # Assigned by the model runner: [num_blocks, heads, block_size, head_dim]
@@ -163,9 +175,10 @@ class BartDecoderSelfAttention(nn.Module):
         num_tokens = hidden_states.shape[0]
         head = (num_tokens, self.num_heads, self.head_dim)
 
-        query = self.q_proj(hidden_states).view(head)
-        key = self.k_proj(hidden_states).view(head)
-        value = self.v_proj(hidden_states).view(head)
+        query, key, value = self.qkv_proj(hidden_states).chunk(3, dim=-1)
+        query = query.reshape(head)
+        key = key.reshape(head)
+        value = value.reshape(head)
 
         out = decoder_self_attention(
             query, key, value, self.k_cache, self.v_cache, self.scaling, self.block_size
@@ -175,6 +188,12 @@ class BartDecoderSelfAttention(nn.Module):
 
 class BartDecoderCrossAttention(nn.Module):
     """Cross-attention using encoder K/V cached once per request."""
+
+    # K and V are both projected from the encoder output, so they share one GEMM
+    # (``_encode``); Q comes from the decoder state and stays separate.
+    fused_projections: ClassVar[dict[str, tuple[str, ...]]] = {
+        "kv_proj": ("k_proj", "v_proj")
+    }
 
     def __init__(
         self,
@@ -192,8 +211,7 @@ class BartDecoderCrossAttention(nn.Module):
             raise ValueError("embed_dim must be divisible by num_heads")
         self.scaling = self.head_dim**-0.5
 
-        self.k_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
-        self.v_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
+        self.kv_proj = nn.Linear(embed_dim, 2 * embed_dim, bias=bias)
         self.q_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
         self.out_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
 

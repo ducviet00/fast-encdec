@@ -99,8 +99,9 @@ class ModelRunner:
             for layer in self.decoder_layers:
                 attn = layer.encoder_attn
                 head = (len(group), ids.shape[1], attn.num_heads, attn.head_dim)
-                key = attn.k_proj(hidden).view(head)
-                value = attn.v_proj(hidden).view(head)
+                key, value = attn.kv_proj(hidden).chunk(2, dim=-1)
+                key = key.reshape(head)
+                value = value.reshape(head)
                 for j, seq in enumerate(group):
                     attn.encoder_kv_cache[seq.request_id] = (
                         key[j].transpose(0, 1).contiguous(),

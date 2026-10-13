@@ -241,7 +241,12 @@ The model calls three device-agnostic ops (`layers/attention.py`):
 `encoder_self_attention` (dense, once per request), `decoder_self_attention`
 (paged, growing cache) and `decoder_cross_attention`. Each op picks its kernel
 from the tensor device, dtype and head dim — FlashAttention-2 on CUDA, the
-vendored vLLM CPU kernel, or PyTorch SDPA. Decoder self-attention is paged;
+vendored vLLM CPU kernel, or PyTorch SDPA. Each self-attention projects q, k and
+v with **one `[dim -> 3*dim]` GEMM** (`qkv_proj`) instead of three small ones —
+at decode shapes those are launch-bound, so fusing them is ~3× faster there —
+and cross-attention shares a `kv_proj` for its key/value. `utils/loader`
+concatenates the HuggingFace `q_proj`/`k_proj`/`v_proj` weights into the fused
+projections, so the checkpoint still loads 1:1. Decoder self-attention is paged;
 **cross-attention is dense**: each decoder layer keeps
 `encoder_kv_cache[request_id] -> (k, v)` of shape `[heads, enc_len, dim]`,
 computed once per request and shared by all of its beams. The paged kernels
@@ -399,20 +404,20 @@ competitive:
 
 | sweep (BART, bf16, enc=256) | config | speedup vs HF |
 |---|---|---:|
-| batch, beams=1 | batch=1 / 2 / 4 / 8 | 1.04× / 1.03× / 1.05× / 1.00× |
-| batch, beams=4 | batch=1 / 2 / 4 / 8 | 1.17× / 1.11× / 0.98× / 0.84× |
-| beams, batch=8 | beams=1 / 4 | 0.99× / 0.83× |
-| dtype, batch=8, beams=4 | bf16 / fp32 | 0.83× / 0.56× |
+| batch, beams=1 | batch=1 / 2 / 4 / 8 | 1.08× / 1.10× / 1.05× / 1.04× |
+| batch, beams=4 | batch=1 / 2 / 4 / 8 | 1.22× / 1.14× / 1.04× / 0.86× |
+| beams, batch=8 | beams=1 / 4 | 1.07× / 0.85× |
+| dtype, batch=8, beams=4 | bf16 / fp32 | 0.85× / 0.57× |
 
 | sweep (Florence-2, bf16) | config | speedup vs HF |
 |---|---|---:|
-| greedy | batch=3 / 6 | 1.23× / 1.24× |
-| beam (batch=3) | beams=1 / 3 | 1.23× / 1.14× |
-| continuous (N=6) | window=3 / 6 | 0.99× / 1.28× |
+| greedy | batch=3 / 6 | 1.27× / 1.27× |
+| beam (batch=3) | beams=1 / 3 | 1.27× / 1.21× |
+| continuous (N=6) | window=3 / 6 | 1.03× / 1.32× |
 
 Decode throughput (`benchmarks/throughput.py`, `bart-large-cnn`, bf16, enc=512,
-EOS suppressed) is **2543 → 4518 tok/s** as the batch grows 32 → 128, and
-**3224 tok/s at batch 32 with `--use-cudagraph`** (1.27× the eager run).  At
+EOS suppressed) is **2673 → 4509 tok/s** as the batch grows 32 → 128, and
+**3237 tok/s at batch 32 with `--use-cudagraph`** (1.21× the eager run).  At
 batch ≥ 32 the decode is GPU-bound re-reading the KV cache each step, so the
 graph only buys small-batch latency.
 

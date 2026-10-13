@@ -19,7 +19,9 @@ encoder-decoder decoding:
   self-attention) run on **FlashAttention-2**.
 
 The model (`fastencdec/models/bart.py`) is a near-verbatim copy of the
-HuggingFace BART reference; only the attention kernels differ.
+HuggingFace BART reference; the attention kernels differ, and the attention
+q/k/v projections are fused into one GEMM (`utils/loader` concatenates the HF
+parts — see the gotchas).
 
 **Florence-2** (`fastencdec/models/florence2.py`) reuses that paged BART as its
 language model and pairs it with the DaViT vision encoder
@@ -89,7 +91,7 @@ fastencdec/
     florence2.py       Florence-2 (vendored DaViT + projector + BART LM)
   utils/
     context.py         device-agnostic per-step Context read by the attention ops
-    loader.py          HF checkpoint -> model weight loading
+    loader.py          HF checkpoint -> model weights (concatenates fused q/k/v)
 csrc/                  vendored vLLM CPU attention kernels (+ bindings.cpp)
 examples/summarize.py
 examples/florence2.py
@@ -261,20 +263,20 @@ never hand-edit or guess.**
 
 | sweep (bf16, enc=256 unless noted) | config | ours ms | speedup vs HF |
 |---|---|---:|---:|
-| batch, beams=1 | batch=1 | 1074 | 1.08x |
-| batch, beams=1 | batch=2 | 1020 | 1.23x |
-| batch, beams=1 | batch=4 | 1202 | 1.21x |
-| batch, beams=1 | batch=8 | 1530 | 1.26x |
-| batch, beams=4 | batch=1 | 1070 | 1.44x |
-| batch, beams=4 | batch=2 | 1279 | 1.54x |
-| batch, beams=4 | batch=4 | 1578 | 1.90x |
-| batch, beams=4 | batch=8 | 2245 | 2.31x |
-| beams, batch=8 | beams=1 | 1522 | 1.27x |
-| beams, batch=8 | beams=4 | 2242 | 2.32x |
-| dtype, batch=8, beams=4 | float32 | 6010 | 2.29x |
-| dtype, batch=8, beams=4 | bfloat16 | 2257 | 2.28x |
-| enc length, batch=8, beams=1 | enc=128 | 1381 | 1.11x |
-| enc length, batch=8, beams=1 | enc=256 | 1552 | 1.25x |
+| batch, beams=1 | batch=1 | 1057 | 1.10x |
+| batch, beams=1 | batch=2 | 1028 | 1.26x |
+| batch, beams=1 | batch=4 | 1176 | 1.29x |
+| batch, beams=1 | batch=8 | 1581 | 1.23x |
+| batch, beams=4 | batch=1 | 1122 | 1.39x |
+| batch, beams=4 | batch=2 | 1246 | 1.60x |
+| batch, beams=4 | batch=4 | 1580 | 1.88x |
+| batch, beams=4 | batch=8 | 2223 | 2.31x |
+| beams, batch=8 | beams=1 | 1542 | 1.27x |
+| beams, batch=8 | beams=4 | 2208 | 2.34x |
+| dtype, batch=8, beams=4 | float32 | 6246 | 2.22x |
+| dtype, batch=8, beams=4 | bfloat16 | 2188 | 2.35x |
+| enc length, batch=8, beams=1 | enc=128 | 1215 | 1.29x |
+| enc length, batch=8, beams=1 | enc=256 | 1541 | 1.28x |
 
 Snapshot of `PYTHONPATH=. $P benchmarks/benchmark_florence2.py --quick`
 (`florence-community/Florence-2-base`, bf16 for both engines, 8 threads,
@@ -283,12 +285,12 @@ projector on `torch.compile`, the new default). Refresh from a real run.
 
 | sweep (bf16) | config | ours ms | speedup vs HF |
 |---|---|---:|---:|
-| greedy batch | batch=3 | 1920 | 1.32x |
-| greedy batch | batch=6 | 3099 | 1.41x |
-| beam (batch=3) | beams=1 | 1719 | 1.26x |
-| beam (batch=3) | beams=3 | 1888 | 1.56x |
-| continuous (N=6) | w=3 | 3442 | 1.30x |
-| continuous (N=6) | w=6 | 3105 | 1.44x |
+| greedy batch | batch=3 | 1882 | 1.32x |
+| greedy batch | batch=6 | 3063 | 1.44x |
+| beam (batch=3) | beams=1 | 1675 | 1.28x |
+| beam (batch=3) | beams=3 | 1838 | 1.60x |
+| continuous (N=6) | w=3 | 3367 | 1.32x |
+| continuous (N=6) | w=6 | 3050 | 1.46x |
 
 Snapshot of `PYTHONPATH=. $P benchmarks/benchmark.py --quick --device cuda` on
 the L4 box (`bart-large-cnn`, bf16 for both engines unless noted, flash backend,
@@ -296,20 +298,20 @@ the L4 box (`bart-large-cnn`, bf16 for both engines unless noted, flash backend,
 
 | sweep (bf16, enc=256 unless noted) | config | ours ms | speedup vs HF |
 |---|---|---:|---:|
-| batch, beams=1 | batch=1 | 510 | 1.04x |
-| batch, beams=1 | batch=2 | 539 | 1.03x |
-| batch, beams=1 | batch=4 | 530 | 1.05x |
-| batch, beams=1 | batch=8 | 554 | 1.00x |
-| batch, beams=4 | batch=1 | 546 | 1.17x |
-| batch, beams=4 | batch=2 | 598 | 1.11x |
-| batch, beams=4 | batch=4 | 722 | 0.98x |
-| batch, beams=4 | batch=8 | 959 | 0.84x |
-| beams, batch=8 | beams=1 | 569 | 0.99x |
-| beams, batch=8 | beams=4 | 953 | 0.83x |
-| dtype, batch=8, beams=4 | float32 | 2034 | 0.56x |
-| dtype, batch=8, beams=4 | bfloat16 | 952 | 0.83x |
-| enc length, batch=8, beams=1 | enc=128 | 551 | 1.00x |
-| enc length, batch=8, beams=1 | enc=256 | 558 | 1.00x |
+| batch, beams=1 | batch=1 | 491 | 1.08x |
+| batch, beams=1 | batch=2 | 511 | 1.10x |
+| batch, beams=1 | batch=4 | 521 | 1.05x |
+| batch, beams=1 | batch=8 | 533 | 1.04x |
+| batch, beams=4 | batch=1 | 532 | 1.22x |
+| batch, beams=4 | batch=2 | 589 | 1.14x |
+| batch, beams=4 | batch=4 | 695 | 1.04x |
+| batch, beams=4 | batch=8 | 945 | 0.86x |
+| beams, batch=8 | beams=1 | 541 | 1.07x |
+| beams, batch=8 | beams=4 | 935 | 0.85x |
+| dtype, batch=8, beams=4 | float32 | 2009 | 0.57x |
+| dtype, batch=8, beams=4 | bfloat16 | 944 | 0.85x |
+| enc length, batch=8, beams=1 | enc=128 | 539 | 1.02x |
+| enc length, batch=8, beams=1 | enc=256 | 549 | 1.02x |
 
 Snapshot of `PYTHONPATH=. $P benchmarks/benchmark_florence2.py --quick
 --device cuda` (`Florence-2-base`, bf16 for both engines, image 640×480 → 768px,
@@ -317,12 +319,12 @@ vision tower compiled, `num_blocks=256`, `block_size=256`).
 
 | sweep (bf16) | config | ours ms | speedup vs HF |
 |---|---|---:|---:|
-| greedy batch | batch=3 | 620 | 1.23x |
-| greedy batch | batch=6 | 692 | 1.24x |
-| beam (batch=3) | beams=1 | 438 | 1.23x |
-| beam (batch=3) | beams=3 | 581 | 1.14x |
-| continuous (N=6) | w=3 | 876 | 0.99x |
-| continuous (N=6) | w=6 | 682 | 1.28x |
+| greedy batch | batch=3 | 617 | 1.27x |
+| greedy batch | batch=6 | 688 | 1.27x |
+| beam (batch=3) | beams=1 | 422 | 1.27x |
+| beam (batch=3) | beams=3 | 561 | 1.21x |
+| continuous (N=6) | w=3 | 838 | 1.03x |
+| continuous (N=6) | w=6 | 655 | 1.32x |
 
 On GPU the engine matches HF on greedy BART and leads on Florence-2; it trails on
 beam search (the paged cache writes new K/V separately where HF's cache append is
@@ -335,10 +337,10 @@ captures the decode step):
 
 | requests | max_tokens | eager tok/s | cudagraph tok/s |
 |---|---:|---:|---:|
-| 32 | 256 | 2543 | 3224 |
-| 64 | 256 | 3945 | 3926 |
-| 128 | 256 | 4518 | 4482 |
-| 128 | 512 | 4346 | 4379 |
+| 32 | 256 | 2673 | 3237 |
+| 64 | 256 | 3981 | 3978 |
+| 128 | 256 | 4509 | 4507 |
+| 128 | 512 | 4388 | 4407 |
 
 At batch ≥ 32 the decode is GPU-bound and re-reads the KV cache every step
 (`flash_fwd_splitkv_kernel` is ~2/3 of the CUDA time), so eager and the CUDA
@@ -360,9 +362,9 @@ on this box with the same kind of workload.
   suppressed via `min_length=max_tokens+1` / HF `min_new_tokens`). Same
   precision, the engine now leads both greedy and beam search on the vendored
   kernel (see the baseline table). `benchmarks/verify_parity.py` confirms the
-  fairness directly: fp32 is token-for-token identical to HF, bf16 matches the
-  output length (occasional single-step token differences come from the
-  different attention kernels).
+  fairness directly: fp32 is token-for-token identical to HF, and bf16 keeps the
+  output length with occasional single-step token differences from the different
+  attention kernels (the same 12/12 pattern before and after the q/k/v fusion).
 - **Comparing to HF.** To get a clean reference, disable the checkpoint's
   generation config (`forced_bos_token_id=None`, `forced_eos_token_id=None`,
   `min_length=0`, `no_repeat_ngram_size=0`, `length_penalty=1.0`,
@@ -465,6 +467,18 @@ on this box with the same kind of workload.
   global rather than `functools.lru_cache` (Dynamo inlines an `lru_cache` body and
   would trace the Hub download), and the flash self-attention path reads the
   Context directly instead of the per-step memo.
+- **Fused q/k/v projections.** Each self-attention holds one `qkv_proj`
+  (`[D -> 3D]`) where HF has `q_proj`/`k_proj`/`v_proj`, and cross-attention
+  holds `kv_proj` + `q_proj` (K and V are both projected from the encoder
+  output, so they share a GEMM). Three small `[D -> D]` GEMMs are launch-bound,
+  so one `[D -> 3D]` GEMM is ~3x faster at decode shapes (B=64 on the L4:
+  57 → 18 us) and at parity for the encoder's wide GEMMs (B=16384: 1.01x).
+  `utils/loader` stacks the HF parts before its name match, driven by each
+  module's `fused_projections` class attribute, so the loader stays
+  model-agnostic. Measured effect: ~5% fewer kernel launches per step
+  (16161 → 15357 at n=32/out=32) and +1-2% wall at batch 8-64, but ~0 at
+  batch ≥ 128 where decode is GPU-bound. fp32 output stays token-for-token
+  identical to HF (`verify_parity.py`).
 - **BF16 SDPA needs contiguous inputs on aarch64.** PyTorch's CPU SDPA with BF16
   *non-contiguous* (transposed) inputs takes a path ~20x slower than the
   contiguous one (Graviton: 86 ms vs 4 ms for a BART-large encoder block); x86
@@ -499,9 +513,11 @@ on this box with the same kind of workload.
   learned positional embeddings. Those per-layer pointwise ops are the
   multi-kernel kind `torch.compile` collapses, so re-measure `compile_model`
   there (see the gotcha) — BART has nothing to fuse, T5 does.
-- Merge the decoder q/k/v projections into one GEMM (nano-vllm's
-  `QKVParallelLinear`): GEMMs are ~40% of GPU decode time, and BART's HF layout
-  does three separate `Linear`s where vLLM does one.
+- A **gated** MLP (T5 v1.1's `T5DenseGatedActDense`, or any gate/up pair) would
+  halve its GEMMs exactly like the q/k/v fusion: give the MLP module
+  `fused_projections = {"gate_up_proj": ("gate_proj", "up_proj")}` and split the
+  output — the loader already handles the concatenation.  BART and the DaViT
+  tower have no gate (`fc2(gelu(fc1(x)))`), so there is nothing to fuse today.
 
 ## 9. Style
 
