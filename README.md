@@ -5,7 +5,7 @@ A small, readable inference engine for **BART** and **Florence-2**, in the spiri
 
 ## Key Features
 
-* 🚀 **Fast offline inference** - 1.1-3.5x faster than `transformers.generate` on CPU, 2.4-3.4x on a GPU
+* 🚀 **Fast offline inference** - up to 3.5x faster than `transformers.generate` on CPU and 3.4x on a GPU (beam search wins most; greedy on CPU is 0.9-2.0x)
 * 📖 **Readable codebase** - paged KV cache, continuous batching and beam search in plain PyTorch
 * 🧩 **Two models, one engine** - BART for summarisation, Florence-2 for vision-language tasks
 * ⚡ **CPU and CUDA** - vendored vLLM CPU attention kernel; FlashAttention-2 and a CUDA graph on GPU

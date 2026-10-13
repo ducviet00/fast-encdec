@@ -282,7 +282,9 @@ pick slightly different hypotheses, which the script reports instead of
 failing.
 
 The README carries the full three-point matrix (`128->512`, `512->128`,
-`256->256`) for the four server boxes.  Its shape is worth knowing when reading it: on
+`256->256`) for the four server boxes.  Those numbers are the mean of two
+independent runs per box, and each run writes its raw results with `--json`,
+so every cell can be re-derived from the JSON instead of trusted.  Its shape is worth knowing when reading it: on
 CPU beam search is the big win (the paged cache shares blocks where HF reorders
 a full beam cache) and greedy is a modest 1.05-1.3x; on CUDA the decode CUDA
 graph is what makes greedy competitive (2.4-3.3x, where eager was ~1.05x) while
