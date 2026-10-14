@@ -101,6 +101,7 @@ fastencdec/
     cpu_attn.py        JIT build + wrapper for the vendored vLLM CPU kernels
     flash_attn.py      lazy loader for the kernels-community/flash-attn2 kernel (CUDA)
     logits_processor.py transformers LogitsProcessorList from SamplingParams
+    packed_linear.py   oneDNN blocked-weight CPU linears (packed once at load)
     sampler.py         greedy / multinomial sampling (Sampler nn.Module)
   models/
     bart.py            BART model (encoder / decoder / cross-attn)
@@ -123,6 +124,7 @@ tests/test_parity.py
 tests/test_attn_backend.py
 tests/test_florence2.py
 tests/test_beam.py
+tests/test_packed_linear.py
 tests/test_gpu_flash.py
 ```
 
@@ -299,14 +301,18 @@ hand-edit or guess.**
 
 | config | ours ms | ours tok/s | hf ms | hf tok/s | speedup |
 |---|---:|---:|---:|---:|---:|
-| batch=1, beams=1, bf16 | 4937 | 51.9 | 6067 | 42.2 | 1.23x |
-| batch=8, beams=1, bf16 | 6046 | 337.9 | 9041 | 226.6 | 1.49x |
-| batch=8, beams=4, bf16 | 9411 | 217.5 | 31479 | 65.1 | 3.34x |
-| batch=8, beams=1, fp32 | 23682 | 86.5 | 24514 | 83.6 | 1.04x |
+| batch=1, beams=1, bf16 | 3709 | 69.0 | 6051 | 42.3 | 1.63x |
+| batch=8, beams=1, bf16 | 5266 | 388.9 | 8957 | 228.6 | 1.70x |
+| batch=8, beams=4, bf16 | 8063 | 254.0 | 30818 | 66.5 | 3.82x |
+| batch=8, beams=1, fp32 | 9006 | 227.4 | 24561 | 83.4 | 2.73x |
 
-Mean of four runs (the batch=8 rows agree within 1%; the latency-bound batch=1
-row varies ~5% with this laptop's clock — this recording ranged 4372-5178 ms, so
-its 1.23x is the least reliable cell).  This recording is at the x86 default
+One run, with the `pack_weights` prepack on (see the gotcha).  Re-running the same
+script with packing disabled in the same session read 5428 / 6153 / 9340 / 23814
+ms (1.12x / 1.46x / 3.37x / 1.03x), so the prepack is worth 1.46x / 1.17x /
+1.16x / **2.64x** here — it is the whole of the fp32 row, where eager
+BART-large only ties HF.  The latency-bound batch=1 row varies ~5% with this
+laptop's clock, so its 1.63x is the least reliable cell.  This recording is at
+the x86 default
 `block_size=32`; at the previous 16 it read 1.16x / 1.49x / 3.44x / 1.03x — that
 page size is the greedy-vs-beam trade-off in the gotcha below.  Absolute times
 are only comparable within one recording: the box ran ~20% slower here than when
@@ -396,6 +402,16 @@ on this box with the same kind of workload.
   exhausted.
 - **BF16 vs FP32**: BF16 ≈ 2× on GEMM-heavy work via oneDNN; attention is
   FP32-accumulate in both.
+- **CPU packed linears (`pack_weights`, on by default).** At load, every CPU
+  `nn.Linear` weight is rewritten once with
+  `torch.ops.mkldnn._reorder_linear_weight` and run through
+  `torch.ops.mkldnn._linear_pointwise` — oneDNN on x86, oneDNN-ACL on aarch64,
+  the same pair Inductor's weight-prepack pass emits.  That removes the per-call
+  weight reorder `F.linear` pays and is worth ~1.3x (Xeon Emerald) / ~1.55x
+  (Graviton Neoverse-V3) end-to-end at `256->256, batch=8`; decode is the
+  bandwidth-bound part, so the encoder and the fp32 rows gain less.  It is always
+  on for CPU and logs the count; a host without the ops keeps `F.linear`.  The
+  original `weight` is kept, so weight memory doubles.
 - **Box choice / threads** (`benchmarks/gemm.py`, bf16 addmm at the engine's
   shapes).  The 4-core Xeons' AMX only pays on the large prefill GEMMs, and SMT
   *hurts* it there: Emerald does 5455 GFLOP/s on `[2048x1024]x[1024x4096]` at 4
@@ -595,7 +611,8 @@ on this box with the same kind of workload.
   `transformers` reference.)
 - After changes: run `python -m compileall fastencdec`,
   `tests/test_parity.py`, `tests/test_attn_backend.py`,
-  `tests/test_florence2.py`, `tests/test_beam.py`, `uvx ruff check` /
+  `tests/test_florence2.py`, `tests/test_beam.py`,
+  `tests/test_packed_linear.py`, `uvx ruff check` /
   `uvx ruff format --check`, and `benchmarks/benchmark.py --scenarios '256->256'`.
 - Every commit must update the "Benchmark baseline" table above with the real
   numbers from that run (no stale or estimated values).  The full three-point
