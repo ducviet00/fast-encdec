@@ -55,11 +55,11 @@ def gen():
     return [o.outputs[0].token_ids for o in out]
 
 
-orig = LLMEngine._batch_can_pipeline
+orig = LLMEngine._pipeline_mode
 pipe_ms, pipe_tokens = timed(gen)
-LLMEngine._batch_can_pipeline = lambda self: False  # force the synchronous loop
+LLMEngine._pipeline_mode = lambda self: None  # force the synchronous loop
 sync_ms, sync_tokens = timed(gen)
-LLMEngine._batch_can_pipeline = orig
+LLMEngine._pipeline_mode = orig
 
 n = 8 * OUT
 print(f"256->{OUT}  batch=8  bf16  greedy+ngram=3")

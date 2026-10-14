@@ -16,7 +16,7 @@ tok = AutoTokenizer.from_pretrained(bv.MODEL)
 prompt = bv.make_prompt(tok, 256)
 llm = LLM(
     bv.MODEL,
-    num_blocks=2048,
+    num_blocks=256,
     block_size=256,
     max_num_seqs=32,
     dtype=torch.bfloat16,
