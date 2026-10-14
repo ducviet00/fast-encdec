@@ -551,6 +551,38 @@ on this box with the same kind of workload.
   global rather than `functools.lru_cache` (Dynamo inlines an `lru_cache` body and
   would trace the Hub download), and the flash self-attention path reads the
   Context directly instead of the per-step memo.
+- **`torch.compile` + graph freezing on CPU.** The Inductor weight-prepack
+  recipe (`torch._inductor.config.cpp.weight_prepack = True`,
+  `config.freezing = True`, then `torch.compile(model)`) does work, but only on
+  models that are pure torch: on a plain `Linear+GELU+Linear` it emits
+  `mkldnn::_linear_pointwise` and gives 1.48x (bf16) / 2.28x (fp32) on the Xeon
+  and 1.67x / 1.97x on Graviton.  Two traps sit in front of it: freezing only
+  happens when `not torch.is_grad_enabled()`, so the forward must be under
+  `torch.no_grad()` (`torch/_inductor/compile_fx.py`), and `recompile_limit`
+  (default 8) is below the 12 decoder layers, which silently drops back to
+  eager.  It does not pay off on this engine: the attention is a pybind op that
+  also reads the module-level `Context`, so Dynamo graph-breaks there — its own
+  remedy is "wrap the custom kernel into an opaque custom op" — and the ~84
+  subgraphs per step cost more than the packing buys (`256->256, batch=8`: eager
+  6700 ms, compile without freezing 7490, compile + freezing 6950, manual
+  prepack 5150).  `torch._dynamo.allow_in_graph` is not enough either: Dynamo
+  still calls the wrapped function on fake tensors, which the kernel cannot run.
+  Registering the attention as a `torch.library.custom_op` with
+  `register_fake` *does* work — the whole decoder then compiles into one graph
+  and lands within 2-14% of the manual prepack (5250 ms Xeon, 5030 ms Graviton,
+  tokens identical) — but `decoder_cross_attention` takes the attention module
+  as an argument, which cannot be a custom-op input, so it needs re-plumbing to
+  pass the staged tensors.  CPU post-op fusion is not worth the plumbing either:
+  `linear+gelu` (`_linear_pointwise(..., "gelu", [-1], "none")`, exact like
+  `F.gelu`) saves 0.002-0.005 ms per `fc1`, under 1% of a step — which is why
+  `compile_model` (Inductor fusing `_add_layer_norm`/`_activation_linear`)
+  measures ~7% *slower* on CPU.  Florence-2 is the exception that proves the
+  rule: `compile_mm_encoder` compiles the (pure-torch) DaViT tower fine, the
+  packed forward is `torch.compiler.disable`d so Inductor never sees the opaque
+  blocked weight (it fails on its `stride=[1, 0]` otherwise), which keeps the
+  linear out of the graph — yet `compile + prepack` is still the fastest
+  `get_image_features` (356 ms vs 369 compiled-unpacked vs 394 eager at 577
+  tokens).
 - **Fused q/k/v projections.** Each self-attention holds one `qkv_proj`
   (`[D -> 3D]`) where HF has `q_proj`/`k_proj`/`v_proj`, and cross-attention
   holds `kv_proj` + `q_proj` (K and V are both projected from the encoder
