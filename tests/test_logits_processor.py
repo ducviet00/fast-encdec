@@ -77,6 +77,32 @@ def check(params, rows):
     assert torch.equal(got, want), f"mismatch rows={rows} params={params}"
 
 
+def check_padded(params, true_lens):
+    torch.manual_seed(sum(true_lens) * 131 + len(true_lens))
+    rows = [torch.randint(0, VOCAB, (L,)) for L in true_lens]
+    scores = torch.randn(len(rows), VOCAB) * 3
+    want = torch.stack(
+        [
+            reference(params, r.unsqueeze(0), s.unsqueeze(0).clone()).squeeze(0)
+            for r, s in zip(rows, scores)
+        ]
+    )
+    width = max(true_lens)
+    pad = torch.full((len(rows), width), -1, dtype=torch.long)
+    for r, t in enumerate(rows):
+        pad[r, width - len(t) :] = t
+    processor = LogitsProcessor(
+        params,
+        vocab_size=VOCAB,
+        device="cpu",
+        max_length=64,
+        begin_index=3,
+        is_beam=params.num_beams > 1,
+    )
+    got = processor(pad, scores.clone(), torch.tensor(true_lens))
+    assert torch.equal(got, want), f"padded mismatch lens={true_lens} params={params}"
+
+
 def main():
     cases = [
         SamplingParams(eos_token_id=EOS, repetition_penalty=1.3),
@@ -107,6 +133,19 @@ def main():
     for params, rows in itertools.product(cases, lengths):
         check(params, rows)
     print(f"processor parity ok ({len(cases)} param sets x {len(lengths)} lengths)")
+
+    for lens in (
+        [1, 2, 5],
+        [2, 5, 9],
+        [1, 1, 12],
+        [3, 3, 3],
+        [5, 9, 12],
+        [1, 3, 9, 12],
+        [63, 5],
+    ):
+        for params in cases:
+            check_padded(params, lens)
+    print(f"padded parity ok ({len(cases)} param sets x 7 shapes)")
 
 
 if __name__ == "__main__":

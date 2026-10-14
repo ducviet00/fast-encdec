@@ -7,7 +7,7 @@ name = "fast-encdec"
 version = "0.1.0"
 description = "Tiny BART/Florence-2 inference: paged KV cache, continuous batching, beam search"
 requires-python = ">=3.10"
-dependencies = ["transformers", "Pillow"]
+dependencies = ["transformers", "Pillow", "numpy"]
 
 [project.optional-dependencies]
 cpu = [
