@@ -101,6 +101,7 @@ fastencdec/
     cpu_attn.py        JIT build + wrapper for the vendored vLLM CPU kernels
     flash_attn.py      lazy loader for the kernels-community/flash-attn2 kernel (CUDA)
     logits_processor.py transformers LogitsProcessorList from SamplingParams
+    ngram.py           Triton no-repeat-n-gram mask (device; CPU keeps transformers)
     sampler.py         greedy / multinomial sampling (Sampler nn.Module)
   models/
     bart.py            BART model (encoder / decoder / cross-attn)
@@ -119,6 +120,12 @@ benchmarks/attn_backend.py
 benchmarks/gemm.py
 benchmarks/florence2_tasks.py
 benchmarks/profile_florence2.py
+benchmarks/benchmark_vllm.py    ours vs the vLLM BART plugin (worker-per-engine)
+benchmarks/profile_bart.py      phase/kernel profile, ours vs vLLM
+benchmarks/test_pipelined.py    pipelined greedy vs the synchronous loop
+benchmarks/test_pipelined_beam.py
+benchmarks/test_ngram.py        Triton n-gram vs transformers
+benchmarks/sweep_batch.py       pipelined vs synchronous across batch sizes
 tests/test_parity.py
 tests/test_attn_backend.py
 tests/test_florence2.py
@@ -151,6 +158,16 @@ request that shares a (beam width, live beam count, decoder length) into one
 `[num_requests, beam_count * vocab]`, with two `.tolist()` syncs for the whole
 group.  Beam postprocess is the host bottleneck on CUDA, so this batching is
 what keeps decode from being launch/sync-bound (see the L4 beam rows).
+
+`LLMEngine.run()` first asks `_pipeline_mode()`.  On CUDA, batches whose logits
+processors run on the device take the **pipelined** path instead of the
+`step()` loop above: `_run_pipelined` / `_pipelined_greedy` (greedy) and
+`_run_pipelined_beam` / `_pipelined_beam` (fixed-length beam).  They keep the
+sampled token, the block table and the step metadata on the device and feed the
+token straight back, so the host never blocks on a per-step `.tolist()`; only
+the copy-on-write allocation stays on the host (one sync per step).  The two
+paths produce identical tokens.  See the pipelined-decode gotcha for the guard,
+the measurements and the ceiling.
 
 `models/bart.py` calls three device-agnostic ops from
 `layers/attention.py` -- `encoder_self_attention` (dense, no cache),
@@ -255,6 +272,14 @@ PYTHONPATH=. $P tests/test_florence2.py
 
 # CUDA flash backend parity (skips without a GPU + the flash-attn2 kernel)
 PYTHONPATH=. $P tests/test_gpu_flash.py
+
+# pipelined decode vs the synchronous loop (CUDA, token-exact)
+PYTHONPATH=. $P benchmarks/test_pipelined.py 256          # greedy, ngram=3
+PYTHONPATH=. $P benchmarks/test_pipelined_beam.py 128 4   # beam, out x beams
+PYTHONPATH=. $P benchmarks/test_ngram.py                  # Triton n-gram vs transformers
+
+# ours vs vLLM (needs vLLM 0.28 + bart-plugin + beam-search-plugin in --vllm-python)
+PYTHONPATH=. $P benchmarks/benchmark_vllm.py --device cuda --vllm-python ~/vllmenv/bin/python
 
 # example
 PYTHONPATH=. $P examples/summarize.py
@@ -504,6 +529,36 @@ on this box with the same kind of workload.
   capacity just rewrites the cross rows in place, so the capture survives across
   `generate()` calls.  (Rebuilding the buffers for every new request set
   re-captured all buckets on every call: ~100 ms of the L4's 176-641 ms rows.)
+- **Pipelined decode (CUDA).**  `LLMEngine._pipeline_mode()` sends a CUDA batch
+  down a loop that keeps the sampled token, the block table and the step
+  metadata on the device and feeds the token straight back, so the host never
+  blocks on a per-step `.tolist()`.  It is selected only when the logits
+  processors are sync-free on the device: greedy always, beam only for the
+  fixed-length lockstep case (`min_length > max_tokens`, so no beam finishes
+  early), and never when Triton is missing.  Greedy reproduces the processors
+  in `_device_mask`; the n-gram one is `layers/ngram.py` (one Triton launch,
+  exact vs `transformers`).  Everything else -- CPU, sampling, early-EOS beam,
+  fp32 (no CUDA graph) -- keeps the synchronous loop, and the two are
+  token-identical (`benchmarks/test_pipelined.py`, `test_pipelined_beam.py`).
+  Measured on the L4 (`bart-large-cnn`, bf16, `no_repeat_ngram_size=3`):
+  greedy **1.24x** (256->256 and 256->64, batch=8); beam **1.07-1.12x**
+  (256->128 b8x2 1.12x, b8x4 1.09x; 256->256 b8x4 1.07x; 256->512 b8x4 1.08x).
+  Against vLLM 0.28 + `bart-plugin` on the same box (256->256, b8 bf16):
+  greedy b1 655 vs 710 ms (1.09x), greedy b8 865 vs 873 (1.01x), beam b8x4
+  1917 vs 1889 (0.99x), fp32 b8 6392 vs 1720 (0.27x).
+- **Pipelining is a small-batch fix; the large-batch gap is GEMMs.**  Sweep at
+  256->128, greedy bf16, no n-gram (ours sync / ours pipelined / vLLM, ms):
+  batch 8 522/434/439, 32 916/828/770, 64 1473/1381/1240, 128 2563/2443/2123.
+  The host round-trip is a *fixed* 0.70-0.95 ms/step, so pipelining is worth
+  1.20x at batch 8 but only 1.05x at batch 128.  Without it the engine is
+  ~1.19x behind vLLM at *every* batch, so the large-batch gap is GPU work, not
+  the sync: at batch=64 ours is 1.223 s self-CUDA vs vLLM's 1.052 s, dominated
+  by GEMM algorithm choice (cuBLAS picks a 64x64 tile for the per-layer
+  `[64,1024]x[1024,1024]` shapes: 110 ms, where vLLM's cutlass linear does not)
+  plus ~80 ms of `aten::clone`/`aten::contiguous` vLLM does not have (source
+  not yet pinned).  The KV store is **not** the cause: `store_kvcache` is one
+  `index_elementwise` with no copies, and the flash call copies nothing either
+  (both measured in isolation).
 - **`torch.compile` (`compile_model=True`, default off) fuses the pointwise
   sequences but does not pay off for BART.** How nano-vllm uses it: not a
   whole-model compile, but `@torch.compile` on four tensor-only functions —
@@ -583,6 +638,21 @@ on this box with the same kind of workload.
   learned positional embeddings. Those per-layer pointwise ops are the
   multi-kernel kind `torch.compile` collapses, so re-measure `compile_model`
   there (see the gotcha) — BART has nothing to fuse, T5 does.
+- The pipelined loops live in `llm_engine.py` (~380 lines).  nano-vllm's split
+  puts all device work in `ModelRunner` and keeps the engine ~90 lines, so they
+  belong in `model_runner.py`.
+- Pipelined beam covers only the fixed-length lockstep case; an early-EOS beam
+  falls back to the synchronous loop.  The general case needs the fork on the
+  device (device-side copy-on-write), which is what the `aten::clone` /
+  `aten::contiguous` question above is really about.
+- The large-batch gap is GEMM algorithm selection, not the decode loop: the
+  per-layer linears go through cuBLAS and get a 64x64 tile at batch 64 (110 ms,
+  where vLLM's cutlass linear is faster).  Re-test `compile_model` or a
+  different linear at that shape.
+- fp32 on CUDA has no FlashAttention-2 path, so no CUDA graph and no pipelined
+  decode (0.27x vs vLLM on the L4).
+- `benchmarks/pipelined_proto.py` and `pipelined_beam_proto.py` are the design
+  vehicles for the engine paths and are now redundant.
 
 ## 9. Style
 
