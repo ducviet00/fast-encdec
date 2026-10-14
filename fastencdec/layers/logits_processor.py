@@ -22,6 +22,20 @@ from transformers.generation.logits_process import (
     TopPLogitsWarper,
 )
 
+from .ngram import TritonNoRepeatNGramLogitsProcessor, triton_available
+
+
+def _ngram_processor(ngram_size: int, device):
+    """The device (Triton) n-gram mask on CUDA, else the transformers one.
+
+    ``transformers``' version syncs the device every step; the Triton one keeps
+    the processor off the host, so the pipelined decode and the beam ranking can
+    run without a round-trip.
+    """
+    if torch.device(device).type == "cuda" and triton_available():
+        return TritonNoRepeatNGramLogitsProcessor(ngram_size)
+    return NoRepeatNGramLogitsProcessor(ngram_size)
+
 
 def build_logits_processor(
     params,
@@ -48,7 +62,7 @@ def build_logits_processor(
     if params.repetition_penalty != 1.0:
         processors.append(RepetitionPenaltyLogitsProcessor(params.repetition_penalty))
     if params.no_repeat_ngram_size > 0:
-        processors.append(NoRepeatNGramLogitsProcessor(params.no_repeat_ngram_size))
+        processors.append(_ngram_processor(params.no_repeat_ngram_size, device))
     if params.min_length > 0 and eos is not None:
         processors.append(
             MinLengthLogitsProcessor(params.min_length, eos, device=device)

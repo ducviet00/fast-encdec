@@ -99,12 +99,15 @@ def self_cache_shape(
 
 def store_kvcache(key, value, k_cache, v_cache, slot_mapping, block_size, page_major):
     """Scatter new K/V ``[T, H, D]`` into the paged cache at ``slot_mapping``."""
-    block = torch.div(slot_mapping, block_size, rounding_mode="floor")
-    pos = slot_mapping % block_size
     if page_major:
-        k_cache[block, pos, :, :] = key
-        v_cache[block, pos, :, :] = value
+        # page-major cache ``[num_blocks, block_size, H, D]``: a flat slot is
+        # exactly ``block * block_size + pos``, so index the flat view directly
+        # and skip the per-call div/mod kernels the 2-D form would need.
+        k_cache.view(-1, *k_cache.shape[-2:])[slot_mapping] = key
+        v_cache.view(-1, *v_cache.shape[-2:])[slot_mapping] = value
     else:
+        block = torch.div(slot_mapping, block_size, rounding_mode="floor")
+        pos = slot_mapping % block_size
         k_cache[block, :, pos, :] = key
         v_cache[block, :, pos, :] = value
 
