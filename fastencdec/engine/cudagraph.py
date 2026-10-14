@@ -1,25 +1,3 @@
-"""Decode-only CUDA-graph capture/replay (prototype).
-
-The decoder feeds exactly one token per sequence, so a step's shape depends only
-on the batch size.  Following nano-vllm, we capture ``model.decoder`` once per
-batch-size bucket into a shared graph pool and replay it:
-
-* all buffers the graph reads are preallocated and reused (``input_ids``,
-  ``positions``, ``slot_mapping``, ``context_lens``, ``block_tables``,
-  ``cross_cache_seqlens``, ``cross_block_tables``, ``outputs``);
-* a smaller batch is padded up to the bucket with **sentinel** metadata that
-  writes to a reserved scratch block and attends to a single dummy key, so the
-  padded rows neither corrupt the cache nor change the real rows;
-* cross-attention reads a **fixed, preallocated** encoder cache through the
-  static block table / cache lengths, so nothing the graph references is ever
-  reallocated;
-* sampling stays outside the graph (one host sync per step).
-
-Only the CUDA + FlashAttention-2 path is graphed; the encoder (and the probe for
-a non-flash backend) stays eager, and the runner falls back to eager whenever a
-batch is larger than the largest bucket or the graphs were invalidated.
-"""
-
 import torch
 
 from ..layers.attention import store_kvcache
@@ -33,13 +11,10 @@ class DecodeGraphRunner:
         self.dtype = runner.dtype
         self.block_size = runner.block_size
         self.max_bs = max(1, min(max_num_seqs, 512))
-        # Buckets: small powers of two, then multiples of 16, plus ``max_bs``
-        # itself so every batch up to the cap has one (for ``max_num_seqs`` < 16
-        # the multiples-of-16 sweep is empty, e.g. 6 -> [1, 2, 4, 6]).
+        # Small powers of 2, multiples of 16, plus max_bs so every batch size fits a bucket.
         buckets = [1, 2, 4, 8, *range(16, self.max_bs + 1, 16), self.max_bs]
         self.graph_bs = sorted({b for b in buckets if b <= self.max_bs})
-        # Reserved self-attention cache row the padded rows write to (the block
-        # manager only ever hands out ``num_blocks`` rows).
+        # Reserved self-attn cache row that padded rows write to.
         self.scratch_block = runner.block_manager.num_blocks
         self.scratch_slot = self.scratch_block * self.block_size
 
@@ -47,7 +22,7 @@ class DecodeGraphRunner:
         self.pool = None
         self.bufs: dict | None = None
 
-        # Cross-attention: request_id -> (first_block, pages, enc_len).
+        # request_id -> (first_block, pages, enc_len)
         self.req_blocks: dict[int, tuple[int, int, int]] = {}
         self.next_block = 0
         self.cross_capacity = 0
@@ -56,16 +31,10 @@ class DecodeGraphRunner:
         self.cross_lens = None
         self._staged_ids = None
 
-    # ------------------------------------------------------------- cross cache
     def stage(self, seqs) -> None:
-        """Make the fixed encoder cache and per-sequence rows match ``seqs``.
-
-        Only rewritten when the request set changes; a steady decode loop just
-        reads the cached rows (no per-step arange/allocs/syncs).
-        """
         bs = self.block_size
         if not self.req_blocks:
-            self.next_block = 0  # nothing live: reuse block 0..N (no realloc)
+            self.next_block = 0
         attn0 = self.runner.decoder_layers[0].encoder_attn
         added = False
         for seq in seqs:
@@ -81,11 +50,7 @@ class DecodeGraphRunner:
             added = True
         if added:
             self._write_cross()
-            # ``_alloc_bufs`` also drops the captured graphs (they read the static
-            # buffers), so only rebuild when the width actually changed --
-            # ``_alloc_cross`` sets ``bufs = None`` for that.  A new request set
-            # with the same capacity only rewrites the cross cache, which the
-            # graph reads in place, so the capture stays valid.
+            # Only rebuild static buffers/graphs when cross-cache capacity grows.
             if self.bufs is None:
                 self._alloc_bufs()
         ids = tuple(seq.request_id for seq in seqs)
@@ -103,7 +68,7 @@ class DecodeGraphRunner:
                 torch.zeros(shape, dtype=self.dtype, device=self.device),
                 torch.zeros(shape, dtype=self.dtype, device=self.device),
             )
-        self.bufs = None  # cross width changed -> reallocate + recapture
+        self.bufs = None
         self.graphs.clear()
         self.pool = None
 
@@ -112,11 +77,11 @@ class DecodeGraphRunner:
         for layer in self.runner.decoder_layers:
             attn = layer.encoder_attn
             k_cache, v_cache = attn.cross_cache
-            for request_id, (first, pages, length) in self.req_blocks.items():
+            for request_id, (first, _, length) in self.req_blocks.items():
                 pair = attn.encoder_kv_cache.get(request_id)
                 if pair is None:
                     continue
-                key, value = pair  # [H, L, D]
+                key, value = pair
                 pos = torch.arange(length, device=self.device)
                 slots = (first + pos // bs) * bs + (pos % bs)
                 store_kvcache(
@@ -144,7 +109,6 @@ class DecodeGraphRunner:
             device=self.device,
         )
 
-    # ---------------------------------------------------------------- buffers
     def _alloc_bufs(self) -> None:
         dev = self.device
         num_blocks = self.runner.block_manager.num_blocks
@@ -193,7 +157,6 @@ class DecodeGraphRunner:
             cross_block_tables=b["cross_bt"][:bs],
         )
 
-    # ------------------------------------------------------------------ graph
     def capture(self) -> None:
         if self.graphs:
             return
@@ -223,8 +186,9 @@ class DecodeGraphRunner:
         b["positions"][:bs].copy_(positions)
         b["slot_mapping"][:bs].copy_(fields["slot_mapping"])
         b["context_lens"][:bs].copy_(fields["context_lens"])
-        w = fields["block_tables"].shape[1]
-        b["block_tables"][:bs, :w].copy_(fields["block_tables"])
+        b["block_tables"][:bs, : fields["block_tables"].shape[1]].copy_(
+            fields["block_tables"]
+        )
         b["cross_lens"][:bs].copy_(self.cross_lens)
         b["cross_bt"][:bs, : self.cross_bt.shape[1]].copy_(self.cross_bt)
         self.graphs[bucket].replay()

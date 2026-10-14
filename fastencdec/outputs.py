@@ -1,16 +1,8 @@
-"""Completion outputs, mirroring the vLLM ``RequestOutput`` shape.
-
-``LLM.generate`` returns one :class:`RequestOutput` per request; the generated
-text is ``output.outputs[0].text``, exactly as in vLLM.
-"""
-
 from dataclasses import dataclass, field
 
 
 @dataclass
 class CompletionOutput:
-    """The output data of one completion output of a request."""
-
     index: int
     text: str
     token_ids: list[int]
@@ -28,8 +20,6 @@ class CompletionOutput:
 
 @dataclass
 class RequestOutput:
-    """The output data of a completion request to the :class:`LLM`."""
-
     request_id: int
     prompt: str | None
     prompt_token_ids: list[int] | None

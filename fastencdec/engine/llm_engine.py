@@ -1,12 +1,3 @@
-"""Continuous-batching engine with greedy/sampling and beam search.
-
-The engine is offline: :meth:`LLMEngine.generate` adds a whole batch with a
-single :class:`SamplingParams` and runs to completion.  Beam search is built on
-the same paged cache: each beam is a normal :class:`Sequence`, blocks are shared
-by reference count and copy-on-write happens on the next append (see
-:mod:`fastencdec.engine.block_manager`).
-"""
-
 from collections import defaultdict
 from dataclasses import replace
 
@@ -22,33 +13,20 @@ from .sequence import Sequence
 
 
 def _length_penalized(seq: Sequence, length_penalty: float) -> float:
-    length = max(seq.num_generated, 1)
-    return seq.cum_logprob / (length**length_penalty)
+    return seq.cum_logprob / (max(seq.num_generated, 1) ** length_penalty)
 
 
 def select_beam_candidates(
     stopped: list[bool], num_beams: int
 ) -> tuple[list[int], list[int]]:
-    """Split a descending-ranked candidate list into finished and live ranks.
-
-    ``stopped`` marks candidates that hit a stopping criterion (EOS or max
-    length); the lists are parallel to that ranking.  A stopped candidate may
-    only finish if it ranks within the top ``num_beams`` — otherwise it is
-    dropped, as in ``generate`` — and the remaining slots go to the best
-    non-stopped continuations.
-    """
+    # Stopped candidates (EOS/max_len) only finish if ranked in the top num_beams.
     finished = [r for r, stop in enumerate(stopped) if stop and r < num_beams]
     live = [r for r, stop in enumerate(stopped) if not stop][:num_beams]
     return finished, live
 
 
 class LLMEngine:
-    def __init__(
-        self,
-        model,
-        config: Config,
-        eos_token_id: int | None = None,
-    ):
+    def __init__(self, model, config: Config, eos_token_id: int | None = None):
         self.block_manager = BlockManager(config.num_blocks, config.block_size)
         self.runner = ModelRunner(
             model,
@@ -70,13 +48,6 @@ class LLMEngine:
         self._next_request_id = 0
 
     def generate(self, requests, params) -> list[int]:
-        """Offline entrypoint: add every request, run, return the request ids.
-
-        ``requests`` is an iterable of ``(encoder_token_ids, decoder_token_ids,
-        pixel_values)``; ``params`` is a single :class:`SamplingParams` shared by
-        the whole batch.  The decoder prompt length must be uniform (the facades
-        always use a single decoder-start token).
-        """
         requests = list(requests)
         if not requests:
             return []
@@ -87,11 +58,8 @@ class LLMEngine:
         if any(len(decoder_ids) != prompt_len for _, decoder_ids, _ in requests):
             raise ValueError("decoder prompt length must be uniform across the batch")
         if prompt_len != 1:
-            # The attention ops feed one token per sequence per step.
             raise ValueError("the decoder prompt must be a single token")
-        begin_index = prompt_len + int(
-            params.forced_bos_token_id is not None and prompt_len == 1
-        )
+        begin_index = prompt_len + int(params.forced_bos_token_id is not None)
         self._logits_processor = build_logits_processor(
             params,
             max_length=prompt_len + params.max_tokens,
@@ -117,7 +85,6 @@ class LLMEngine:
         self.run()
         return request_ids
 
-    # ------------------------------------------------------------------ run
     def is_finished(self) -> bool:
         return self.scheduler.is_finished()
 
@@ -132,29 +99,24 @@ class LLMEngine:
 
     def _postprocess(self, seqs, logits) -> None:
         processor = self._logits_processor
-        # Group by request (a request's beams move together), then by beam width
-        # and decoder length: one log_softmax + processor + topk can serve every
-        # request that shares them.
         by_request: dict[int, list[int]] = defaultdict(list)
         for index, seq in enumerate(seqs):
             by_request[seq.request_id].append(index)
 
         device = logits.device
         pin = device.type == "cuda"
-        beam_groups: dict[tuple[int, int, int], list[tuple[int, list[int]]]] = {}
-        buckets: dict[int, list[int]] = {}
+        beam_groups = defaultdict(list)
+        buckets = defaultdict(list)
         for request_id, indices in by_request.items():
             params = seqs[indices[0]].sampling
             length = len(seqs[indices[0]].token_ids)
             if params.num_beams > 1:
-                # A request does not always have ``num_beams`` live beams (the
-                # seed is one, and beams can finish early), so the group key
-                # carries the actual count -- every row must pack the same way.
-                beam_groups.setdefault(
-                    (params.num_beams, len(indices), length), []
-                ).append((request_id, indices))
+                # Group by (num_beams, live_beam_count, decoder_len) for a single batched topk.
+                beam_groups[(params.num_beams, len(indices), length)].append(
+                    (request_id, indices)
+                )
             else:
-                buckets.setdefault(length, []).extend(indices)
+                buckets[length].extend(indices)
 
         for (num_beams, beam_count, _), group in beam_groups.items():
             self._beam_group(
@@ -162,33 +124,26 @@ class LLMEngine:
             )
 
         for indices in buckets.values():
-            # pin_memory + non_blocking: a pageable copy would sync the stream.
             input_ids = torch.tensor(
                 [seqs[i].token_ids for i in indices],
                 dtype=torch.long,
                 pin_memory=pin,
             ).to(device, non_blocking=True)
             scores = processor(input_ids, logits[indices].float())
-            # One batched sample (one device sync) for the whole bucket.
             tokens = self.sampler(
                 scores, seqs[indices[0]].sampling.temperature
             ).tolist()
             for row, i in enumerate(indices):
                 self._sample(seqs[i], seqs[i].sampling, tokens[row])
 
-    # -------------------------------------------------------------- sampling
-    def _release(self, request_id: int) -> None:
-        self.runner.clear_request(request_id)
-
     def _sample(self, seq: Sequence, params, token: int) -> None:
         seq.append_token(token)
         if token in params.eos_ids() or seq.num_completion_tokens >= params.max_tokens:
             self.scheduler.remove(seq)
             self.block_manager.deallocate(seq)
-            self._release(seq.request_id)
+            self.runner.clear_request(seq.request_id)
             self.results[seq.request_id] = seq.completion_token_ids
 
-    # ------------------------------------------------------------ beam search
     def _fork(self, parent: Sequence, token: int, score: float) -> Sequence:
         child = Sequence(
             request_id=parent.request_id,
@@ -206,16 +161,7 @@ class LLMEngine:
     def _beam_group(
         self, seqs, group, num_beams, beam_count, processor, logits, device, pin
     ) -> None:
-        """Rank all continuations for a batch of same-shape beam requests.
-
-        ``group`` is ``[(request_id, seq_indices)]`` and every request has
-        ``beam_count`` live beams and the same decoder length.  ``logits[rows]``
-        is laid out request-major / beam-minor, so one ``log_softmax``, one
-        processor call and one ``topk`` over ``[num_requests, beam_count *
-        vocab]`` replace the old per-request loop -- the dominant CUDA
-        beam-decode cost (8x fewer kernel launches, and the two ``tolist`` calls
-        below cut the per-step device syncs from ~3/request to 2/group).
-        """
+        # Batched log_softmax + processor + topk over [num_requests, beam_count * vocab].
         vocab = logits.shape[-1]
         rows = [i for _, seq_indices in group for i in seq_indices]
         input_ids = torch.tensor(
@@ -233,8 +179,7 @@ class LLMEngine:
         params = seqs[group[0][1][0]].sampling
         keep = min(max(2, 1 + len(params.eos_ids())) * num_beams, scores.shape[-1])
         top_values, top_indices = torch.topk(scores, keep, dim=-1)
-        values = top_values.tolist()  # one sync for the whole group
-        indices = top_indices.tolist()
+        values, indices = top_values.tolist(), top_indices.tolist()
         for row, (request_id, seq_indices) in enumerate(group):
             self._beam_advance(
                 request_id,
@@ -255,7 +200,7 @@ class LLMEngine:
         ]
         finished_ranks, live_ranks = select_beam_candidates(stopped, num_beams)
 
-        # Build children before freeing parents (children share parent blocks).
+        # Fork children before freeing parents so shared blocks stay alive.
         new_finished = [
             self._fork(beams[parents[r]], tokens[r], top_values[r])
             for r in finished_ranks
@@ -277,7 +222,6 @@ class LLMEngine:
             self._finish_beam_request(request_id, params)
 
     def _prune_finished(self, request_id: int, params) -> None:
-        """Keep only the best ``num_beams`` finished hypotheses."""
         finished = self._finished_beams[request_id]
         if len(finished) <= params.num_beams:
             return
@@ -289,12 +233,7 @@ class LLMEngine:
         del finished[params.num_beams :]
 
     def _should_stop(self, request_id: int, params, live) -> bool:
-        """HF ``early_stopping=False``: stop when no live beam can improve.
-
-        Once ``num_beams`` hypotheses are finished, compare the worst finished
-        (length-normalized) score against the best possible live score at the
-        current length.
-        """
+        # HF early_stopping=False: stop when no live beam can beat the worst finished score.
         finished = self._finished_beams[request_id]
         if len(finished) < params.num_beams:
             return False
@@ -320,5 +259,5 @@ class LLMEngine:
             self.scheduler.remove(seq)
         for seq in finished + live:
             self.block_manager.deallocate(seq)
-        self._release(request_id)
+        self.runner.clear_request(request_id)
         self.results[request_id] = best.completion_token_ids if best else []

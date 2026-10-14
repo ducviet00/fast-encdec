@@ -1,10 +1,3 @@
-"""The unified offline :class:`LLM` facade for BART and Florence-2.
-
-``LLM.generate`` mirrors the vLLM offline entrypoint: it takes prompts plus
-optional ``SamplingParams`` and returns ``RequestOutput`` objects (the text is
-``output.outputs[0].text``).
-"""
-
 import torch
 from transformers import AutoConfig, AutoTokenizer, GenerationConfig
 
@@ -19,7 +12,6 @@ from .utils.loader import load_hf_weights
 
 
 def _load_generation_config(model_path: str) -> GenerationConfig:
-    """Load the checkpoint's ``GenerationConfig``, or a bare default."""
     try:
         return GenerationConfig.from_pretrained(model_path)
     except OSError:
@@ -27,39 +19,6 @@ def _load_generation_config(model_path: str) -> GenerationConfig:
 
 
 class LLM:
-    """Minimal offline engine for BART and Florence-2 checkpoints.
-
-    The checkpoint's ``model_type`` picks the model: BART takes text prompts;
-    Florence-2 takes a task prompt plus an image (its visual tokens are spliced
-    into the encoder input).  Everything below this facade — paged KV cache,
-    continuous batching, beam search — is shared.  On CPU the checkpoint's
-    ``nn.Linear`` weights are prepacked into oneDNN's blocked layout at load
-    (:mod:`fastencdec.layers.packed_linear`).
-
-    Args:
-        model_path: HF repo id or local path of a BART or Florence-2 checkpoint.
-        num_blocks: number of paged KV blocks (total KV capacity).
-        block_size: tokens per KV block.
-        max_num_seqs: maximum sequences (beams) in flight at once.
-        dtype: ``torch.float32`` or ``torch.bfloat16``.
-        attn_backend: ``"auto"`` (use the vendored vLLM CPU attention kernel
-            when it builds, else the PyTorch SDPA path), ``"vllm"`` (require
-            it) or ``"sdpa"`` (force the PyTorch path).
-        compile_mm_encoder: ``torch.compile`` the Florence-2 vision tower +
-            projector (~1.2x there).  Ignored for BART.  On by default: it
-            changes the BF16 outputs slightly and compiles once per batch size
-            on first use, so pass ``False`` for exact HF parity or to avoid the
-            per-shape compile latency.
-        device: ``"cpu"`` (default) or ``"cuda"`` to run on a GPU.  On CUDA the
-            decoder attention uses FlashAttention-2 (``attn_backend="flash"``)
-            when it is available and the shape is supported, else SDPA.
-        use_cudagraph: capture the decoder step into a CUDA graph (on by
-            default; only takes effect on CUDA + FlashAttention-2, ignored
-            elsewhere).
-        compile_model: fuse the per-layer pointwise sequences with
-            ``torch.compile`` (default off).
-    """
-
     def __init__(
         self,
         model_path: str,
@@ -84,22 +43,22 @@ class LLM:
             )
 
             self.processor = AutoProcessor.from_pretrained(model_path)
+            self.tokenizer = self.processor.tokenizer
             self.model = Florence2ForConditionalGeneration(hf_config)
             load_hf_weights(self.model, model_path, hf_model_cls=HFFlorence2)
             self.model.to(dtype).to(device)
             if compile_mm_encoder:
                 self.model.compile_mm_encoder()
-            self.tokenizer = self.processor.tokenizer
             text_config = hf_config.text_config
-            self.decoder_start_token_id = text_config.decoder_start_token_id
-            self.eos_token_id = text_config.eos_token_id
         else:
             self.tokenizer = AutoTokenizer.from_pretrained(model_path)
             self.model = BartForConditionalGeneration(hf_config)
             load_hf_weights(self.model, model_path)
             self.model.to(dtype).to(device)
-            self.decoder_start_token_id = hf_config.decoder_start_token_id
-            self.eos_token_id = hf_config.eos_token_id
+            text_config = hf_config
+
+        self.decoder_start_token_id = text_config.decoder_start_token_id
+        self.eos_token_id = text_config.eos_token_id
 
         if torch.device(device).type == "cpu":
             packed_linear.apply(self.model, max_num_seqs)
@@ -121,24 +80,16 @@ class LLM:
         self.engine = LLMEngine(self.model, config, eos_token_id=self.eos_token_id)
 
     def _decode(self, token_ids: list[int]) -> str:
-        # Florence-2's answer *is* special tokens -- the ``<loc_...>`` tokens
-        # carry the boxes -- so keep them (post-processing needs them); BART
-        # output is plain text.
+        # Keep special tokens (<loc_...>) for Florence-2 post-processing.
         return self.tokenizer.decode(token_ids, skip_special_tokens=not self.multimodal)
 
     def _parse_prompt(self, item):
-        """Split one prompt into ``(text, prompt_token_ids, image)``.
-
-        Accepts a plain string, or a vLLM-style dict with ``prompt`` /
-        ``prompt_token_ids`` and an optional ``multi_modal_data`` (e.g.
-        ``{"multi_modal_data": {"image": image}}``).
-        """
+        # Extract (text, prompt_token_ids, image) from a str or vLLM-style dict.
         if isinstance(item, str):
             return item, None, None
         if not isinstance(item, dict):
             raise TypeError(f"prompt must be a str or dict, got {type(item).__name__}")
-        text = item.get("prompt")
-        token_ids = item.get("prompt_token_ids")
+        text, token_ids = item.get("prompt"), item.get("prompt_token_ids")
         if text is None and token_ids is None:
             raise ValueError("prompt dict needs 'prompt' or 'prompt_token_ids'")
         image = (item.get("multi_modal_data") or {}).get("image")
@@ -153,30 +104,15 @@ class LLM:
         use_tqdm: bool = True,
         mm_processor_kwargs: dict | None = None,
     ) -> list[RequestOutput]:
-        """Generate completions for ``prompts`` (vLLM-style entrypoint).
-
-        ``prompts`` is a string, a dict, or a list of either.  A dict may carry
-        ``prompt`` / ``prompt_token_ids`` and, for Florence-2, an image via
-        ``{"multi_modal_data": {"image": image}}``.  Decoding starts from the
-        model's ``decoder_start_token_id``; ``sampling_params`` defaults to the
-        checkpoint's ``GenerationConfig``.
-
-        Returns one :class:`RequestOutput` per prompt; the text is
-        ``output.outputs[0].text``.
-
-        ``use_tqdm`` is accepted for signature parity with vLLM but unused (the
-        engine decodes the whole batch in one pass).
-        """
         if isinstance(prompts, (str, dict)):
             prompts = [prompts]
         if sampling_params is None:
             sampling_params = self.default_sampling_params
-        eos_ids = sampling_params.eos_ids()
-        if not eos_ids and self.eos_token_id is not None:
-            eos_ids = {self.eos_token_id}
+        eos_ids = sampling_params.eos_ids() or (
+            {self.eos_token_id} if self.eos_token_id is not None else set()
+        )
 
-        records = []
-        engine_requests = []
+        records, engine_requests = [], []
         for item in prompts:
             encoder_prompt, encoder_ids, image = self._parse_prompt(item)
             decoder_ids = [self.decoder_start_token_id]

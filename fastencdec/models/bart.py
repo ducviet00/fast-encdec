@@ -1,21 +1,3 @@
-"""BART model with paged attention (vLLM CPU kernel or CUDA FlashAttention-2).
-
-Adapted from the HuggingFace BART reference.  Compared to the GPU version this
-only swaps the attention kernels:
-
-* encoder self-attention stays a plain non-causal attention (it runs once and
-  holds no cache),
-* decoder self-attention reads/writes the paged KV cache through the global
-  :class:`~fastencdec.utils.context.Context`,
-* decoder cross-attention uses encoder K/V cached per request on the layer.
-
-Everything else (LayerNorms, embeddings, residual layout, the ``+2``
-positional-embedding offset and the logits bias) is unchanged so the
-HuggingFace weights load 1:1.  The one deviation is the fused attention
-projections (``qkv_proj`` / ``kv_proj``): one GEMM instead of the reference's
-separate q/k/v ones, which ``utils/loader`` builds from the HF parts.
-"""
-
 import math
 from typing import ClassVar
 
@@ -32,10 +14,7 @@ from ..layers.attention import (
 ACT2FN = {"gelu": F.gelu}
 
 
-# --------------------------------------------------------------- pointwise
-# Small tensor-only ops that ``torch.compile`` fuses into a single kernel
-# (nano-vllm style).  The layer forwards look these names up at call time, so
-# ``enable_compile`` can swap in compiled versions before the first forward.
+# Pointwise helpers swapped with torch.compile versions when compile_model=True.
 def _add_layer_norm_impl(norm, residual, x):
     return norm(residual + x)
 
@@ -50,10 +29,6 @@ _COMPILED = False
 
 
 def enable_compile(enable: bool = True) -> None:
-    """Fuse the residual-add + layer-norm and the activation + fc1 with inductor.
-
-    Called by the model runner with its ``compile_model`` flag (CUDA only).
-    """
     global _add_layer_norm, _activation_linear, _COMPILED
     if enable and not _COMPILED:
         _add_layer_norm = torch.compile(_add_layer_norm_impl)
@@ -66,8 +41,7 @@ def enable_compile(enable: bool = True) -> None:
 
 
 class BartLearnedPositionalEmbedding(nn.Embedding):
-    """Learned positional embeddings; BART offsets ids by 2 (padding hack)."""
-
+    # BART offsets position ids by +2.
     def __init__(self, num_embeddings: int, embedding_dim: int):
         self.offset = 2
         super().__init__(num_embeddings + self.offset, embedding_dim)
@@ -77,8 +51,6 @@ class BartLearnedPositionalEmbedding(nn.Embedding):
 
 
 class BartScaledWordEmbedding(nn.Embedding):
-    """Embeddings scaled by ``sqrt(d_model)`` when ``scale_embedding`` is set."""
-
     def __init__(
         self,
         num_embeddings: int,
@@ -93,13 +65,19 @@ class BartScaledWordEmbedding(nn.Embedding):
         return super().forward(input) * self.embed_scale
 
 
-class BartEncoderSelfAttention(nn.Module):
-    """Non-causal multi-head self-attention for the encoder (no cache)."""
+class _BartAttentionBase(nn.Module):
+    def __init__(self, embed_dim: int, num_heads: int):
+        super().__init__()
+        if embed_dim % num_heads != 0:
+            raise ValueError("embed_dim must be divisible by num_heads")
+        self.embed_dim = embed_dim
+        self.num_heads = num_heads
+        self.head_dim = embed_dim // num_heads
+        self.scaling = self.head_dim**-0.5
 
-    # One ``[D -> 3D]`` GEMM instead of three ``[D -> D]`` ones.  The small
-    # per-projection GEMMs are launch-bound, so fusing q/k/v is ~3x faster at
-    # decode shapes (~parity for the encoder's wide GEMMs); ``utils/loader``
-    # concatenates HuggingFace's q/k/v_proj into it, so weights still load 1:1.
+
+class BartEncoderSelfAttention(_BartAttentionBase):
+    # Fused [D -> 3D] projection; loader concatenates HF's q/k/v_proj.
     fused_projections: ClassVar[dict[str, tuple[str, ...]]] = {
         "qkv_proj": ("q_proj", "k_proj", "v_proj")
     }
@@ -112,36 +90,23 @@ class BartEncoderSelfAttention(nn.Module):
         config=None,
         layer_idx: int | None = None,
     ):
-        super().__init__()
-        self.embed_dim = embed_dim
-        self.num_heads = num_heads
-        self.head_dim = embed_dim // num_heads
-        if self.head_dim * num_heads != embed_dim:
-            raise ValueError("embed_dim must be divisible by num_heads")
-        self.scaling = self.head_dim**-0.5
-
+        super().__init__(embed_dim, num_heads)
         self.qkv_proj = nn.Linear(embed_dim, 3 * embed_dim, bias=bias)
         self.out_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        # hidden_states: [batch, seq, dim] -> [batch, heads, seq, head_dim]
         shape = (*hidden_states.shape[:-1], -1, self.head_dim)
-        query, key, value = self.qkv_proj(hidden_states).chunk(3, dim=-1)
-        # ``.contiguous()`` matters: on aarch64, SDPA with BF16 *non-contiguous*
-        # (transposed) inputs falls into a path ~20x slower than the contiguous
-        # one (Graviton: 86 ms vs 4 ms for a BART-large encoder block), while x86
-        # is unaffected.  The copy is negligible next to the attention.
-        query = query.reshape(shape).transpose(1, 2).contiguous()
-        key = key.reshape(shape).transpose(1, 2).contiguous()
-        value = value.reshape(shape).transpose(1, 2).contiguous()
-        out = encoder_self_attention(query, key, value)
+        # .contiguous() avoids the ~20x slower non-contiguous BF16 SDPA path on aarch64.
+        q, k, v = (
+            t.reshape(shape).transpose(1, 2).contiguous()
+            for t in self.qkv_proj(hidden_states).chunk(3, dim=-1)
+        )
+        out = encoder_self_attention(q, k, v)
         out = out.transpose(1, 2).reshape(*hidden_states.shape[:-1], -1).contiguous()
         return self.out_proj(out)
 
 
-class BartDecoderSelfAttention(nn.Module):
-    """Causal multi-head self-attention backed by the paged KV cache."""
-
+class BartDecoderSelfAttention(_BartAttentionBase):
     fused_projections: ClassVar[dict[str, tuple[str, ...]]] = {
         "qkv_proj": ("q_proj", "k_proj", "v_proj")
     }
@@ -154,43 +119,27 @@ class BartDecoderSelfAttention(nn.Module):
         config=None,
         layer_idx: int | None = None,
     ):
-        super().__init__()
-        self.embed_dim = embed_dim
-        self.num_heads = num_heads
-        self.head_dim = embed_dim // num_heads
-        if self.head_dim * num_heads != embed_dim:
-            raise ValueError("embed_dim must be divisible by num_heads")
-        self.scaling = self.head_dim**-0.5
-
+        super().__init__(embed_dim, num_heads)
         self.qkv_proj = nn.Linear(embed_dim, 3 * embed_dim, bias=bias)
         self.out_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
-
-        # Assigned by the model runner: [num_blocks, heads, block_size, head_dim]
-        # (or the page-major layout on CUDA), plus the block size the op needs.
         self.k_cache = torch.empty([])
         self.v_cache = torch.empty([])
         self.block_size = 16
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         num_tokens = hidden_states.shape[0]
-        head = (num_tokens, self.num_heads, self.head_dim)
-
-        query, key, value = self.qkv_proj(hidden_states).chunk(3, dim=-1)
-        query = query.reshape(head)
-        key = key.reshape(head)
-        value = value.reshape(head)
-
+        shape = (num_tokens, self.num_heads, self.head_dim)
+        q, k, v = (
+            t.reshape(shape) for t in self.qkv_proj(hidden_states).chunk(3, dim=-1)
+        )
         out = decoder_self_attention(
-            query, key, value, self.k_cache, self.v_cache, self.scaling, self.block_size
+            q, k, v, self.k_cache, self.v_cache, self.scaling, self.block_size
         )
         return self.out_proj(out.reshape(num_tokens, self.embed_dim))
 
 
-class BartDecoderCrossAttention(nn.Module):
-    """Cross-attention using encoder K/V cached once per request."""
-
-    # K and V are both projected from the encoder output, so they share one GEMM
-    # (``_encode``); Q comes from the decoder state and stays separate.
+class BartDecoderCrossAttention(_BartAttentionBase):
+    # K/V projected once from encoder output in _encode; Q projected per step.
     fused_projections: ClassVar[dict[str, tuple[str, ...]]] = {
         "kv_proj": ("k_proj", "v_proj")
     }
@@ -203,30 +152,20 @@ class BartDecoderCrossAttention(nn.Module):
         config=None,
         layer_idx: int | None = None,
     ):
-        super().__init__()
-        self.embed_dim = embed_dim
-        self.num_heads = num_heads
-        self.head_dim = embed_dim // num_heads
-        if self.head_dim * num_heads != embed_dim:
-            raise ValueError("embed_dim must be divisible by num_heads")
-        self.scaling = self.head_dim**-0.5
-
+        super().__init__(embed_dim, num_heads)
         self.kv_proj = nn.Linear(embed_dim, 2 * embed_dim, bias=bias)
         self.q_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
         self.out_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
-
-        # request_id -> (key, value), each [num_heads, enc_len, head_dim].
-        # Dense per request (not paged), shared by all beams of the request; the
-        # attention op stages it into a paged cache for kernels that need one.
+        # request_id -> (key, value) [num_heads, enc_len, head_dim]
         self.encoder_kv_cache: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
-        # Fixed page-major encoder cache used by the CUDA-graph path.
         self.cross_cache = None
         self.block_size = 16
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         num_tokens = hidden_states.shape[0]
-        head = (num_tokens, self.num_heads, self.head_dim)
-        query = self.q_proj(hidden_states).view(head)
+        query = self.q_proj(hidden_states).view(
+            num_tokens, self.num_heads, self.head_dim
+        )
         out = decoder_cross_attention(query, self, self.scaling, self.block_size)
         return self.out_proj(out.reshape(num_tokens, self.embed_dim))
 
@@ -248,17 +187,11 @@ class BartEncoderLayer(nn.Module):
         self.final_layer_norm = nn.LayerNorm(self.embed_dim)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        residual = hidden_states
-        hidden_states = self.self_attn(hidden_states)
         hidden_states = _add_layer_norm(
-            self.self_attn_layer_norm, residual, hidden_states
+            self.self_attn_layer_norm, hidden_states, self.self_attn(hidden_states)
         )
-
-        residual = hidden_states
-        hidden_states = self.fc2(
-            _activation_linear(self.fc1, self.activation_fn, hidden_states)
-        )
-        return _add_layer_norm(self.final_layer_norm, residual, hidden_states)
+        ffn = self.fc2(_activation_linear(self.fc1, self.activation_fn, hidden_states))
+        return _add_layer_norm(self.final_layer_norm, hidden_states, ffn)
 
 
 class BartDecoderLayer(nn.Module):
@@ -285,23 +218,16 @@ class BartDecoderLayer(nn.Module):
         self.final_layer_norm = nn.LayerNorm(self.embed_dim)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        residual = hidden_states
-        hidden_states = self.self_attn(hidden_states)
         hidden_states = _add_layer_norm(
-            self.self_attn_layer_norm, residual, hidden_states
+            self.self_attn_layer_norm, hidden_states, self.self_attn(hidden_states)
         )
-
-        residual = hidden_states
-        hidden_states = self.encoder_attn(hidden_states)
         hidden_states = _add_layer_norm(
-            self.encoder_attn_layer_norm, residual, hidden_states
+            self.encoder_attn_layer_norm,
+            hidden_states,
+            self.encoder_attn(hidden_states),
         )
-
-        residual = hidden_states
-        hidden_states = self.fc2(
-            _activation_linear(self.fc1, self.activation_fn, hidden_states)
-        )
-        return _add_layer_norm(self.final_layer_norm, residual, hidden_states)
+        ffn = self.fc2(_activation_linear(self.fc1, self.activation_fn, hidden_states))
+        return _add_layer_norm(self.final_layer_norm, hidden_states, ffn)
 
 
 class BartEncoder(nn.Module):
@@ -310,7 +236,6 @@ class BartEncoder(nn.Module):
         embed_dim = config.d_model
         self.padding_idx = config.pad_token_id
         self.embed_scale = math.sqrt(embed_dim) if config.scale_embedding else 1.0
-
         self.embed_tokens = BartScaledWordEmbedding(
             config.vocab_size, embed_dim, self.padding_idx, embed_scale=self.embed_scale
         )
@@ -331,12 +256,11 @@ class BartEncoder(nn.Module):
         positions: torch.Tensor | None = None,
         inputs_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        # ``inputs_embeds`` is used by multimodal models (Florence-2) that mix
-        # projected image features into the token embeddings before encoding.
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
-        hidden_states = inputs_embeds + self.embed_positions(positions)
-        hidden_states = self.layernorm_embedding(hidden_states)
+        hidden_states = self.layernorm_embedding(
+            inputs_embeds + self.embed_positions(positions)
+        )
         for layer in self.layers:
             hidden_states = layer(hidden_states)
         return hidden_states
@@ -347,7 +271,6 @@ class BartDecoder(nn.Module):
         super().__init__()
         self.padding_idx = config.pad_token_id
         self.embed_scale = math.sqrt(config.d_model) if config.scale_embedding else 1.0
-
         self.embed_tokens = BartScaledWordEmbedding(
             config.vocab_size,
             config.d_model,
@@ -366,9 +289,9 @@ class BartDecoder(nn.Module):
         self.layernorm_embedding = nn.LayerNorm(config.d_model)
 
     def forward(self, input_ids: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
-        # input_ids/positions are flattened [num_tokens] across the batch.
-        hidden_states = self.embed_tokens(input_ids) + self.embed_positions(positions)
-        hidden_states = self.layernorm_embedding(hidden_states)
+        hidden_states = self.layernorm_embedding(
+            self.embed_tokens(input_ids) + self.embed_positions(positions)
+        )
         for layer in self.layers:
             hidden_states = layer(hidden_states)
         return hidden_states
@@ -387,7 +310,6 @@ class BartModel(nn.Module):
         self.decoder = BartDecoder(config)
 
         if config.tie_word_embeddings:
-            # Share storage so a single load updates all three.
             self.encoder.embed_tokens.weight = self.shared.weight
             self.decoder.embed_tokens.weight = self.shared.weight
 
@@ -408,11 +330,11 @@ class BartForConditionalGeneration(nn.Module):
 
     @torch.no_grad()
     def encode(self, encoder_input_ids: torch.Tensor) -> torch.Tensor:
-        """Run the encoder for a batch of ids [B, S] -> hidden [B, S, D]."""
-        positions = torch.arange(
-            encoder_input_ids.shape[1], device=encoder_input_ids.device
+        positions = (
+            torch.arange(encoder_input_ids.shape[1], device=encoder_input_ids.device)
+            .unsqueeze(0)
+            .expand_as(encoder_input_ids)
         )
-        positions = positions.unsqueeze(0).expand_as(encoder_input_ids)
         return self.model.encoder(encoder_input_ids, positions)
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -420,10 +342,8 @@ class BartForConditionalGeneration(nn.Module):
 
     @property
     def decoder_layers(self):
-        """Decoder self-attention layers, read by the model runner."""
         return self.model.decoder.layers
 
     @property
     def decoder(self):
-        """The paged decoder module, read by the model runner."""
         return self.model.decoder

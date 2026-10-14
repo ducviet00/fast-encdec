@@ -1,25 +1,3 @@
-"""Florence-2: DaViT vision encoder + multimodal projector + BART language model.
-
-The language model is ours (:mod:`fastencdec.models.bart`); the DaViT vision
-tower and projector below are a vendored, optimized copy of HuggingFace's
-``Florence2VisionBackbone`` / ``Florence2MultiModalProjector``
-(``modeling_florence2.py``, Apache-2.0) with the parameter layout unchanged, so
-the same checkpoint loads.  The module layout mirrors HF
-(``model.vision_tower``, ``model.multi_modal_projector``,
-``model.language_model``, ``lm_head``) so the same weight loader works.
-
-The vision forward passes avoid redundant layout copies: the channel attention
-hands SDPA pre-contiguous Q/K/V (flash kernel), the window attention does the
-same for aarch64, the window pad/crop is skipped when the spatial size divides
-the window size, and the wrapper's extra ``transpose(1, 2).contiguous()`` is
-dropped.  The channel-attention flash kernel shifts fp32 outputs by ~1e-6 (the
-same order as ``compile_mm_encoder``); decoded tokens are unaffected.
-
-The image-side graph runs once per request in the encoder; the decoder is the
-standard paged BART decoder.  Visual tokens are produced by the projector and
-scattered into the ``image_token_id`` slots of the encoder inputs.
-"""
-
 import math
 
 import torch
@@ -32,23 +10,17 @@ from .bart import BartModel
 class Florence2VisionMLP(nn.Module):
     def __init__(self, config, stage_idx: int):
         super().__init__()
+        dim = config.embed_dim[stage_idx]
+        hidden_dim = int(dim * config.mlp_ratio)
         self.activation_fn = F.gelu
-        self.fc1 = nn.Linear(
-            config.embed_dim[stage_idx],
-            int(config.embed_dim[stage_idx] * config.mlp_ratio),
-        )
-        self.fc2 = nn.Linear(
-            int(config.embed_dim[stage_idx] * config.mlp_ratio),
-            config.embed_dim[stage_idx],
-        )
+        self.fc1 = nn.Linear(dim, hidden_dim)
+        self.fc2 = nn.Linear(hidden_dim, dim)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         return self.fc2(self.activation_fn(self.fc1(hidden_states)))
 
 
 class Florence2VisionConvEmbed(nn.Module):
-    """Image to patch embedding (a strided conv, optional pre/post layer norm)."""
-
     def __init__(self, config, stage_idx: int):
         super().__init__()
         self.stage_idx = stage_idx
@@ -68,12 +40,10 @@ class Florence2VisionConvEmbed(nn.Module):
             stride=self.stride,
             padding=self.padding,
         )
-        dim_norm = self.in_channels if self.pre_norm else self.embed_dim
-        self.norm = nn.LayerNorm(dim_norm)
+        self.norm = nn.LayerNorm(self.in_channels if self.pre_norm else self.embed_dim)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        # Layer norm runs channels-last (the only layout ``nn.LayerNorm`` normalizes
-        # over); keep the permuted view so the conv consumes channels-last directly.
+        # LayerNorm normalizes over the last dim (channels-last).
         if self.pre_norm:
             hidden_states = self.norm(hidden_states.movedim(1, -1)).movedim(-1, 1)
         hidden_states = self.conv(hidden_states)
@@ -83,8 +53,6 @@ class Florence2VisionConvEmbed(nn.Module):
 
 
 class Florence2DropPath(nn.Module):
-    """Stochastic depth; identity at eval time."""
-
     def __init__(self, drop_prob: float = 0.0):
         super().__init__()
         self.drop_prob = drop_prob
@@ -94,17 +62,14 @@ class Florence2DropPath(nn.Module):
             return hidden_states
         keep_prob = 1 - self.drop_prob
         shape = (hidden_states.shape[0],) + (1,) * (hidden_states.ndim - 1)
-        random_tensor = torch.rand(
-            shape, dtype=hidden_states.dtype, device=hidden_states.device
+        rand = torch.floor(
+            torch.rand(shape, dtype=hidden_states.dtype, device=hidden_states.device)
+            + keep_prob
         )
-        random_tensor = torch.floor(random_tensor + keep_prob)
-        return hidden_states.div(keep_prob) * random_tensor
+        return hidden_states.div(keep_prob) * rand
 
 
 class Florence2VisionChannelAttention(nn.Module):
-    """Channel-group attention: attention over the ``head_dim`` axis, batched over
-    every spatial position simultaneously."""
-
     def __init__(self, config, stage_idx: int):
         super().__init__()
         self.dim = config.embed_dim[stage_idx]
@@ -115,10 +80,7 @@ class Florence2VisionChannelAttention(nn.Module):
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         batch_size, num_tokens, hidden_size = hidden_states.shape
         head_dim = hidden_size // self.groups
-        scale = num_tokens**-0.5
-
-        # [B, N, 3, groups, head_dim] -> [3, B, groups, head_dim, N], contiguous
-        # so SDPA can use the flash kernel (spatially-last is what it wants).
+        # Channel attention over head_dim (N is the key/value dim); contiguous for Flash SDPA.
         qkv = (
             self.qkv(hidden_states)
             .reshape(batch_size, num_tokens, 3, self.groups, head_dim)
@@ -126,8 +88,9 @@ class Florence2VisionChannelAttention(nn.Module):
             .contiguous()
         )
         query, key, value = qkv.unbind(0)
-        hidden_states = F.scaled_dot_product_attention(query, key, value, scale=scale)
-        # [B, groups, head_dim, N] -> [B, N, dim]
+        hidden_states = F.scaled_dot_product_attention(
+            query, key, value, scale=num_tokens**-0.5
+        )
         hidden_states = hidden_states.permute(0, 3, 1, 2).reshape(
             batch_size, num_tokens, hidden_size
         )
@@ -135,8 +98,6 @@ class Florence2VisionChannelAttention(nn.Module):
 
 
 class Florence2VisionWindowAttention(nn.Module):
-    """Local window attention over non-overlapping ``window_size`` patches."""
-
     def __init__(self, config, stage_idx: int):
         super().__init__()
         self.dim = config.embed_dim[stage_idx]
@@ -154,10 +115,9 @@ class Florence2VisionWindowAttention(nn.Module):
         pad_bottom = (ws - height % ws) % ws
         if pad_right or pad_bottom:
             hidden_states = F.pad(hidden_states, (0, 0, 0, pad_right, 0, pad_bottom))
-        padded_height = height + pad_bottom
-        padded_width = width + pad_right
+        padded_height, padded_width = height + pad_bottom, width + pad_right
 
-        # Partition into non-overlapping windows: [B, h, w, ws, ws, C] -> [nW, ws*ws, C].
+        # Partition into non-overlapping [num_windows, ws*ws, C] windows.
         windows = (
             hidden_states.view(
                 batch_size,
@@ -172,9 +132,7 @@ class Florence2VisionWindowAttention(nn.Module):
         )
         num_windows = windows.shape[0]
 
-        # Pre-contiguous Q/K/V: on aarch64 SDPA with BF16 non-contiguous
-        # (transposed) inputs is ~5.5x slower (Graviton), and the small copy is
-        # cheaper than that; x86 pays the copy either way.
+        # Contiguous QKV avoids the ~5.5x slower non-contiguous BF16 SDPA path on aarch64.
         qkv = (
             self.qkv(windows)
             .reshape(
@@ -185,10 +143,10 @@ class Florence2VisionWindowAttention(nn.Module):
         )
         query, key, value = qkv.unbind(0)
         windows = F.scaled_dot_product_attention(query, key, value, scale=self.scale)
-        windows = windows.transpose(1, 2).reshape(num_windows, ws * ws, embed_dim)
-        windows = self.proj(windows)
+        windows = self.proj(
+            windows.transpose(1, 2).reshape(num_windows, ws * ws, embed_dim)
+        )
 
-        # Merge windows back to the spatial layout.
         hidden_states = (
             windows.view(
                 -1,
@@ -228,24 +186,23 @@ class Florence2VisionSpatialBlock(nn.Module):
 
         hidden_states = self.conv1(hidden_states) + hidden_states
         residual = hidden_states.flatten(2).transpose(1, 2)
-        hidden_states = self.norm1(residual)
         hidden_states = self.window_attn(
-            hidden_states.view(batch_size, height, width, embed_dim)
+            self.norm1(residual).view(batch_size, height, width, embed_dim)
         )
-        hidden_states = residual + self.drop_path1(hidden_states)
-        hidden_states = hidden_states.transpose(1, 2).view(
-            batch_size, embed_dim, height, width
+        hidden_states = (
+            (residual + self.drop_path1(hidden_states))
+            .transpose(1, 2)
+            .view(batch_size, embed_dim, height, width)
         )
 
         hidden_states = self.conv2(hidden_states) + hidden_states
         residual = hidden_states.flatten(2).transpose(1, 2)
-        hidden_states = self.norm2(residual)
-        hidden_states = self.ffn(hidden_states)
-        hidden_states = residual + self.drop_path2(hidden_states)
-        hidden_states = hidden_states.transpose(1, 2).view(
-            batch_size, embed_dim, height, width
+        hidden_states = self.ffn(self.norm2(residual))
+        return (
+            (residual + self.drop_path2(hidden_states))
+            .transpose(1, 2)
+            .view(batch_size, embed_dim, height, width)
         )
-        return hidden_states
 
 
 class Florence2VisionChannelBlock(nn.Module):
@@ -271,19 +228,20 @@ class Florence2VisionChannelBlock(nn.Module):
         hidden_states = self.conv1(hidden_states) + hidden_states
         residual = hidden_states.flatten(2).transpose(1, 2)
         hidden_states = self.channel_attn(self.norm1(residual))
-        hidden_states = residual + self.drop_path1(hidden_states)
-        hidden_states = hidden_states.transpose(1, 2).view(
-            batch_size, embed_dim, height, width
+        hidden_states = (
+            (residual + self.drop_path1(hidden_states))
+            .transpose(1, 2)
+            .view(batch_size, embed_dim, height, width)
         )
 
         hidden_states = self.conv2(hidden_states) + hidden_states
         residual = hidden_states.flatten(2).transpose(1, 2)
         hidden_states = self.ffn(self.norm2(residual))
-        hidden_states = residual + self.drop_path2(hidden_states)
-        hidden_states = hidden_states.transpose(1, 2).view(
-            batch_size, embed_dim, height, width
+        return (
+            (residual + self.drop_path2(hidden_states))
+            .transpose(1, 2)
+            .view(batch_size, embed_dim, height, width)
         )
-        return hidden_states
 
 
 class Florence2VisionBlock(nn.Module):
@@ -303,13 +261,10 @@ class Florence2VisionBlock(nn.Module):
         )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        hidden_states = self.spatial_block(hidden_states)
-        return self.channel_block(hidden_states)
+        return self.channel_block(self.spatial_block(hidden_states))
 
 
 class Florence2VisionBackbone(nn.Module):
-    """DaViT backbone: four patch-embed + spatial/channel blocks stages."""
-
     def __init__(self, config):
         super().__init__()
         self.config = config
@@ -318,10 +273,7 @@ class Florence2VisionBackbone(nn.Module):
         self.num_groups = config.num_groups
         self.num_stages = len(self.embed_dim)
 
-        dpr = [
-            x.item()
-            for x in torch.linspace(0, config.drop_path_rate, sum(config.depths) * 2)
-        ]
+        dpr = torch.linspace(0, config.drop_path_rate, sum(config.depths) * 2).tolist()
         depth_offset = 0
         convs, blocks = [], []
         for stage_idx in range(self.num_stages):
@@ -343,7 +295,6 @@ class Florence2VisionBackbone(nn.Module):
         self.blocks = nn.ModuleList(blocks)
 
     def forward(self, pixel_values: torch.Tensor) -> torch.Tensor:
-        """``[B, 3, H, W]`` -> spatial feature map ``[B, C, H', W']`` (channels-first)."""
         hidden_states = pixel_values.to(dtype=self.convs[0].conv.weight.dtype)
         for conv, block in zip(self.convs, self.blocks):
             hidden_states = conv(hidden_states)
@@ -373,7 +324,6 @@ class Florence2VisionLearnedAbsolutePositionEmbedding2D(nn.Module):
             ],
             dim=-1,
         )
-        # [C, H, W] broadcast over batch (the reference repeats it per sample).
         return pos.permute(2, 0, 1).unsqueeze(0)
 
 
@@ -394,7 +344,7 @@ class Florence2VisionPositionalEmbeddingCosine1D(nn.Module):
         self.register_buffer("pos_idx_to_embed", pos_idx_to_embed)
 
     def forward(self, seq_embeds: torch.Tensor) -> torch.Tensor:
-        return self.pos_idx_to_embed[0 : seq_embeds.size(1), :]
+        return self.pos_idx_to_embed[: seq_embeds.size(1)]
 
 
 class Florence2MultiModalProjector(nn.Module):
@@ -412,24 +362,23 @@ class Florence2MultiModalProjector(nn.Module):
         self.visual_temporal_embed = Florence2VisionPositionalEmbeddingCosine1D(config)
 
     def forward(self, image_features: torch.Tensor) -> torch.Tensor:
-        position_features = image_features + self.image_position_embed(image_features)
-        position_features = position_features.flatten(2).transpose(1, 2)
+        position_features = (
+            (image_features + self.image_position_embed(image_features))
+            .flatten(2)
+            .transpose(1, 2)
+        )
         temporal_features = self.visual_temporal_embed(
             position_features[:, :1, :]
         ).unsqueeze(1)
         visual_token_features = (position_features + temporal_features).unsqueeze(1)
-        spatial_image_features = visual_token_features.mean(dim=2)
-        temporal_image_features = visual_token_features.mean(dim=1)
         image_features = torch.cat(
-            [spatial_image_features, temporal_image_features], dim=1
+            [visual_token_features.mean(dim=2), visual_token_features.mean(dim=1)],
+            dim=1,
         )
-        image_features = self.image_projection(image_features)
-        return self.image_proj_norm(image_features)
+        return self.image_proj_norm(self.image_projection(image_features))
 
 
 class Florence2Model(nn.Module):
-    """Vision tower, projector and BART language model (HF key layout)."""
-
     def __init__(self, config):
         super().__init__()
         self.vision_tower = Florence2VisionBackbone(config.vision_config)
@@ -450,26 +399,17 @@ class Florence2ForConditionalGeneration(nn.Module):
 
     @property
     def decoder_layers(self):
-        """Decoder self-attention layers, read by the model runner."""
         return self.model.language_model.decoder.layers
 
     @property
     def decoder(self):
-        """The paged decoder module, read by the model runner."""
         return self.model.language_model.decoder
 
     @torch.no_grad()
     def get_image_features(self, pixel_values: torch.Tensor) -> torch.Tensor:
-        """``[B, 3, H, W]`` -> visual tokens ``[B, 1 + H' * W', d_model]``."""
         return self.model.multi_modal_projector(self.model.vision_tower(pixel_values))
 
     def compile_mm_encoder(self, mode: str = "default", dynamic: bool = False) -> None:
-        """Opt in to ``torch.compile`` for the vision tower + projector.
-
-        Inductor fuses/reorders the BF16 graph, so outputs can shift slightly and
-        the first call compiles once per input shape (batch size).  Off by
-        default; the decoder is untouched.
-        """
         self.get_image_features = torch.compile(
             self.get_image_features, mode=mode, dynamic=dynamic
         )
@@ -478,16 +418,18 @@ class Florence2ForConditionalGeneration(nn.Module):
     def encode(
         self, encoder_input_ids: torch.Tensor, pixel_values: torch.Tensor | None = None
     ) -> torch.Tensor:
-        """Run the encoder with visual tokens scattered into image slots."""
+        # Scatter projected visual tokens into image_token_id positions before encoding.
         language_model = self.model.language_model
-        positions = torch.arange(
-            encoder_input_ids.shape[1], device=encoder_input_ids.device
+        positions = (
+            torch.arange(encoder_input_ids.shape[1], device=encoder_input_ids.device)
+            .unsqueeze(0)
+            .expand_as(encoder_input_ids)
         )
-        positions = positions.unsqueeze(0).expand_as(encoder_input_ids)
         inputs_embeds = language_model.shared(encoder_input_ids)
         if pixel_values is not None:
-            image_features = self.get_image_features(pixel_values)
-            image_features = image_features.to(inputs_embeds.dtype)
+            image_features = self.get_image_features(pixel_values).to(
+                inputs_embeds.dtype
+            )
             image_mask = encoder_input_ids == self.config.image_token_id
             inputs_embeds = inputs_embeds.masked_scatter(
                 image_mask.unsqueeze(-1), image_features

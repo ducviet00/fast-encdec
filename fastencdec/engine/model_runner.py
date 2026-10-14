@@ -1,9 +1,4 @@
-"""Batching + forward pass for the paged engine.
-
-The runner only builds the per-step :class:`~fastencdec.utils.context.Context`
-and the KV caches; every attention op picks its own kernel (see
-:mod:`fastencdec.layers.attention`).
-"""
+from collections import defaultdict
 
 import torch
 
@@ -14,8 +9,6 @@ from .cudagraph import DecodeGraphRunner
 
 
 class ModelRunner:
-    """Turns a list of :class:`Sequence` into logits, using the paged KV cache."""
-
     def __init__(
         self,
         model,
@@ -33,27 +26,21 @@ class ModelRunner:
         self.block_size = block_manager.block_size
         self.dtype = dtype
         self.decoder_layers = list(model.decoder_layers)
-        # nano-vllm-style ``torch.compile``: fuse the small tensor-only pointwise
-        # sequences in each layer (residual add + layer norm, activation + fc1).
-        # Wrapping the whole decoder instead fragments on the attention ops.
+        # Fuse per-layer pointwise ops (add+norm, act+fc1) when compile_model=True.
         bart.enable_compile(compile_model)
         self.decoder = model.decoder
 
         attention.set_backend(attn_backend)
 
-        # One paged cache per decoder self-attention layer; the layout is the one
-        # the kernel the ops will pick expects.
         self.cache_layers = [layer.self_attn for layer in self.decoder_layers]
         self.num_heads = self.cache_layers[0].num_heads
         self.head_dim = self.cache_layers[0].head_dim
-        # CUDA graphs capture the decoder step; only meaningful on the flash path.
         self.use_cudagraph = use_cudagraph and (
             self.device.type == "cuda"
             and attention.backend(self.device, dtype, self.head_dim, self.block_size)
             == "flash"
         )
-        # The graph path reserves one extra cache row as a scratch block for the
-        # padded rows of an undersized batch.
+        # One extra cache row serves as scratch for padded CUDA-graph rows.
         rows = block_manager.num_blocks + int(self.use_cudagraph)
         shape = attention.self_cache_shape(
             rows, self.block_size, self.num_heads, self.head_dim, self.device, dtype
@@ -73,16 +60,15 @@ class ModelRunner:
             layer.k_cache[dst].copy_(layer.k_cache[src])
             layer.v_cache[dst].copy_(layer.v_cache[src])
 
-    # --------------------------------------------------------------- encode
     @torch.no_grad()
     def _encode(self, seqs) -> None:
-        """Run the encoder once per distinct shape and cache cross-attn K/V."""
-        groups: dict[tuple, list] = {}
+        # Group fresh sequences by (encoder_len, image_shape) and cache cross-attn K/V.
+        groups = defaultdict(list)
         for seq in seqs:
-            pixel_shape = (
+            px_shape = (
                 None if seq.pixel_values is None else tuple(seq.pixel_values.shape)
             )
-            groups.setdefault((len(seq.encoder_token_ids), pixel_shape), []).append(seq)
+            groups[(len(seq.encoder_token_ids), px_shape)].append(seq)
         for group in groups.values():
             ids = torch.tensor(
                 [s.encoder_token_ids for s in group],
@@ -92,16 +78,13 @@ class ModelRunner:
             if group[0].pixel_values is None:
                 hidden = self.model.encode(ids)
             else:
-                pixel_values = torch.stack([s.pixel_values for s in group]).to(
-                    self.device
-                )
-                hidden = self.model.encode(ids, pixel_values=pixel_values)
+                px = torch.stack([s.pixel_values for s in group]).to(self.device)
+                hidden = self.model.encode(ids, pixel_values=px)
             for layer in self.decoder_layers:
                 attn = layer.encoder_attn
-                head = (len(group), ids.shape[1], attn.num_heads, attn.head_dim)
+                shape = (len(group), ids.shape[1], attn.num_heads, attn.head_dim)
                 key, value = attn.kv_proj(hidden).chunk(2, dim=-1)
-                key = key.reshape(head)
-                value = value.reshape(head)
+                key, value = key.reshape(shape), value.reshape(shape)
                 for j, seq in enumerate(group):
                     attn.encoder_kv_cache[seq.request_id] = (
                         key[j].transpose(0, 1).contiguous(),
@@ -116,11 +99,9 @@ class ModelRunner:
             attn.encoder_kv_cache.pop(request_id, None)
             attn.cross_staged = None
 
-    # -------------------------------------------------------------- prepare
     def _prepare(self, seqs):
         bs = self.block_size
-        # Reserve the whole batch's blocks before mutating anything so a full
-        # cache raises cleanly instead of leaving sequences half-prepared.
+        # Check block budget upfront so a full cache raises before mutating state.
         required = sum(
             self.block_manager.required_new_blocks(
                 seq, len(seq.token_ids) - seq.num_cached_tokens
@@ -146,36 +127,21 @@ class ModelRunner:
             context_lens.append(seq.num_cached_tokens)
             seq_block_tables.append(seq.block_table)
 
-        max_blocks = max(len(table) for table in seq_block_tables)
-        # Pad the block tables into a rectangle so the whole batch is one copy.
-        padded = [table + [0] * (max_blocks - len(table)) for table in seq_block_tables]
-        # nano-vllm style: build the host tensor pinned, then copy with
-        # non_blocking (a pageable copy would synchronise the stream).  The
-        # pinned allocator is CUDA-only, so CPU builds the tensor directly.
+        max_blocks = max(len(t) for t in seq_block_tables)
+        padded = [t + [0] * (max_blocks - len(t)) for t in seq_block_tables]
+        # Pinned host memory + non_blocking avoids stream syncs on CUDA.
         pin = self.device.type == "cuda"
-        context_lens = torch.tensor(context_lens, dtype=torch.int32, pin_memory=pin).to(
-            self.device, non_blocking=True
-        )
-        block_tables = torch.tensor(padded, dtype=torch.int32, pin_memory=pin).to(
-            self.device, non_blocking=True
-        )
-        slot_mapping = torch.tensor(new_slots, dtype=torch.int64, pin_memory=pin).to(
-            self.device, non_blocking=True
-        )
-        input_ids = torch.tensor(input_ids, dtype=torch.long, pin_memory=pin).to(
-            self.device, non_blocking=True
-        )
-        positions = torch.tensor(positions, dtype=torch.long, pin_memory=pin).to(
+        to_dev = lambda x, dtype: torch.tensor(x, dtype=dtype, pin_memory=pin).to(
             self.device, non_blocking=True
         )
         fields = {
             "is_prefill": is_prefill,
-            "context_lens": context_lens,
-            "block_tables": block_tables,
-            "slot_mapping": slot_mapping,
+            "context_lens": to_dev(context_lens, torch.int32),
+            "block_tables": to_dev(padded, torch.int32),
+            "slot_mapping": to_dev(new_slots, torch.int64),
             "request_ids": [seq.request_id for seq in seqs],
         }
-        return input_ids, positions, fields
+        return to_dev(input_ids, torch.long), to_dev(positions, torch.long), fields
 
     @torch.no_grad()
     def run(self, seqs):
@@ -194,6 +160,4 @@ class ModelRunner:
 
         set_context(**fields)
         hidden = self.decoder(input_ids, positions)
-        # One new token per sequence (the decoder prompt is a single token), so
-        # the logits are just the rows in sequence order.
         return self.model.compute_logits(hidden)

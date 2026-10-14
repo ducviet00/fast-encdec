@@ -52,19 +52,18 @@ placeholders; the decoder is unchanged.
   (torch 2.14.0+cpu, transformers 5.17, safetensors).
 - Dev CPU: AMD Ryzen 7 7840H (Zen 4) — has `avx512_bf16`, **no** AMX, **no**
   `avx512_fp16`. Prefer `bfloat16` or `float32`; never `float16`.
-- CUDA benchmarking box: `ssh ducviet00@34.142.225.47` (NVIDIA L4, sm89, 24 GB,
+- CUDA benchmarking box: `ssh ducviet00@35.247.129.222` (NVIDIA L4, sm89, 24 GB,
   driver 580 / CUDA 13.0, 4 vCPU). The repo lives at `~/fast-encdec` and the env
-  at `~/fegpu` (python 3.12, torch 2.11.0+cu128, transformers 5.19, `kernels`);
+  at `~/fast-encdec/.venv` (CUDA torch, transformers, `kernels`);
   there is no GPU on the dev box, so run `--device cuda` benchmarks there. Auth
   is flaky (public-key connections are sometimes refused) — retry. `build_essential`
   was installed for `torch.compile` of the Florence-2 vision tower.
-- CPU benchmarking boxes (the README matrix): `ssh ducviet00@35.247.129.222`
-  (Xeon 8581C, Emerald Rapids, `amx_bf16`, 8 vCPU = 4 cores), `ssh
+- CPU benchmarking boxes (the README matrix): `ssh ducviet00@34.142.225.47`
+  (Xeon 8581C, Emerald Rapids, `amx_bf16`, 8 vCPU = 4 cores, `~/env-ours`), `ssh
   ubuntu@54.252.169.176` (Xeon 6975P-C, Granite Rapids, `amx_bf16`, 8 vCPU = 4
-  cores) and `ssh ubuntu@3.26.21.19` (Graviton 5 / Neoverse-V3, 8 cores, no
-  SMT).  Each has the repo at `~/fast-encdec`, a `~/venv` (python 3.13/3.14,
-  torch 2.14.1+cpu, transformers 5.19) and `car.jpg` at
-  `/tmp/fastencdec/florence2_bench.jpg`.  `35.247` has **no rsync** — copy with
+  cores, `~/venv`) and `ssh ubuntu@3.26.21.19` (Graviton 5 / Neoverse-V3, 8 cores, no
+  SMT, `~/venv`).  Each has the repo at `~/fast-encdec` and `car.jpg` at
+  `/tmp/fastencdec/florence2_bench.jpg`.  Copy with
   `tar czf - ... | ssh box 'tar xzf - -C ~/fast-encdec'` — and all three needed
   `gcc g++ make ninja-build python3-dev` before `csrc/` would build (torch's
   cpp_extension shells out to ninja, and the Python headers must be present).
@@ -301,10 +300,10 @@ hand-edit or guess.**
 
 | config | ours ms | ours tok/s | hf ms | hf tok/s | speedup |
 |---|---:|---:|---:|---:|---:|
-| batch=1, beams=1, bf16 | 3709 | 69.0 | 6051 | 42.3 | 1.63x |
-| batch=8, beams=1, bf16 | 5266 | 388.9 | 8957 | 228.6 | 1.70x |
-| batch=8, beams=4, bf16 | 8063 | 254.0 | 30818 | 66.5 | 3.82x |
-| batch=8, beams=1, fp32 | 9006 | 227.4 | 24561 | 83.4 | 2.73x |
+| batch=1, beams=1, bf16 | 3756 | 68.2 | 6253 | 40.9 | 1.66x |
+| batch=8, beams=1, bf16 | 5270 | 388.6 | 9251 | 221.4 | 1.76x |
+| batch=8, beams=4, bf16 | 8116 | 252.3 | 31434 | 65.2 | 3.87x |
+| batch=8, beams=1, fp32 | 8896 | 230.2 | 24371 | 84.0 | 2.74x |
 
 One run, with the `pack_weights` prepack on (see the gotcha).  Re-running the same
 script with packing disabled in the same session read 5428 / 6153 / 9340 / 23814
@@ -354,8 +353,8 @@ default, `--no-cudagraph` disables it):
 
 | requests | max_tokens | eager tok/s | cudagraph tok/s |
 |---|---:|---:|---:|
-| 32 | 256 | 2601 | 3395 |
-| 128 | 256 | 4546 | 4654 |
+| 32 | 256 | 2674 | 3423 |
+| 128 | 256 | 4575 | 4657 |
 
 At batch ≥ 32 the decode is GPU-bound and re-reads the KV cache every step
 (`flash_fwd_splitkv_kernel` is ~2/3 of the CUDA time), so eager and the CUDA

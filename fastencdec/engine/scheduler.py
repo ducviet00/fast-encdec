@@ -1,12 +1,3 @@
-"""Continuous-batching scheduler.
-
-The scheduler keeps a ``running`` batch that requests join as soon as they
-arrive and leave when they finish.  Beam search is implemented on top of the
-same paged cache: each beam is a normal :class:`Sequence`, blocks are shared by
-reference count and copy-on-write happens on the next append (see
-:mod:`fastencdec.engine.block_manager`).
-"""
-
 from collections import deque
 
 from ..config import Config
@@ -37,17 +28,13 @@ class Scheduler:
         self.running.remove(seq)
 
     def schedule(self) -> list[Sequence]:
-        # A request expands to ``num_beams`` sequences once beam search starts,
-        # so charge every in-flight request its full beam width.  Counting
-        # sequences directly would admit ``max_num_seqs`` seeds and then
-        # overflow the batch on the following step.
-        widths = {seq.request_id: seq.sampling.num_beams for seq in self.running}
-        used = sum(widths.values())
-        while self.waiting:
-            seq = self.waiting[0]
-            if used + seq.sampling.num_beams > self.max_num_seqs:
-                break
-            self.waiting.popleft()
+        # Reserve full beam width per active request so beam expansion cannot overflow.
+        used = sum({s.request_id: s.sampling.num_beams for s in self.running}.values())
+        while (
+            self.waiting
+            and used + self.waiting[0].sampling.num_beams <= self.max_num_seqs
+        ):
+            seq = self.waiting.popleft()
             self.running.append(seq)
             used += seq.sampling.num_beams
         return list(self.running)

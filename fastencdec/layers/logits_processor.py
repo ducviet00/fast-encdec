@@ -1,12 +1,3 @@
-"""Logits processors from ``transformers`` for the paged engine.
-
-The engine builds one :class:`~transformers.LogitsProcessorList` per request
-(see :func:`build_logits_processor`) in the same order as
-``GenerationMixin._get_logits_processor``.  Greedy/sampling apply it to the step
-logits and beam search to the log-probs, matching where ``GenerationMixin``
-invokes the processors (``_sample`` vs ``_beam_search``).
-"""
-
 import torch
 from transformers import LogitsProcessorList
 from transformers.generation.logits_process import (
@@ -31,16 +22,6 @@ def build_logits_processor(
     is_beam: bool,
     device: str = "cpu",
 ) -> LogitsProcessorList:
-    """Assemble the processors for one request's resolved ``SamplingParams``.
-
-    Args:
-        max_length: total decoder length at which a forced EOS fires.
-        begin_index: decoder position at which ``begin_suppress_tokens`` apply.
-        is_beam: keep at least ``num_eos + 1`` tokens in the warpers so beam
-            search always has a non-EOS continuation to explore.
-        device: device the step logits live on (processors index ``scores`` with
-            their token tensors, which must be on the same device).
-    """
     eos_ids = sorted(params.eos_ids())
     eos = torch.tensor(eos_ids, dtype=torch.long, device=device) if eos_ids else None
 
@@ -72,7 +53,6 @@ def build_logits_processor(
             )
         )
 
-    # The warpers only run when sampling; greedy keeps the processors above.
     if params.temperature > 0:
         min_tokens = len(eos_ids) + 1 if is_beam else 1
         if params.temperature != 1.0:
