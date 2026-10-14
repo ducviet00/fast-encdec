@@ -4,7 +4,7 @@ from dataclasses import replace
 import torch
 
 from ..config import Config
-from ..layers.logits_processor import build_logits_processor
+from ..layers.logits_processor import LogitsProcessor
 from ..layers.sampler import Sampler
 from .block_manager import BlockManager
 from .model_runner import ModelRunner
@@ -60,12 +60,13 @@ class LLMEngine:
         if prompt_len != 1:
             raise ValueError("the decoder prompt must be a single token")
         begin_index = prompt_len + int(params.forced_bos_token_id is not None)
-        self._logits_processor = build_logits_processor(
+        self._logits_processor = LogitsProcessor(
             params,
+            vocab_size=self.runner.model.lm_head.out_features,
+            device=self.device,
             max_length=prompt_len + params.max_tokens,
             begin_index=begin_index,
             is_beam=params.num_beams > 1,
-            device=self.device,
         )
 
         request_ids = []
@@ -98,6 +99,8 @@ class LLMEngine:
             self.step()
 
     def _postprocess(self, seqs, logits) -> None:
+        if not seqs:
+            return
         processor = self._logits_processor
         by_request: dict[int, list[int]] = defaultdict(list)
         for index, seq in enumerate(seqs):
