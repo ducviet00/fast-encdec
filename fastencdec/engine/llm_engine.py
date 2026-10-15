@@ -101,54 +101,56 @@ class LLMEngine:
     def _postprocess(self, seqs, logits) -> None:
         if not seqs:
             return
+        # generate() uses one SamplingParams for the whole batch, so the mode
+        # is uniform; branch once instead of per request.
+        if self._logits_processor.is_beam:
+            self._postprocess_beam(seqs, logits)
+        else:
+            self._postprocess_greedy(seqs, logits)
+
+    def _postprocess_greedy(self, seqs, logits) -> None:
         processor = self._logits_processor
+        params = seqs[0].sampling
+        device = logits.device
+        pin = device.type == "cuda"
+        lens = [len(seq.token_ids) for seq in seqs]
+        width = max(lens)
+        if min(lens) == width:
+            histories = [seq.token_ids for seq in seqs]
+            lengths = None
+        else:
+            # Left-pad -1: pad never equals a real token, so the n-gram scan
+            # needs no masking; the length-gated checks read true lengths.
+            histories = [
+                [-1] * (width - len(seq.token_ids)) + seq.token_ids for seq in seqs
+            ]
+            lengths = torch.tensor(lens, dtype=torch.long)
+        input_ids = torch.tensor(histories, dtype=torch.long, pin_memory=pin).to(
+            device, non_blocking=True
+        )
+        scores = processor(input_ids, logits.float(), lengths)
+        tokens = self.sampler(scores, params.temperature).tolist()
+        for seq, token in zip(seqs, tokens):
+            self._sample(seq, params, token)
+
+    def _postprocess_beam(self, seqs, logits) -> None:
+        processor = self._logits_processor
+        num_beams = seqs[0].sampling.num_beams
+        device = logits.device
+        pin = device.type == "cuda"
         by_request: dict[int, list[int]] = defaultdict(list)
         for index, seq in enumerate(seqs):
             by_request[seq.request_id].append(index)
-
-        device = logits.device
-        pin = device.type == "cuda"
-        beam_groups = defaultdict(list)
-        greedy_rows = []
+        # One batched topk per (live_beam_count, decoder_len); num_beams is uniform.
+        groups: dict[tuple[int, int], list] = defaultdict(list)
         for request_id, indices in by_request.items():
-            params = seqs[indices[0]].sampling
-            if params.num_beams > 1:
-                # Group by (num_beams, live_beam_count, decoder_len) for a single batched topk.
-                length = len(seqs[indices[0]].token_ids)
-                beam_groups[(params.num_beams, len(indices), length)].append(
-                    (request_id, indices)
-                )
-            else:
-                greedy_rows.extend(indices)
-
-        for (num_beams, beam_count, _), group in beam_groups.items():
+            groups[(len(indices), len(seqs[indices[0]].token_ids))].append(
+                (request_id, indices)
+            )
+        for (beam_count, _), group in groups.items():
             self._beam_group(
                 seqs, group, num_beams, beam_count, processor, logits, device, pin
             )
-
-        if greedy_rows:
-            lens = [len(seqs[i].token_ids) for i in greedy_rows]
-            width = max(lens)
-            if min(lens) == width:
-                histories = [seqs[i].token_ids for i in greedy_rows]
-                lengths = None
-            else:
-                # Left-pad -1: pad never equals a real token, so the n-gram scan
-                # needs no masking; the length-gated checks read true lengths.
-                histories = [
-                    [-1] * (width - len(seqs[i].token_ids)) + seqs[i].token_ids
-                    for i in greedy_rows
-                ]
-                lengths = torch.tensor(lens, dtype=torch.long)
-            input_ids = torch.tensor(histories, dtype=torch.long, pin_memory=pin).to(
-                device, non_blocking=True
-            )
-            scores = processor(input_ids, logits[greedy_rows].float(), lengths)
-            tokens = self.sampler(
-                scores, seqs[greedy_rows[0]].sampling.temperature
-            ).tolist()
-            for row, i in enumerate(greedy_rows):
-                self._sample(seqs[i], seqs[i].sampling, tokens[row])
 
     def _sample(self, seq: Sequence, params, token: int) -> None:
         seq.append_token(token)
