@@ -99,7 +99,7 @@ fastencdec/
     attention.py       device-agnostic attention ops (encoder/self/cross) + dispatch
     cpu_attn.py        JIT build + wrapper for the vendored vLLM CPU kernels
     flash_attn.py      lazy loader for the kernels-community/flash-attn2 kernel (CUDA)
-    logits_processor.py transformers LogitsProcessorList from SamplingParams
+    logits_processor.py  pure-torch LogitsProcessor (built once per generate)
     packed_linear.py   oneDNN blocked-weight CPU linears (packed once at load)
     sampler.py         greedy / multinomial sampling (Sampler nn.Module)
   models/
@@ -214,15 +214,14 @@ own kernel; the runner and the model never name a backend
    `get_context()`. It is not thread-safe and assumes a single in-flight
    forward.
 9. **EOS.** `LLMEngine.generate` fills `SamplingParams.eos_token_id` from the
-   model config when unset. Logits processing is delegated to `transformers`'
-   `LogitsProcessorList` (built in `layers/logits_processor.build_logits_processor`),
-   so `min_length`, `no_repeat_ngram_size`, `repetition_penalty`, forced BOS/EOS,
-   suppressed tokens and the sampling warpers match `generate`. `LLM.generate`
+   model config when unset. Logits masking is pure torch
+   (`layers.logits_processor.LogitsProcessor`, mirroring `transformers`'
+   processor semantics), so `min_length`, `no_repeat_ngram_size`,
+   `repetition_penalty`, forced BOS/EOS, suppressed tokens and the sampling warpers match `generate`. `LLM.generate`
    uses the checkpoint's `GenerationConfig` (via
    `SamplingParams.from_generation_config`) when called without params; an
    explicit `SamplingParams` fully overrides those defaults. `length_penalty`
-   ranks finished beams. The whole batch shares one (stateless)
-   `LogitsProcessorList`; greedy decoding applies it once per step to every
+   ranks finished beams. The whole batch shares one (stateless) mask call; greedy decoding applies it once per step to every
    request at the same decoder length.
 10. **Multimodal inputs (Florence-2).** `Sequence.pixel_values` carries the
     request image `[3, H, W]`; `_encode` groups fresh sequences by

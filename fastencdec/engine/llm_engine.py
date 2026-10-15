@@ -4,7 +4,7 @@ from dataclasses import replace
 import torch
 
 from ..config import Config
-from ..layers.logits_processor import build_logits_processor
+from ..layers.logits_processor import LogitsProcessor
 from ..layers.sampler import Sampler
 from .block_manager import BlockManager
 from .model_runner import ModelRunner
@@ -64,12 +64,13 @@ class LLMEngine:
         if prompt_len != 1:
             raise ValueError("the decoder prompt must be a single token")
         begin_index = prompt_len + int(params.forced_bos_token_id is not None)
-        self._logits_processor = build_logits_processor(
+        self._logits_processor = LogitsProcessor(
             params,
+            vocab_size=self.runner.model.lm_head.out_features,
+            device=self.device,
             max_length=prompt_len + params.max_tokens,
             begin_index=begin_index,
             is_beam=params.num_beams > 1,
-            device=self.device,
         )
 
         request_ids = []
@@ -106,43 +107,60 @@ class LLMEngine:
 
     def _postprocess(self, seqs, logits) -> None:
         """Apply logits processors and advance greedy/sampled or beam-search sequences."""
+        if not seqs:
+            return
+        # generate() uses one SamplingParams for the whole batch, so the mode
+        # is uniform; branch once instead of per request.
+        if self._logits_processor.is_beam:
+            self._postprocess_beam(seqs, logits)
+        else:
+            self._postprocess_greedy(seqs, logits)
+
+    def _postprocess_greedy(self, seqs, logits) -> None:
+        """Apply the logits processor and sample one token per greedy sequence."""
         processor = self._logits_processor
+        params = seqs[0].sampling
+        device = logits.device
+        pin = device.type == "cuda"
+        lens = [len(seq.token_ids) for seq in seqs]
+        width = max(lens)
+        if min(lens) == width:
+            histories = [seq.token_ids for seq in seqs]
+            lengths = None
+        else:
+            # Left-pad -1: pad never equals a real token, so the n-gram scan
+            # needs no masking; the length-gated checks read true lengths.
+            histories = [
+                [-1] * (width - len(seq.token_ids)) + seq.token_ids for seq in seqs
+            ]
+            lengths = torch.tensor(lens, dtype=torch.long)
+        input_ids = torch.tensor(histories, dtype=torch.long, pin_memory=pin).to(
+            device, non_blocking=True
+        )
+        scores = processor(input_ids, logits.float(), lengths)
+        tokens = self.sampler(scores, params.temperature).tolist()
+        for seq, token in zip(seqs, tokens):
+            self._sample(seq, params, token)
+
+    def _postprocess_beam(self, seqs, logits) -> None:
+        """Group beam requests by shape and run one batched topk per group."""
+        processor = self._logits_processor
+        num_beams = seqs[0].sampling.num_beams
+        device = logits.device
+        pin = device.type == "cuda"
         by_request: dict[int, list[int]] = defaultdict(list)
         for index, seq in enumerate(seqs):
             by_request[seq.request_id].append(index)
-
-        device = logits.device
-        pin = device.type == "cuda"
-        beam_groups = defaultdict(list)
-        buckets = defaultdict(list)
+        # One batched topk per (live_beam_count, decoder_len); num_beams is uniform.
+        groups: dict[tuple[int, int], list] = defaultdict(list)
         for request_id, indices in by_request.items():
-            params = seqs[indices[0]].sampling
-            length = len(seqs[indices[0]].token_ids)
-            if params.num_beams > 1:
-                # Group by (num_beams, live_beam_count, decoder_len) for a single batched topk.
-                beam_groups[(params.num_beams, len(indices), length)].append(
-                    (request_id, indices)
-                )
-            else:
-                buckets[length].extend(indices)
-
-        for (num_beams, beam_count, _), group in beam_groups.items():
+            groups[(len(indices), len(seqs[indices[0]].token_ids))].append(
+                (request_id, indices)
+            )
+        for (beam_count, _), group in groups.items():
             self._beam_group(
                 seqs, group, num_beams, beam_count, processor, logits, device, pin
             )
-
-        for indices in buckets.values():
-            input_ids = torch.tensor(
-                [seqs[i].token_ids for i in indices],
-                dtype=torch.long,
-                pin_memory=pin,
-            ).to(device, non_blocking=True)
-            scores = processor(input_ids, logits[indices].float())
-            tokens = self.sampler(
-                scores, seqs[indices[0]].sampling.temperature
-            ).tolist()
-            for row, i in enumerate(indices):
-                self._sample(seqs[i], seqs[i].sampling, tokens[row])
 
     def _sample(self, seq: Sequence, params, token: int) -> None:
         """Append a sampled token to seq and finalize the request if it hit EOS or max_tokens."""
