@@ -177,9 +177,6 @@ name = "fast-encdec"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
-    { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11' or (extra == 'extra-11-fast-encdec-cpu' and extra == 'extra-11-fast-encdec-cu130')" },
-    { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version == '3.11.*' or (extra == 'extra-11-fast-encdec-cpu' and extra == 'extra-11-fast-encdec-cu130')" },
-    { name = "numpy", version = "2.5.3", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12' or (extra == 'extra-11-fast-encdec-cpu' and extra == 'extra-11-fast-encdec-cu130')" },
     { name = "pillow" },
     { name = "transformers" },
 ]
@@ -200,7 +197,6 @@ cu130 = [
 [package.metadata]
 requires-dist = [
     { name = "ninja", marker = "extra == 'cpu'", specifier = ">=1.11" },
-    { name = "numpy" },
     { name = "pillow" },
     { name = "torch", marker = "extra == 'cpu'", specifier = ">=2.11.0", index = "https://download.pytorch.org/whl/cpu", conflict = { package = "fast-encdec", extra = "cpu" } },
     { name = "torch", marker = "extra == 'cu130'", specifier = ">=2.11.0", index = "https://download.pytorch.org/whl/cu130", conflict = { package = "fast-encdec", extra = "cu130" } },

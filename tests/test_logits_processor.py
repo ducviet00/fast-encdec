@@ -128,6 +128,13 @@ def main():
         SamplingParams(
             eos_token_id=EOS, num_beams=4, temperature=0.7, top_k=5, top_p=0.9
         ),
+        # top_k below the beam min_tokens_to_keep (len(EOS)+1 == 3): HF keeps
+        # max(top_k, min_tokens), not top_k.
+        SamplingParams(eos_token_id=EOS, num_beams=4, temperature=0.7, top_k=1),
+        SamplingParams(eos_token_id=EOS, num_beams=4, temperature=0.7, top_k=2),
+        # Out-of-vocab suppress ids: HF's isin mask ignores them.
+        SamplingParams(eos_token_id=EOS, suppress_tokens=[5, 999]),
+        SamplingParams(eos_token_id=EOS, begin_suppress_tokens=[5, 999]),
     ]
     lengths = [1, 2, 3, 5, 9, 12, 63]
     for params, rows in itertools.product(cases, lengths):
@@ -146,6 +153,34 @@ def main():
         for params in cases:
             check_padded(params, lens)
     print(f"padded parity ok ({len(cases)} param sets x 7 shapes)")
+
+    # Padded -1 must not alias real token 0 in the repetition penalty, even
+    # when both share the scatter (pads on the left, real 0 on the right).
+    rep = SamplingParams(eos_token_id=EOS, repetition_penalty=1.3)
+    torch.manual_seed(0)
+    scores = torch.randn(4, VOCAB) * 3
+    true_rows = [
+        torch.tensor([0, 5]),
+        torch.tensor([0]),
+        torch.tensor([1, 0, 0]),
+        torch.tensor([7]),
+    ]
+    width = max(len(r) for r in true_rows)
+    pad = torch.full((len(true_rows), width), -1, dtype=torch.long)
+    for r, t in enumerate(true_rows):
+        pad[r, width - len(t) :] = t
+    want = torch.stack(
+        [
+            reference(rep, r.unsqueeze(0), s.unsqueeze(0).clone()).squeeze(0)
+            for r, s in zip(true_rows, scores)
+        ]
+    )
+    processor = LogitsProcessor(
+        rep, vocab_size=VOCAB, device="cpu", max_length=64, begin_index=3, is_beam=False
+    )
+    got = processor(pad, scores.clone(), torch.tensor([len(r) for r in true_rows]))
+    assert torch.equal(got, want), "padded repetition aliases token 0"
+    print("padded repetition zero-alias ok")
 
 
 if __name__ == "__main__":

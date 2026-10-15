@@ -1,7 +1,6 @@
 from collections import defaultdict
 from dataclasses import replace
 
-import numpy as np
 import torch
 
 from ..config import Config
@@ -108,6 +107,7 @@ class LLMEngine:
             by_request[seq.request_id].append(index)
 
         device = logits.device
+        pin = device.type == "cuda"
         beam_groups = defaultdict(list)
         greedy_rows = []
         for request_id, indices in by_request.items():
@@ -123,26 +123,26 @@ class LLMEngine:
 
         for (num_beams, beam_count, _), group in beam_groups.items():
             self._beam_group(
-                seqs, group, num_beams, beam_count, processor, logits, device
+                seqs, group, num_beams, beam_count, processor, logits, device, pin
             )
 
         if greedy_rows:
             lens = [len(seqs[i].token_ids) for i in greedy_rows]
             width = max(lens)
             if min(lens) == width:
-                histories = np.array(
-                    [seqs[i].token_ids for i in greedy_rows], dtype=np.int64
-                )
+                histories = [seqs[i].token_ids for i in greedy_rows]
                 lengths = None
             else:
                 # Left-pad -1: pad never equals a real token, so the n-gram scan
                 # needs no masking; the length-gated checks read true lengths.
-                histories = np.full((len(greedy_rows), width), -1, dtype=np.int64)
-                for r, i in enumerate(greedy_rows):
-                    t = seqs[i].token_ids
-                    histories[r, width - len(t) :] = t
+                histories = [
+                    [-1] * (width - len(seqs[i].token_ids)) + seqs[i].token_ids
+                    for i in greedy_rows
+                ]
                 lengths = torch.tensor(lens, dtype=torch.long)
-            input_ids = torch.from_numpy(histories).to(device)
+            input_ids = torch.tensor(histories, dtype=torch.long, pin_memory=pin).to(
+                device, non_blocking=True
+            )
             scores = processor(input_ids, logits[greedy_rows].float(), lengths)
             tokens = self.sampler(
                 scores, seqs[greedy_rows[0]].sampling.temperature
@@ -173,14 +173,14 @@ class LLMEngine:
         return child
 
     def _beam_group(
-        self, seqs, group, num_beams, beam_count, processor, logits, device
+        self, seqs, group, num_beams, beam_count, processor, logits, device, pin
     ) -> None:
         # Batched log_softmax + processor + topk over [num_requests, beam_count * vocab].
         vocab = logits.shape[-1]
         rows = [i for _, seq_indices in group for i in seq_indices]
-        input_ids = torch.from_numpy(
-            np.array([seqs[i].token_ids for i in rows], dtype=np.int64)
-        ).to(device)
+        input_ids = torch.tensor(
+            [seqs[i].token_ids for i in rows], dtype=torch.long, pin_memory=pin
+        ).to(device, non_blocking=True)
         logprobs = processor(input_ids, torch.log_softmax(logits[rows].float(), dim=-1))
         cumulative = torch.tensor(
             [[seqs[i].cum_logprob for i in seq_indices] for _, seq_indices in group],
