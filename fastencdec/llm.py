@@ -12,6 +12,7 @@ from .utils.loader import load_hf_weights
 
 
 def _load_generation_config(model_path: str) -> GenerationConfig:
+    """Load the checkpoint's GenerationConfig, falling back to an empty default."""
     try:
         return GenerationConfig.from_pretrained(model_path)
     except OSError:
@@ -19,6 +20,8 @@ def _load_generation_config(model_path: str) -> GenerationConfig:
 
 
 class LLM:
+    """Offline inference entrypoint for BART and Florence-2 checkpoints."""
+
     def __init__(
         self,
         model_path: str,
@@ -80,11 +83,11 @@ class LLM:
         self.engine = LLMEngine(self.model, config, eos_token_id=self.eos_token_id)
 
     def _decode(self, token_ids: list[int]) -> str:
-        # Keep special tokens (<loc_...>) for Florence-2 post-processing.
+        """Decode token IDs to text, keeping special tokens (<loc_...>) for Florence-2."""
         return self.tokenizer.decode(token_ids, skip_special_tokens=not self.multimodal)
 
     def _parse_prompt(self, item):
-        # Extract (text, prompt_token_ids, image) from a str or vLLM-style dict.
+        """Extract (text, prompt_token_ids, image) from a str or vLLM-style dict."""
         if isinstance(item, str):
             return item, None, None
         if not isinstance(item, dict):
@@ -104,6 +107,7 @@ class LLM:
         use_tqdm: bool = True,
         mm_processor_kwargs: dict | None = None,
     ) -> list[RequestOutput]:
+        """Run batched generation on prompts and return one RequestOutput per prompt."""
         if isinstance(prompts, (str, dict)):
             prompts = [prompts]
         if sampling_params is None:

@@ -7,6 +7,7 @@ _BACKENDS = ("auto", "vllm", "flash", "sdpa")
 
 
 def default_block_size(device) -> int:
+    """Return the optimal KV page size for the target device's attention kernel."""
     # FlashAttention-2 needs >=256; CPU AVX-512 'vec' needs 32; ARM NEON needs 16.
     if str(device).startswith("cuda"):
         return 256
@@ -15,6 +16,8 @@ def default_block_size(device) -> int:
 
 @dataclass
 class Config:
+    """Engine configuration shared by the scheduler, block manager, and runner."""
+
     num_blocks: int = 512
     block_size: int | None = None
     max_num_seqs: int = 32

@@ -11,6 +11,7 @@ _DERIVED: tuple = (None, None, None)
 
 
 def set_backend(name: str) -> None:
+    """Override the attention backend ('auto', 'vllm', 'flash', or 'sdpa')."""
     if name not in _BACKENDS:
         raise ValueError(f"attn_backend must be one of {_BACKENDS}, got {name!r}")
     global _PREFER
@@ -18,6 +19,7 @@ def set_backend(name: str) -> None:
 
 
 def _paged_backend(device, dtype, head_dim, block_size) -> str:
+    """Resolve the active paged attention backend for (device, dtype, head_dim, block_size)."""
     if _PREFER == "flash" and device.type != "cuda":
         raise RuntimeError("FlashAttention-2 requires a CUDA device")
     if _PREFER == "vllm" and device.type != "cpu":
@@ -51,19 +53,21 @@ def _paged_backend(device, dtype, head_dim, block_size) -> str:
 
 
 def backend(device, dtype, head_dim, block_size) -> str:
+    """Return the paged kernel name ('flash', 'vllm', or 'sdpa') for the given configuration."""
     return _paged_backend(torch.device(device), dtype, head_dim, block_size)
 
 
 def self_cache_shape(
     num_blocks, block_size, num_heads, head_dim, device, dtype
 ) -> tuple:
-    # Page-major [blocks, bs, H, D] for FlashAttention-2; head-major [blocks, H, bs, D] otherwise.
+    """Return page-major [blocks, bs, H, D] for FlashAttention-2 or head-major [blocks, H, bs, D] otherwise."""
     if backend(device, dtype, head_dim, block_size) == "flash":
         return (num_blocks, block_size, num_heads, head_dim)
     return (num_blocks, num_heads, block_size, head_dim)
 
 
 def store_kvcache(key, value, k_cache, v_cache, slot_mapping, block_size, page_major):
+    """Scatter new key/value [T, H, D] into the paged cache at slot_mapping."""
     if page_major:
         # Flat view indexing avoids div/mod kernels for page-major caches.
         k_cache.view(-1, *k_cache.shape[-2:])[slot_mapping] = key
@@ -76,6 +80,7 @@ def store_kvcache(key, value, k_cache, v_cache, slot_mapping, block_size, page_m
 
 
 def _store(key, value, k_cache, v_cache, slot_mapping, block_size, backend, isa=None):
+    """Scatter new key/value into the paged cache using the fastest path for backend."""
     if backend == "vllm":
         cpu_attn.module().reshape_and_cache(
             key, value, k_cache, v_cache, slot_mapping, isa
@@ -93,6 +98,7 @@ def _store(key, value, k_cache, v_cache, slot_mapping, block_size, backend, isa=
 
 
 def _dense_flash(query) -> bool:
+    """Return True if dense encoder self-attention should use FlashAttention-2."""
     if _PREFER == "sdpa":
         return False
     if not query.is_cuda:
@@ -112,6 +118,7 @@ def _dense_flash(query) -> bool:
 
 
 def encoder_self_attention(query, key, value, scale=None):
+    """Run dense non-causal self-attention [B, H, S, D] for the encoder."""
     if _dense_flash(query):
         out = flash_attn.require().flash_attn_func(
             query.transpose(1, 2).contiguous(),
@@ -127,6 +134,7 @@ def encoder_self_attention(query, key, value, scale=None):
 
 
 def _key_slot_ids(ctx, block_size):
+    """Build (block_ids, pos_in_block) gather indices for all cached keys in the batch."""
     lens = ctx.context_lens.long()
     pos = torch.arange(int(lens.max()), device=lens.device)
     blocks = ctx.block_tables.long()[:, pos // block_size]
@@ -136,7 +144,7 @@ def _key_slot_ids(ctx, block_size):
 
 
 def _dynamic_causal(ctx):
-    # Per-sequence causal flag for vLLM CPU kernel (1 = prefill when context_len == 1).
+    """Build per-sequence causal flags for the vLLM CPU kernel (1 = prefill when context_len == 1)."""
     if ctx.is_prefill:
         return torch.ones(
             ctx.context_lens.numel(), dtype=torch.int32, device=ctx.context_lens.device
@@ -145,6 +153,7 @@ def _dynamic_causal(ctx):
 
 
 def _self_derived(ctx, backend, num_heads, head_dim, dtype, block_size):
+    """Compute and memoize per-step self-attention kernel metadata for ctx."""
     global _DERIVED
     key = (backend, num_heads, head_dim, dtype, block_size)
     if _DERIVED[0] is ctx and _DERIVED[1] == key:
@@ -180,6 +189,7 @@ def _self_derived(ctx, backend, num_heads, head_dim, dtype, block_size):
 
 
 def decoder_self_attention(query, key, value, k_cache, v_cache, scale, block_size):
+    """Write new K/V into the paged cache and run causal self-attention over cached keys."""
     ctx = get_context()
     num_heads, head_dim = query.shape[1], query.shape[2]
     backend = _paged_backend(query.device, query.dtype, head_dim, block_size)
@@ -234,6 +244,7 @@ def decoder_self_attention(query, key, value, k_cache, v_cache, scale, block_siz
 
 
 def _cross_sdpa(query, layer, ctx, scale):
+    """Run per-sequence SDPA cross-attention against each request's dense encoder K/V."""
     return torch.cat(
         [
             cross_sdpa(query[i : i + 1], *layer.encoder_kv_cache[rid], scale)
@@ -244,7 +255,7 @@ def _cross_sdpa(query, layer, ctx, scale):
 
 
 def _cross_staged(layer, ctx, backend, block_size, num_heads, head_dim, dtype):
-    # Stage dense per-request encoder K/V into a paged cache, memoized per active request set.
+    """Stage dense per-request encoder K/V into a paged cache, memoized per active request set."""
     req_key = (backend, tuple(ctx.request_ids))
     staged = getattr(layer, "cross_staged", None)
     if staged is not None and staged[0] == req_key:
@@ -318,6 +329,7 @@ def _cross_staged(layer, ctx, backend, block_size, num_heads, head_dim, dtype):
 
 
 def decoder_cross_attention(query, layer, scale, block_size):
+    """Run decoder cross-attention against the layer's cached per-request encoder K/V."""
     ctx = get_context()
     num_heads, head_dim = query.shape[1], query.shape[2]
     backend = _paged_backend(query.device, query.dtype, head_dim, block_size)
@@ -358,6 +370,7 @@ def decoder_cross_attention(query, layer, scale, block_size):
 
 
 def _sdpa(query, key, value, causal, scale):
+    """Run single-sequence SDPA over contiguous [L, H, D] tensors."""
     # .contiguous() avoids the ~20x slower non-contiguous BF16 SDPA path on aarch64.
     out = F.scaled_dot_product_attention(
         query.transpose(0, 1).unsqueeze(0).contiguous(),
@@ -370,6 +383,7 @@ def _sdpa(query, key, value, causal, scale):
 
 
 def cross_sdpa(query, key, value, scale):
+    """Run single-sequence cross-attention over contiguous [H, S, D] encoder K/V."""
     out = F.scaled_dot_product_attention(
         query.transpose(0, 1).unsqueeze(0).contiguous(),
         key.unsqueeze(0),
@@ -381,11 +395,13 @@ def cross_sdpa(query, key, value, scale):
 
 
 def _gather_all(cache, key_slot_ids):
+    """Gather cached keys or values at (block_ids, pos_in_block)."""
     block_ids, pos_in_block = key_slot_ids
     return cache[block_ids, :, pos_in_block, :]
 
 
 def _sdpa_paged(query, k_cache, v_cache, key_slot_ids, ctx, scale):
+    """Run paged self-attention via PyTorch SDPA (batched on CUDA, per-sequence on CPU)."""
     if query.is_cuda:
         return _sdpa_paged_batched(query, k_cache, v_cache, key_slot_ids, ctx, scale)
     k_all = _gather_all(k_cache, key_slot_ids)
@@ -407,7 +423,7 @@ def _sdpa_paged(query, k_cache, v_cache, key_slot_ids, ctx, scale):
 
 
 def _sdpa_paged_batched(query, k_cache, v_cache, key_slot_ids, ctx, scale):
-    # Batched block-diagonal SDPA on CUDA to avoid per-sequence launch overhead.
+    """Run batched block-diagonal SDPA over the gathered cache on CUDA."""
     device = query.device
     k_all = _gather_all(k_cache, key_slot_ids)
     v_all = _gather_all(v_cache, key_slot_ids)

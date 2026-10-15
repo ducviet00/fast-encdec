@@ -5,6 +5,8 @@ from ..utils.context import set_context
 
 
 class DecodeGraphRunner:
+    """Captures and replays bucketed CUDA graphs for the FlashAttention-2 decode step."""
+
     def __init__(self, runner, max_num_seqs: int):
         self.runner = runner
         self.device = runner.device
@@ -32,6 +34,7 @@ class DecodeGraphRunner:
         self._staged_ids = None
 
     def stage(self, seqs) -> None:
+        """Stage per-request encoder K/V and block tables into static buffers when active requests change."""
         bs = self.block_size
         if not self.req_blocks:
             self.next_block = 0
@@ -59,6 +62,7 @@ class DecodeGraphRunner:
             self._staged_ids = ids
 
     def _alloc_cross(self, capacity: int) -> None:
+        """Allocate fixed page-major cross-attention KV caches and invalidate captured graphs."""
         self.cross_capacity = capacity
         self.cross_scratch = capacity - 1
         for layer in self.runner.decoder_layers:
@@ -73,6 +77,7 @@ class DecodeGraphRunner:
         self.pool = None
 
     def _write_cross(self) -> None:
+        """Scatter each active request's dense encoder K/V into the static paged cross_cache."""
         bs = self.block_size
         for layer in self.runner.decoder_layers:
             attn = layer.encoder_attn
@@ -95,6 +100,7 @@ class DecodeGraphRunner:
                 )
 
     def _rows(self, seqs) -> None:
+        """Build per-sequence cross-attention block tables and sequence lengths for seqs."""
         width = max((p for _, p, _ in self.req_blocks.values()), default=1)
         table = torch.zeros(len(seqs), width, dtype=torch.int32, device=self.device)
         for i, seq in enumerate(seqs):
@@ -110,6 +116,7 @@ class DecodeGraphRunner:
         )
 
     def _alloc_bufs(self) -> None:
+        """Preallocate static input, metadata, and output tensors for graph capture and replay."""
         dev = self.device
         num_blocks = self.runner.block_manager.num_blocks
         width = self.cross_scratch + 1
@@ -135,9 +142,11 @@ class DecodeGraphRunner:
         self.pool = None
 
     def ready(self) -> bool:
+        """Return True when static graph buffers are allocated."""
         return self.bufs is not None
 
     def _fill_sentinels(self) -> None:
+        """Fill static metadata buffers with scratch sentinels so padded rows are no-ops."""
         b = self.bufs
         b["slot_mapping"].fill_(self.scratch_slot)
         b["context_lens"].fill_(1)
@@ -146,6 +155,7 @@ class DecodeGraphRunner:
         b["cross_bt"].fill_(self.cross_scratch)
 
     def _set_context(self, bs: int) -> None:
+        """Bind the global Context to the first bs rows of the static graph buffers."""
         b = self.bufs
         set_context(
             is_prefill=False,
@@ -158,6 +168,7 @@ class DecodeGraphRunner:
         )
 
     def capture(self) -> None:
+        """Capture one CUDA graph per batch-size bucket into a shared memory pool."""
         if self.graphs:
             return
         b = self.bufs
@@ -179,6 +190,7 @@ class DecodeGraphRunner:
         self._fill_sentinels()
 
     def replay(self, bs: int, input_ids, positions, fields):
+        """Copy step inputs into the static buffers, replay the bucket graph, and return hidden states."""
         b = self.bufs
         bucket = next(x for x in self.graph_bs if x >= bs)
         self._fill_sentinels()

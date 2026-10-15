@@ -2,7 +2,7 @@ import torch
 
 
 def fuse_projections(model, state_dict: dict) -> None:
-    # Concatenate separate HF projections (e.g. q/k/v_proj -> qkv_proj) along dim 0.
+    """Concatenate separate HF projections (e.g. q/k/v_proj -> qkv_proj) along dim 0 in state_dict."""
     for prefix, module in model.named_modules():
         for target, sources in getattr(module, "fused_projections", {}).items():
             for suffix in ("weight", "bias"):
@@ -14,6 +14,7 @@ def fuse_projections(model, state_dict: dict) -> None:
 
 
 def load_hf_weights(model, model_path: str, hf_model_cls=None):
+    """Load HuggingFace checkpoint weights (with projection fusion) into model."""
     if hf_model_cls is None:
         from transformers import AutoModelForSeq2SeqLM
 

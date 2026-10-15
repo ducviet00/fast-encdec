@@ -17,6 +17,7 @@ class Florence2VisionMLP(nn.Module):
         self.fc2 = nn.Linear(hidden_dim, dim)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Run the two-layer GELU MLP on vision features."""
         return self.fc2(self.activation_fn(self.fc1(hidden_states)))
 
 
@@ -43,6 +44,7 @@ class Florence2VisionConvEmbed(nn.Module):
         self.norm = nn.LayerNorm(self.in_channels if self.pre_norm else self.embed_dim)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Apply strided patch convolution with pre- or post-LayerNorm."""
         # LayerNorm normalizes over the last dim (channels-last).
         if self.pre_norm:
             hidden_states = self.norm(hidden_states.movedim(1, -1)).movedim(-1, 1)
@@ -58,6 +60,7 @@ class Florence2DropPath(nn.Module):
         self.drop_prob = drop_prob
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Apply stochastic depth during training (identity at eval time)."""
         if self.drop_prob == 0.0 or not self.training:
             return hidden_states
         keep_prob = 1 - self.drop_prob
@@ -78,6 +81,7 @@ class Florence2VisionChannelAttention(nn.Module):
         self.proj = nn.Linear(self.dim, self.dim)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Run grouped channel self-attention over the head_dim axis."""
         batch_size, num_tokens, hidden_size = hidden_states.shape
         head_dim = hidden_size // self.groups
         # Channel attention over head_dim (N is the key/value dim); contiguous for Flash SDPA.
@@ -108,6 +112,7 @@ class Florence2VisionWindowAttention(nn.Module):
         self.proj = nn.Linear(self.dim, self.dim)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Partition spatial features into local windows, run self-attention, and merge back."""
         batch_size, height, width, embed_dim = hidden_states.shape
         ws = self.window_size
 
@@ -182,6 +187,7 @@ class Florence2VisionSpatialBlock(nn.Module):
         )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Run depthwise conv + local window attention + FFN on spatial features."""
         batch_size, embed_dim, height, width = hidden_states.shape
 
         hidden_states = self.conv1(hidden_states) + hidden_states
@@ -223,6 +229,7 @@ class Florence2VisionChannelBlock(nn.Module):
         )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Run depthwise conv + grouped channel attention + FFN on spatial features."""
         batch_size, embed_dim, height, width = hidden_states.shape
 
         hidden_states = self.conv1(hidden_states) + hidden_states
@@ -261,6 +268,7 @@ class Florence2VisionBlock(nn.Module):
         )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Run one DaViT block (spatial window block followed by channel block)."""
         return self.channel_block(self.spatial_block(hidden_states))
 
 
@@ -295,6 +303,7 @@ class Florence2VisionBackbone(nn.Module):
         self.blocks = nn.ModuleList(blocks)
 
     def forward(self, pixel_values: torch.Tensor) -> torch.Tensor:
+        """Encode images [B, 3, H, W] through the four DaViT stages into [B, C, H', W']."""
         hidden_states = pixel_values.to(dtype=self.convs[0].conv.weight.dtype)
         for conv, block in zip(self.convs, self.blocks):
             hidden_states = conv(hidden_states)
@@ -314,6 +323,7 @@ class Florence2VisionLearnedAbsolutePositionEmbedding2D(nn.Module):
         )
 
     def forward(self, pixel_values: torch.Tensor) -> torch.Tensor:
+        """Build 2D row/column positional embeddings [1, C, H, W] for a spatial feature map."""
         height, width = pixel_values.shape[-2:]
         x_emb = self.column_embeddings(torch.arange(width, device=pixel_values.device))
         y_emb = self.row_embeddings(torch.arange(height, device=pixel_values.device))
@@ -344,6 +354,7 @@ class Florence2VisionPositionalEmbeddingCosine1D(nn.Module):
         self.register_buffer("pos_idx_to_embed", pos_idx_to_embed)
 
     def forward(self, seq_embeds: torch.Tensor) -> torch.Tensor:
+        """Return 1D cosine temporal positional embeddings for seq_embeds."""
         return self.pos_idx_to_embed[: seq_embeds.size(1)]
 
 
@@ -362,6 +373,7 @@ class Florence2MultiModalProjector(nn.Module):
         self.visual_temporal_embed = Florence2VisionPositionalEmbeddingCosine1D(config)
 
     def forward(self, image_features: torch.Tensor) -> torch.Tensor:
+        """Add 2D/temporal embeddings, pool global token, and project to language model dim."""
         position_features = (
             (image_features + self.image_position_embed(image_features))
             .flatten(2)
@@ -399,17 +411,21 @@ class Florence2ForConditionalGeneration(nn.Module):
 
     @property
     def decoder_layers(self):
+        """Return the language model's decoder layer list."""
         return self.model.language_model.decoder.layers
 
     @property
     def decoder(self):
+        """Return the language model's paged decoder module."""
         return self.model.language_model.decoder
 
     @torch.no_grad()
     def get_image_features(self, pixel_values: torch.Tensor) -> torch.Tensor:
+        """Run the vision tower and multimodal projector to produce visual token embeddings."""
         return self.model.multi_modal_projector(self.model.vision_tower(pixel_values))
 
     def compile_mm_encoder(self, mode: str = "default", dynamic: bool = False) -> None:
+        """Wrap get_image_features with torch.compile."""
         self.get_image_features = torch.compile(
             self.get_image_features, mode=mode, dynamic=dynamic
         )
@@ -418,7 +434,7 @@ class Florence2ForConditionalGeneration(nn.Module):
     def encode(
         self, encoder_input_ids: torch.Tensor, pixel_values: torch.Tensor | None = None
     ) -> torch.Tensor:
-        # Scatter projected visual tokens into image_token_id positions before encoding.
+        """Scatter projected visual tokens into image_token_id slots and run the BART encoder."""
         language_model = self.model.language_model
         positions = (
             torch.arange(encoder_input_ids.shape[1], device=encoder_input_ids.device)
@@ -437,4 +453,5 @@ class Florence2ForConditionalGeneration(nn.Module):
         return language_model.encoder(positions=positions, inputs_embeds=inputs_embeds)
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Project decoder hidden states to vocabulary logits."""
         return self.lm_head(hidden_states)
