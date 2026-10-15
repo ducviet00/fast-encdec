@@ -1,4 +1,4 @@
-"""BART benchmark on CUDA: this engine vs vLLM, scenarios x configs.
+"""BART benchmark: this engine vs vLLM, scenarios x configs.
 
 vLLM runs BART through two plugins (no fork, no source patch):
 
@@ -34,6 +34,22 @@ is how the decode-scaling tables are produced::
 
   ... --engine ours --batches 1,2,4,8,16,32 --json ours_greedy.json
   python benchmarks/benchmark_vllm.py --compare ours_greedy.json vllm_greedy.json
+
+``--device cpu`` runs the same comparison on a CPU box (``VLLM_CPU_KVCACHE_SPACE``
+is defaulted to 8 GiB here).  The vLLM side then needs a vLLM whose CPU build
+still has the V1 model runner plus the *pre-MRV2* BART plugin, because vLLM gates
+the V2 model runner on Triton and Triton has no CPU backend::
+
+  # the CPU env: vllm 0.24.0+cpu (aarch64 wheel from the v0.24.0 GitHub release,
+  # deps from the PyTorch CPU index) + bart-plugin v0.5.0 + beam plugin 0.1.5
+  PYTHONPATH=. ~/venv/bin/python benchmarks/benchmark_vllm.py --engine ours --device cpu --json ours.json
+  HF_HUB_OFFLINE=1 ~/vllm024/bin/python benchmarks/benchmark_vllm.py --engine vllm --device cpu --json vllm.json
+  python benchmarks/benchmark_vllm.py --compare ours.json vllm.json
+
+Beam search is CUDA-only: ``BeamSearchScheduler`` raises unless vLLM uses the V2
+model runner *with async scheduling*, and BART's plugin requires V2 outright, so
+``--engine vllm --device cpu`` rejects ``beams > 1`` instead of silently running
+something else.
 """
 
 import argparse
@@ -96,6 +112,11 @@ def _sync() -> None:
         torch.cuda.synchronize()
 
 
+def _empty_cache() -> None:
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
 def timed(fn, warmup: int, repeats: int):
     """Return (best_seconds, per-repeat token counts)."""
     for _ in range(warmup):
@@ -141,7 +162,7 @@ def run_ours(args, tokenizer, scenarios):
     from fastencdec import LLM, SamplingParams
     from fastencdec.config import default_block_size
 
-    block_size = default_block_size("cuda")
+    block_size = default_block_size(args.device)
     max_seqs = max(b * n for _, b, n, _ in args.configs)
     rows = []
     for dtype_name in ("bfloat16", "float32"):
@@ -157,7 +178,7 @@ def run_ours(args, tokenizer, scenarios):
                 block_size=block_size,
                 max_num_seqs=max_seqs,
                 dtype=getattr(torch, dtype_name),
-                device="cuda",
+                device=args.device,
             )
             for label, batch, beams, _ in configs:
                 # min_length = out + 1 makes EOS illegal for the whole run, so
@@ -194,18 +215,31 @@ def run_ours(args, tokenizer, scenarios):
                 )
                 dump(args, rows)
             del llm
-            torch.cuda.empty_cache()
+            _empty_cache()
     return rows
 
 
 def run_vllm(args, tokenizer, scenarios):
     use_beam = any(beams > 1 for _, _, beams, _ in args.configs)
+    on_cpu = not str(args.device).startswith("cuda")
+    if on_cpu and use_beam:
+        # BeamSearchScheduler's ctor raises without MRV2 + async scheduling, and
+        # vLLM only implements MRV2 behind Triton, which has no CPU backend.
+        raise SystemExit(
+            "vLLM cannot run BART beam search on CPU: BeamSearchScheduler needs "
+            "the V2 model runner with async scheduling, which vLLM gates on "
+            "Triton.  Drop the beams>1 configs (or use --device cuda)."
+        )
     # Read before importing vllm: no nvcc on this box, so FlashInfer's JIT sampler
     # must be off.  The beam plugin replaces the scheduler with a custom one that
     # disables async scheduling (and can slow plain greedy down), so load it only
     # when a beam config is actually requested.
     os.environ.setdefault("VLLM_USE_FLASHINFER_SAMPLER", "0")
     os.environ.setdefault("VLLM_PLUGINS", "bart,beam_search" if use_beam else "bart")
+    if on_cpu:
+        # The CPU backend sizes its KV pool from the environment, not from
+        # ``gpu_memory_utilization``.
+        os.environ.setdefault("VLLM_CPU_KVCACHE_SPACE", "8")
     import vllm_bart_plugin  # noqa: F401  registers BART with vLLM
     from vllm import LLM, SamplingParams
 
@@ -213,8 +247,9 @@ def run_vllm(args, tokenizer, scenarios):
         "model": args.model,
         "max_model_len": 1024,
         "max_num_seqs": max(b * n for _, b, n, _ in args.configs),
-        "gpu_memory_utilization": 0.7,
     }
+    if not on_cpu:
+        llm_kwargs["gpu_memory_utilization"] = 0.7
     if use_beam:
         llm_kwargs["scheduler_cls"] = "vllm_beam_search.scheduler.BeamSearchScheduler"
 
@@ -276,7 +311,7 @@ def run_vllm(args, tokenizer, scenarios):
                 dump(args, rows)
         del llm
         gc.collect()
-        torch.cuda.empty_cache()
+        _empty_cache()
     return rows
 
 
@@ -316,6 +351,13 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", default=MODEL)
     ap.add_argument("--engine", choices=("ours", "vllm"))
+    ap.add_argument("--device", default="cuda", help="cuda or cpu (cuda:N works)")
+    ap.add_argument(
+        "--threads",
+        type=int,
+        default=0,
+        help="0 = torch default, i.e. the number of physical cores",
+    )
     ap.add_argument("--scenarios", default="", help="comma list, default all")
     ap.add_argument(
         "--configs",
@@ -338,6 +380,9 @@ def main():
         return
     if not args.engine:
         ap.error("--engine is required (or use --compare)")
+
+    if args.threads:
+        torch.set_num_threads(args.threads)
 
     from transformers import AutoTokenizer
 

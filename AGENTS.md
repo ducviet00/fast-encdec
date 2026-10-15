@@ -280,6 +280,16 @@ python benchmarks/benchmark_vllm.py --compare ours.json vllm.json
 PYTHONPATH=. .venv/bin/python benchmarks/benchmark_vllm.py --engine ours \
     --batches 1,2,4,8,16,32 --json ours_greedy.json
 
+# ours vs vLLM on CPU (`--device cpu`): greedy only — see the vLLM gotcha.
+# The vLLM side needs the *pre-MRV2* BART plugin (v0.5.0) on a vLLM whose CPU
+# build still has the V1 model runner (0.24.0+cpu from the v0.24.0 GitHub
+# release wheel, deps from the PyTorch CPU index), in its own venv:
+PYTHONPATH=. ~/venv/bin/python benchmarks/benchmark_vllm.py --engine ours \
+    --device cpu --configs 'batch=1, beams=1, bf16;batch=8, beams=1, bf16;batch=8, beams=1, fp32' --json ours.json
+HF_HUB_OFFLINE=1 ~/vllm024/bin/python benchmarks/benchmark_vllm.py --engine vllm \
+    --device cpu --configs 'batch=1, beams=1, bf16;batch=8, beams=1, bf16;batch=8, beams=1, fp32' --json vllm.json
+python benchmarks/benchmark_vllm.py --compare ours.json vllm.json
+
 # Florence-2 benchmark (real image; caption / detection / segmentation /
 # phrase-grounding tasks, EOS-stopped)
 PYTHONPATH=. $P benchmarks/benchmark_florence2.py
@@ -313,17 +323,17 @@ hand-edit or guess.**
 
 | config | ours ms | ours tok/s | hf ms | hf tok/s | speedup |
 |---|---:|---:|---:|---:|---:|
-| batch=1, beams=1, bf16 | 3756 | 68.2 | 6253 | 40.9 | 1.66x |
-| batch=8, beams=1, bf16 | 5270 | 388.6 | 9251 | 221.4 | 1.76x |
-| batch=8, beams=4, bf16 | 8116 | 252.3 | 31434 | 65.2 | 3.87x |
-| batch=8, beams=1, fp32 | 8896 | 230.2 | 24371 | 84.0 | 2.74x |
+| batch=1, beams=1, bf16 | 3489 | 73.4 | 5562 | 46.0 | 1.59x |
+| batch=8, beams=1, bf16 | 5134 | 398.9 | 8902 | 230.1 | 1.73x |
+| batch=8, beams=4, bf16 | 7857 | 260.7 | 31060 | 65.9 | 3.95x |
+| batch=8, beams=1, fp32 | 8613 | 237.8 | 24946 | 82.1 | 2.90x |
 
 One run, with the `pack_weights` prepack on (see the gotcha).  Re-running the same
-script with packing disabled in the same session read 5428 / 6153 / 9340 / 23814
-ms (1.12x / 1.46x / 3.37x / 1.03x), so the prepack is worth 1.46x / 1.17x /
-1.16x / **2.64x** here — it is the whole of the fp32 row, where eager
+script back-to-back with packing disabled read 4513 / 6150 / 9435 / 23794
+ms (1.37x / 1.51x / 3.35x / 1.05x), so the prepack is worth 1.29x / 1.20x /
+1.20x / **2.76x** here — it is the whole of the fp32 row, where eager
 BART-large only ties HF.  The latency-bound batch=1 row varies ~5% with this
-laptop's clock, so its 1.63x is the least reliable cell.  This recording is at
+laptop's clock, so its 1.59x is the least reliable cell.  This recording is at
 the x86 default
 `block_size=32`; at the previous 16 it read 1.16x / 1.49x / 3.44x / 1.03x — that
 page size is the greedy-vs-beam trade-off in the gotcha below.  Absolute times
@@ -592,6 +602,27 @@ on this box with the same kind of workload.
   CUDA graph and goes launch-bound (a batch=8 decode runs at the batch=1 rate).
   vLLM's beam path appends a trailing EOS, so it decodes N+1 tokens against our
   exactly-N; the reported speedup is `vLLM ms / ours ms`.
+- **vLLM on CPU: greedy only.**  `--device cpu` compares the two engines on a CPU
+  box, but **only for `beams=1`**: vLLM's CPU wheels disable Triton ("Triton is
+  installed, but doesn't include CPU backend"), and vLLM gates its V2 model runner
+  on it (`ValueError: Model Runner V2 requires Triton.`, `vllm/config/vllm.py`).
+  `BeamSearchScheduler.__init__` raises `requires MRV2 with async scheduling
+  enabled` without it, and `vllm-bart-plugin` ≥ v0.6 requires V2 outright, so
+  current BART plugins cannot even *load* BART on CPU.  The working combination is
+  **vLLM 0.24.0+cpu + `vllm-bart-plugin` v0.5.0** (the last release that only
+  registers the model class and runs on the V1 model runner) + the beam plugin
+  installed but never used; `--engine vllm --device cpu` therefore rejects
+  `beams>1` instead of silently degrading to greedy.  The CPU backend sizes its KV
+  pool from `VLLM_CPU_KVCACHE_SPACE` (the script defaults it to 8 GiB), not from
+  `gpu_memory_utilization`.  Beam search on CPU has no vLLM reference - compare it
+  against HF with `benchmarks/benchmark.py` instead.  What to expect on CPU (Graviton
+  5, aarch64, 8 cores, bf16): ours leads every greedy row at 1.03-4.8x.  The wide
+  end is `512->128`, where vLLM's CPU path barely batches (68 -> 120 tok/s from
+  `batch=1` to 32, against 129 -> 571 for ours); the narrow end is `128->512`
+  (1.03-1.27x), where a single-token decode dominates and both engines do the same
+  bandwidth-bound GEMM work.  fp32 is ~1.1x for the same reason.  Ours' own
+  `beams=4` rows on that box are 386 / 273 / 362 tok/s at `128->512` / `512->128` /
+  `256->256`.
 - **CUDA graph (on by default on CUDA + flash).** `engine/cudagraph.py`
   captures `model.decoder` once per batch-size bucket (`[1,2,4,8,16,…,
   max_num_seqs]`) into a shared pool and replays it — decode only, CUDA+flash

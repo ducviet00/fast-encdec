@@ -188,6 +188,62 @@ Reproduce with `--batches 1,2,4,8,16,32`.  Removing the beam plugin moved vLLM's
 greedy ~1% at `batch=8` (`256->256` 870 ms / 2353 tok/s vs 876 ms / 2337 tok/s
 with it) and ~0.4% in fp32; `batch=1` is inside the run-to-run noise.
 
+**vs vLLM (Graviton 5, CPU)**
+
+`benchmarks/benchmark_vllm.py --device cpu` runs the same comparison on CPU -
+greedy only.  vLLM's beam plugin needs its V2 model runner *with async
+scheduling*, and vLLM gates V2 on Triton, which has no CPU backend
+(`BeamSearchScheduler requires MRV2 with async scheduling enabled`), so the CPU
+rows need the pre-MRV2 `vllm-bart-plugin` v0.5.0 on `vllm==0.24.0+cpu`.  Both
+engines decode the same token count on every row (the script asserts it), bf16
+unless noted, one process per engine, warmup 1 + best-of-3.
+
+| point | config | ours ms | ours tok/s | vLLM ms | vLLM tok/s | speedup |
+|---|---|---:|---:|---:|---:|---:|
+| 128->512 | batch=1, beams=1 | 3361 | 152.3 | 3473 | 147.4 | 1.03x |
+| 128->512 | batch=8, beams=1 | 4761 | 860.4 | 5862 | 698.7 | 1.23x |
+| 128->512 | batch=8, beams=1, fp32 | 8629 | 474.7 | 9734 | 420.8 | 1.13x |
+| 512->128 | batch=1, beams=1 | 972 | 131.7 | 1829 | 70.0 | **1.88x** |
+| 512->128 | batch=8, beams=1 | 2149 | 476.6 | 9016 | 113.6 | **4.20x** |
+| 512->128 | batch=8, beams=1, fp32 | 5049 | 202.8 | 5603 | 182.8 | 1.11x |
+| 256->256 | batch=1, beams=1 | 1730 | 148.0 | 1972 | 129.8 | 1.14x |
+| 256->256 | batch=8, beams=1 | 2703 | 757.7 | 4915 | 416.7 | **1.82x** |
+| 256->256 | batch=8, beams=1, fp32 | 5333 | 384.1 | 6024 | 340.0 | 1.13x |
+
+| point | batch | ours ms | ours tok/s | vLLM ms | vLLM tok/s | speedup |
+|---|---|---:|---:|---:|---:|---:|
+| 128->512 | 1 | 3366 | 152.1 | 3612 | 141.7 | 1.07x |
+| 128->512 | 2 | 3672 | 278.9 | 4501 | 227.5 | 1.23x |
+| 128->512 | 4 | 4058 | 504.7 | 4942 | 414.4 | 1.22x |
+| 128->512 | 8 | 4766 | 859.5 | 5975 | 685.5 | 1.25x |
+| 128->512 | 16 | 7648 | 1071.2 | 9676 | 846.6 | 1.27x |
+| 128->512 | 32 | 12757 | 1284.3 | 15775 | 1038.6 | 1.24x |
+| 512->128 | 1 | 992 | 129.0 | 1877 | 68.2 | 1.89x |
+| 512->128 | 2 | 1165 | 219.8 | 3062 | 83.6 | 2.63x |
+| 512->128 | 4 | 1489 | 343.9 | 5029 | 101.8 | 3.38x |
+| 512->128 | 8 | 2164 | 473.3 | 9070 | 112.9 | 4.19x |
+| 512->128 | 16 | 3827 | 535.2 | 17522 | 116.9 | 4.58x |
+| 512->128 | 32 | 7172 | 571.1 | 34178 | 119.8 | **4.77x** |
+| 256->256 | 1 | 1713 | 149.5 | 2098 | 122.0 | 1.22x |
+| 256->256 | 2 | 1910 | 268.0 | 2768 | 185.0 | 1.45x |
+| 256->256 | 4 | 2188 | 467.9 | 3492 | 293.2 | 1.60x |
+| 256->256 | 8 | 2695 | 760.0 | 4994 | 410.1 | 1.85x |
+| 256->256 | 16 | 4369 | 937.5 | 8758 | 467.7 | 2.00x |
+| 256->256 | 32 | 7627 | 1074.1 | 15709 | 521.5 | 2.06x |
+
+This engine is ahead on every CPU row, because the two shapes fail differently for
+vLLM.  Where the encoder dominates (`512->128`) its CPU path barely batches: it
+goes 68 -> 120 tok/s from `batch=1` to `batch=32` while this engine goes
+129 -> 571, so the margin grows with batch to 4.8x.  Where the decode dominates
+(`128->512`) the two are close (1.03-1.27x) - a single-token CPU decode is the
+same bandwidth-bound GEMM work in both engines.  fp32 is flat ~1.1x, since
+neither engine has a fused attention path to lose there.
+
+Beam search has no vLLM reference on CPU, so its rows are this engine's own: at
+`batch=8, beams=4, bf16` it reaches 386 tok/s at `128->512`, 273 at `512->128`
+and 362 at `256->256`.  Measure those against `transformers` with
+`benchmarks/benchmark.py` instead.
+
 **Florence-2** (real 640x480 photo, four tasks: caption, detection, referring
 segmentation and phrase grounding)
 
