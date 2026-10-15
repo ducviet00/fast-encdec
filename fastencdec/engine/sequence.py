@@ -4,6 +4,8 @@ from ..sampling_params import SamplingParams
 
 
 class Sequence:
+    """State and paged KV-cache bookkeeping for a single decoder hypothesis."""
+
     def __init__(
         self,
         request_id: int,
@@ -25,14 +27,17 @@ class Sequence:
         self.cum_logprob = 0.0
 
     def append_token(self, token_id: int) -> None:
+        """Append a newly generated token ID to the sequence."""
         self.token_ids.append(token_id)
 
     @property
     def num_generated(self) -> int:
+        """Return the number of tokens generated after the decoder prompt."""
         return len(self.token_ids) - len(self.decoder_prompt_ids)
 
     num_completion_tokens = num_generated
 
     @property
     def completion_token_ids(self) -> list[int]:
+        """Return the generated token IDs excluding the decoder prompt."""
         return self.token_ids[len(self.decoder_prompt_ids) :]

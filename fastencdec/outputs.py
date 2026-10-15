@@ -3,6 +3,8 @@ from dataclasses import dataclass, field
 
 @dataclass
 class CompletionOutput:
+    """Output data for one generated completion hypothesis."""
+
     index: int
     text: str
     token_ids: list[int]
@@ -20,6 +22,8 @@ class CompletionOutput:
 
 @dataclass
 class RequestOutput:
+    """Output data for a completed generation request."""
+
     request_id: int
     prompt: str | None
     prompt_token_ids: list[int] | None

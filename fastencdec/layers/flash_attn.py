@@ -11,10 +11,12 @@ _RESOLVED = False
 
 
 def supported(dtype: torch.dtype, head_dim: int) -> bool:
+    """Return True if FlashAttention-2 supports the given (dtype, head_dim) pair."""
     return dtype in _FLOAT_DTYPES and head_dim in _HEAD_DIMS
 
 
 def _load():
+    """Fetch the prebuilt FlashAttention-2 kernel from the HuggingFace kernels hub."""
     try:
         from kernels import get_kernel
     except Exception:  # noqa: BLE001
@@ -27,6 +29,7 @@ def _load():
 
 
 def module():
+    """Return the loaded FlashAttention-2 module, or None if unavailable."""
     # Plain global rather than lru_cache so torch.compile does not inline _load.
     global _MODULE, _RESOLVED
     if not _RESOLVED:
@@ -36,6 +39,7 @@ def module():
 
 
 def require():
+    """Return the loaded FlashAttention-2 module, raising RuntimeError if unavailable."""
     mod = module()
     if mod is None:
         raise RuntimeError(

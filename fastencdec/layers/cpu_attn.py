@@ -19,6 +19,7 @@ _FLOAT_DTYPES = {torch.float32, torch.bfloat16, torch.float16}
 
 
 def _x86_kernel_ok() -> bool:
+    """Return True if this x86 CPU supports AVX-512 and AVX-512 BF16."""
     # Guard against SIGILL since x86 kernels are compiled with -mavx512*.
     try:
         return bool(torch.cpu._is_avx512_supported()) and bool(
@@ -29,6 +30,7 @@ def _x86_kernel_ok() -> bool:
 
 
 def select_isa(dtype, block_size: int, head_dim: int) -> str | None:
+    """Return the vLLM CPU kernel ISA ('neon', 'vec', or 'vec16') if supported, else None."""
     if dtype not in _FLOAT_DTYPES or block_size % 16 != 0:
         return None
     if platform.machine().lower() in ("arm64", "aarch64"):
@@ -43,6 +45,7 @@ def select_isa(dtype, block_size: int, head_dim: int) -> str | None:
 
 
 def _compile_flags():
+    """Return architecture-specific C++ compiler flags for the CPU attention extension."""
     base = [
         "-O3",
         "-fopenmp",
@@ -68,6 +71,7 @@ def _compile_flags():
 
 
 def _build():
+    """JIT-compile and load the vendored vLLM CPU attention C++ extension."""
     generated = os.path.join(_CPU, "cpu_attn_dispatch_generated.h")
     if not os.path.exists(generated):
         subprocess.run(
@@ -98,6 +102,7 @@ def _build():
 
 @functools.lru_cache(maxsize=1)
 def module():
+    """Return the compiled CPU attention extension module, or None if build fails."""
     try:
         return _build()
     except Exception:  # noqa: BLE001
@@ -105,6 +110,7 @@ def module():
 
 
 def require():
+    """Return the compiled CPU attention extension module, raising RuntimeError if unavailable."""
     built = module()
     if built is None:
         raise RuntimeError(

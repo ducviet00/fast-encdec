@@ -9,6 +9,8 @@ from .cudagraph import DecodeGraphRunner
 
 
 class ModelRunner:
+    """Manages KV caches, encoder caching, step preparation, and model execution."""
+
     def __init__(
         self,
         model,
@@ -56,13 +58,14 @@ class ModelRunner:
         )
 
     def _copy_block(self, src: int, dst: int) -> None:
+        """Copy KV cache contents from block src to dst across all decoder layers."""
         for layer in self.cache_layers:
             layer.k_cache[dst].copy_(layer.k_cache[src])
             layer.v_cache[dst].copy_(layer.v_cache[src])
 
     @torch.no_grad()
     def _encode(self, seqs) -> None:
-        # Group fresh sequences by (encoder_len, image_shape) and cache cross-attn K/V.
+        """Batch fresh sequences by (encoder_len, image_shape) and cache cross-attn K/V."""
         groups = defaultdict(list)
         for seq in seqs:
             px_shape = (
@@ -92,6 +95,7 @@ class ModelRunner:
                     )
 
     def clear_request(self, request_id: int) -> None:
+        """Release cached encoder K/V and staged cross-attention state for a finished request."""
         if self.graph is not None:
             self.graph.req_blocks.pop(request_id, None)
         for layer in self.decoder_layers:
@@ -100,6 +104,7 @@ class ModelRunner:
             attn.cross_staged = None
 
     def _prepare(self, seqs):
+        """Allocate KV blocks and build input_ids, positions, and Context tensors for the step."""
         bs = self.block_size
         # Check block budget upfront so a full cache raises before mutating state.
         required = sum(
@@ -145,6 +150,7 @@ class ModelRunner:
 
     @torch.no_grad()
     def run(self, seqs):
+        """Encode any fresh sequences, run one decoder step, and return next-token logits."""
         fresh = [seq for seq in seqs if seq.num_cached_tokens == 0]
         if fresh:
             self._encode(fresh)

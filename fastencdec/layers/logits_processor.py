@@ -22,6 +22,7 @@ def build_logits_processor(
     is_beam: bool,
     device: str = "cpu",
 ) -> LogitsProcessorList:
+    """Build a transformers LogitsProcessorList from SamplingParams."""
     eos_ids = sorted(params.eos_ids())
     eos = torch.tensor(eos_ids, dtype=torch.long, device=device) if eos_ids else None
 

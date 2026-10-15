@@ -5,7 +5,8 @@ import torch
 
 @dataclass(slots=True)
 class Context:
-    # Per-step metadata shared across attention layers; cross_* fields are for CUDA graphs.
+    """Per-step metadata shared across attention layers; cross_* fields are for CUDA graphs."""
+
     is_prefill: bool = False
     context_lens: torch.Tensor | None = None
     block_tables: torch.Tensor | None = None
@@ -19,9 +20,11 @@ _CONTEXT: Context | None = None
 
 
 def get_context() -> Context:
+    """Return the active step's Context."""
     return _CONTEXT
 
 
 def set_context(**fields) -> None:
+    """Set the global Context for the current model forward pass."""
     global _CONTEXT
     _CONTEXT = Context(**fields)

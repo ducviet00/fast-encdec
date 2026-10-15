@@ -13,19 +13,22 @@ from .sequence import Sequence
 
 
 def _length_penalized(seq: Sequence, length_penalty: float) -> float:
+    """Compute the length-normalized cumulative log probability of a sequence."""
     return seq.cum_logprob / (max(seq.num_generated, 1) ** length_penalty)
 
 
 def select_beam_candidates(
     stopped: list[bool], num_beams: int
 ) -> tuple[list[int], list[int]]:
-    # Stopped candidates (EOS/max_len) only finish if ranked in the top num_beams.
+    """Split ranked candidates into finished (if in top num_beams) and live indices."""
     finished = [r for r, stop in enumerate(stopped) if stop and r < num_beams]
     live = [r for r, stop in enumerate(stopped) if not stop][:num_beams]
     return finished, live
 
 
 class LLMEngine:
+    """Step-level execution engine driving scheduling, forward passes, sampling, and beam search."""
+
     def __init__(self, model, config: Config, eos_token_id: int | None = None):
         self.block_manager = BlockManager(config.num_blocks, config.block_size)
         self.runner = ModelRunner(
@@ -48,6 +51,7 @@ class LLMEngine:
         self._next_request_id = 0
 
     def generate(self, requests, params) -> list[int]:
+        """Enqueue a batch of requests, run until all complete, and return their request IDs."""
         requests = list(requests)
         if not requests:
             return []
@@ -86,18 +90,22 @@ class LLMEngine:
         return request_ids
 
     def is_finished(self) -> bool:
+        """Return True when all scheduled requests have completed."""
         return self.scheduler.is_finished()
 
     def step(self) -> None:
+        """Schedule the active batch, run one model forward pass, and postprocess outputs."""
         seqs = self.scheduler.schedule()
         logits = self.runner.run(seqs)
         self._postprocess(seqs, logits)
 
     def run(self) -> None:
+        """Step the engine in a loop until all requests finish."""
         while not self.is_finished():
             self.step()
 
     def _postprocess(self, seqs, logits) -> None:
+        """Apply logits processors and advance greedy/sampled or beam-search sequences."""
         processor = self._logits_processor
         by_request: dict[int, list[int]] = defaultdict(list)
         for index, seq in enumerate(seqs):
@@ -137,6 +145,7 @@ class LLMEngine:
                 self._sample(seqs[i], seqs[i].sampling, tokens[row])
 
     def _sample(self, seq: Sequence, params, token: int) -> None:
+        """Append a sampled token to seq and finalize the request if it hit EOS or max_tokens."""
         seq.append_token(token)
         if token in params.eos_ids() or seq.num_completion_tokens >= params.max_tokens:
             self.scheduler.remove(seq)
@@ -145,6 +154,7 @@ class LLMEngine:
             self.results[seq.request_id] = seq.completion_token_ids
 
     def _fork(self, parent: Sequence, token: int, score: float) -> Sequence:
+        """Create a child beam hypothesis sharing parent's KV blocks with token appended."""
         child = Sequence(
             request_id=parent.request_id,
             decoder_prompt_ids=parent.decoder_prompt_ids,
@@ -161,7 +171,7 @@ class LLMEngine:
     def _beam_group(
         self, seqs, group, num_beams, beam_count, processor, logits, device, pin
     ) -> None:
-        # Batched log_softmax + processor + topk over [num_requests, beam_count * vocab].
+        """Run batched log_softmax, logits processing, and topk for same-shape beam requests."""
         vocab = logits.shape[-1]
         rows = [i for _, seq_indices in group for i in seq_indices]
         input_ids = torch.tensor(
@@ -191,6 +201,7 @@ class LLMEngine:
             )
 
     def _beam_advance(self, request_id, beams, params, parents, tokens, top_values):
+        """Fork winning finished/live beam continuations, free parents, and check stopping."""
         num_beams = params.num_beams
         eos_ids = params.eos_ids()
 
@@ -222,6 +233,7 @@ class LLMEngine:
             self._finish_beam_request(request_id, params)
 
     def _prune_finished(self, request_id: int, params) -> None:
+        """Retain only the top num_beams finished hypotheses by length-penalized score."""
         finished = self._finished_beams[request_id]
         if len(finished) <= params.num_beams:
             return
@@ -233,7 +245,7 @@ class LLMEngine:
         del finished[params.num_beams :]
 
     def _should_stop(self, request_id: int, params, live) -> bool:
-        # HF early_stopping=False: stop when no live beam can beat the worst finished score.
+        """Return True when no live beam can beat the worst finished hypothesis (early_stopping=False)."""
         finished = self._finished_beams[request_id]
         if len(finished) < params.num_beams:
             return False
@@ -246,6 +258,7 @@ class LLMEngine:
         return worst_finished >= best_possible
 
     def _finish_beam_request(self, request_id: int, params) -> None:
+        """Record the best finished beam for request_id and release all remaining resources."""
         finished = self._finished_beams.pop(request_id, [])
         live = [s for s in list(self.scheduler.running) if s.request_id == request_id]
 

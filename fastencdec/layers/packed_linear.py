@@ -13,6 +13,7 @@ _DTYPES = (torch.float32, torch.bfloat16)
 
 
 def available() -> bool:
+    """Return True if oneDNN blocked-weight linear ops are available in this PyTorch build."""
     return (
         torch.backends.mkldnn.is_available()
         and hasattr(torch.ops.mkldnn, "_linear_pointwise")
@@ -21,6 +22,8 @@ def available() -> bool:
 
 
 def _forward(packed: torch.Tensor, bias: torch.Tensor):
+    """Build a forward closure that runs the oneDNN pointwise linear op against a prepacked weight."""
+
     # Inductor cannot consume opaque blocked weights, so disable compilation here.
     @torch.compiler.disable
     def forward(x: torch.Tensor) -> torch.Tensor:
@@ -34,6 +37,7 @@ def _forward(packed: torch.Tensor, bias: torch.Tensor):
 
 
 def apply(model: nn.Module, m_hint: int) -> int:
+    """Prepack all supported nn.Linear weights in model for oneDNN and return the packed count."""
     if not available():
         logger.info("mkldnn prepacked linear unavailable, using F.linear")
         return 0

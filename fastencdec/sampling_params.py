@@ -3,7 +3,8 @@ from dataclasses import dataclass
 
 @dataclass(slots=True)
 class SamplingParams:
-    # temperature <= 0 selects greedy decoding; num_beams > 1 selects beam search.
+    """Decoding parameters; temperature <= 0 uses greedy, num_beams > 1 uses beam search."""
+
     max_tokens: int = 64
     num_beams: int = 1
     temperature: float = 0.0
@@ -20,6 +21,7 @@ class SamplingParams:
     begin_suppress_tokens: list[int] | None = None
 
     def eos_ids(self) -> set[int]:
+        """Return EOS token IDs normalized as a set."""
         if self.eos_token_id is None:
             return set()
         return (
@@ -35,6 +37,7 @@ class SamplingParams:
         eos_token_id: int | None = None,
         decoder_prompt_len: int = 1,
     ) -> "SamplingParams":
+        """Build SamplingParams from a HuggingFace GenerationConfig."""
         val = lambda x, default: default if x is None else x
         temperature = 0.0 if not config.do_sample else val(config.temperature, 1.0)
         if config.max_new_tokens is not None:
