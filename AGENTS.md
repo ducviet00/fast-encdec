@@ -112,6 +112,7 @@ csrc/                  vendored vLLM CPU attention kernels (+ bindings.cpp)
 examples/summarize.py
 examples/florence2.py
 benchmarks/benchmark.py
+benchmarks/benchmark_vllm.py
 benchmarks/benchmark_florence2.py
 benchmarks/verify_parity.py
 benchmarks/throughput.py
@@ -266,6 +267,19 @@ PYTHONPATH=. $P benchmarks/benchmark.py --device cuda   # BART on a GPU box
 PYTHONPATH=. $P benchmarks/benchmark.py --scenarios '256->256'
 PYTHONPATH=. $P benchmarks/benchmark.py --json out.json
 
+# ours vs vLLM on CUDA (one process per engine: different venvs).  vLLM needs
+# the bart-plugin; the beam rows additionally need vllm-beam-search-plugin.
+# VLLM_USE_FLASHINFER_SAMPLER=0 because there is no nvcc on the L4 box.  The
+# script picks VLLM_PLUGINS (bart for greedy, bart+beam_search for beam), and
+# --batches runs a greedy-only batch sweep.  Raw JSONs merge into one table.
+PYTHONPATH=. .venv/bin/python benchmarks/benchmark_vllm.py --engine ours --json ours.json
+HF_HUB_OFFLINE=1 VLLM_USE_FLASHINFER_SAMPLER=0 \
+    ~/vllmenv/bin/python benchmarks/benchmark_vllm.py --engine vllm --json vllm.json
+python benchmarks/benchmark_vllm.py --compare ours.json vllm.json
+# greedy batch sweep (beam plugin not loaded):
+PYTHONPATH=. .venv/bin/python benchmarks/benchmark_vllm.py --engine ours \
+    --batches 1,2,4,8,16,32 --json ours_greedy.json
+
 # Florence-2 benchmark (real image; caption / detection / segmentation /
 # phrase-grounding tasks, EOS-stopped)
 PYTHONPATH=. $P benchmarks/benchmark_florence2.py
@@ -345,6 +359,64 @@ reorders a full beam cache every step.  On CUDA greedy is 2.4-3.6x - the decode
 CUDA graph removes the per-step launch overhead that dominated small batches
 (eager it was ~1.05x) - while beam search is 2.0-4.2x.  fp32 trails on CUDA
 (there is no FlashAttention-2 path).
+
+`benchmarks/benchmark_vllm.py` is the same comparison against **vLLM** on the L4
+(bf16, both engines on their CUDA graph; vLLM 0.28.0 plus `vllm-bart-plugin`, and
+`vllm-beam-search-plugin` for the beam rows only; one process per engine because
+they live in different venvs).  Each engine decodes its own token count - vLLM's
+beam path appends one trailing EOS - and the speedup is `vLLM ms / ours ms`, so
+>1 is ours ahead.  Greedy is measured with the beam plugin *uninstalled* (it swaps
+in a custom scheduler that disables async scheduling - see the gotcha):
+
+| point | config | ours ms | ours tok/s | vLLM ms | vLLM tok/s | speedup |
+|---|---:|---:|---:|---:|---:|---:|
+| 128->512 | batch=1, beams=1 | 1457 | 351 | 1397 | 366 | 0.96x |
+| 128->512 | batch=8, beams=1 | 1834 | 2233 | 1685 | 2431 | 0.92x |
+| 128->512 | batch=8, beams=4 | 3197 | 1281 | 3458 | 1187 | 1.08x |
+| 128->512 | batch=8, beams=1, fp32 | 12011 | 341 | 3355 | 1221 | 0.28x |
+| 512->128 | batch=1, beams=1 | 372 | 344 | 361 | 355 | 0.97x |
+| 512->128 | batch=8, beams=1 | 560 | 1828 | 517 | 1980 | 0.92x |
+| 512->128 | batch=8, beams=4 | 900 | 1138 | 1058 | 975 | 1.18x |
+| 512->128 | batch=8, beams=1, fp32 | 3190 | 321 | 985 | 1040 | 0.31x |
+| 256->256 | batch=1, beams=1 | 727 | 352 | 699 | 366 | 0.96x |
+| 256->256 | batch=8, beams=1 | 950 | 2155 | 870 | 2353 | 0.92x |
+| 256->256 | batch=8, beams=4 | 1737 | 1179 | 1761 | 1167 | 1.01x |
+| 256->256 | batch=8, beams=1, fp32 | 6026 | 340 | 1723 | 1189 | 0.29x |
+
+Greedy alone, sweeping the batch size (`--batches 1,2,4,8,16,32`, no beam plugin):
+
+| point | batch | ours ms | ours tok/s | vLLM ms | vLLM tok/s | speedup |
+|---|---:|---:|---:|---:|---:|---:|
+| 128->512 | 1 | 1457 | 351 | 1397 | 366 | 0.96x |
+| 128->512 | 2 | 1567 | 654 | 1475 | 694 | 0.94x |
+| 128->512 | 4 | 1676 | 1222 | 1510 | 1356 | 0.90x |
+| 128->512 | 8 | 1834 | 2233 | 1685 | 2431 | 0.92x |
+| 128->512 | 16 | 2273 | 3604 | 2094 | 3913 | 0.92x |
+| 128->512 | 32 | 3170 | 5168 | 2977 | 5503 | 0.94x |
+| 512->128 | 1 | 372 | 344 | 361 | 355 | 0.97x |
+| 512->128 | 2 | 420 | 609 | 397 | 644 | 0.95x |
+| 512->128 | 4 | 460 | 1112 | 441 | 1162 | 0.96x |
+| 512->128 | 8 | 560 | 1828 | 517 | 1980 | 0.92x |
+| 512->128 | 16 | 779 | 2630 | 693 | 2953 | 0.89x |
+| 512->128 | 32 | 1230 | 3330 | 1051 | 3896 | 0.85x |
+| 256->256 | 1 | 727 | 352 | 699 | 366 | 0.96x |
+| 256->256 | 2 | 797 | 642 | 747 | 686 | 0.94x |
+| 256->256 | 4 | 855 | 1197 | 775 | 1321 | 0.91x |
+| 256->256 | 8 | 950 | 2155 | 870 | 2353 | 0.92x |
+| 256->256 | 16 | 1202 | 3409 | 1100 | 3725 | 0.92x |
+| 256->256 | 32 | 1729 | 4737 | 1563 | 5242 | 0.90x |
+
+The shape is the HF comparison shrunk down.  vLLM's single-token decode loop is
+3-9% leaner in bf16, so greedy loses 0.92-0.97x; the gap widens with batch
+(`512->128, batch=32` is 0.85x) and is ~0 at `batch=1`, where both are
+latency-bound.  Block sharing between beams turns greedy's loss back into a small
+win at `beams=4` (1.01-1.18x) where the plugin copy-on-writes a whole beam group
+every step.  fp32 is the one-sided loss (0.28-0.31x): with no FlashAttention-2
+path the engine also loses the decode CUDA graph that depends on it, so a batch=8
+decode runs at the batch=1 rate (launch-bound), while vLLM keeps fp32 on
+`TRITON_ATTN`.  Each run is one process per engine on an idle L4, warmup 1 + 3
+repeats, best-of-3; the raw JSONs are written per row so the numbers can be
+re-derived.
 
 Decode throughput (`benchmarks/throughput.py`, `bart-large-cnn`, bf16, enc=512,
 EOS suppressed, so both engines decode a fixed token count; the graph is on by
@@ -501,6 +573,25 @@ on this box with the same kind of workload.
   for nano-vllm too). At batch ≥ 32 the engine is GPU-bound (eager ≈ CUDA-graph);
   small batches are host-bound. `benchmarks/throughput.py` reports decode tok/s
   and `benchmarks/profile_florence2.py [--no-cudagraph]` breaks it down.
+- **vLLM comparison (`benchmarks/benchmark_vllm.py`).** vLLM serves BART only
+  through two plugins: `vllm-bart-plugin` (encoder-decoder model + the
+  `encoder_prompt`/`decoder_prompt` dict prompt) and `vllm-beam-search-plugin`
+  (`scheduler_cls=vllm_beam_search.scheduler.BeamSearchScheduler`, per-request
+  `SamplingParams(extra_args={"beam_width": n})`).  Both pin vLLM to
+  `>=0.24,<0.32`; the L4 box uses `vllm==0.28.0` in `~/vllmenv` (ours stays in the
+  repo `.venv`), and `VLLM_USE_FLASHINFER_SAMPLER=0` is required (no nvcc, so
+  FlashInfer's JIT sampler fails).  **Load the beam plugin only for beam runs**: it
+  replaces vLLM's scheduler with a custom one that disables async scheduling, which
+  cost plain greedy ~1% at batch 8 (and ~0.4% in fp32) on the L4.  The script picks
+  `VLLM_PLUGINS` (`bart` vs `bart,beam_search`) and the scheduler from the requested
+  configs, so a greedy (`--batches`) run never loads it.  Run one process per engine
+  and merge the two JSONs with `--compare`.  What to expect: in bf16 vLLM's
+  single-token decode is 3-9% leaner than ours (greedy 0.85-0.97x, widest with
+  batch), our block sharing wins beam back (1.01-1.18x at `beams=4`), and fp32 is a
+  ~3.4x loss because fp32 has no FlashAttention-2 path, so it also loses the decode
+  CUDA graph and goes launch-bound (a batch=8 decode runs at the batch=1 rate).
+  vLLM's beam path appends a trailing EOS, so it decodes N+1 tokens against our
+  exactly-N; the reported speedup is `vLLM ms / ours ms`.
 - **CUDA graph (on by default on CUDA + flash).** `engine/cudagraph.py`
   captures `model.decoder` once per batch-size bucket (`[1,2,4,8,16,…,
   max_num_seqs]`) into a shared pool and replays it — decode only, CUDA+flash

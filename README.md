@@ -70,8 +70,9 @@ parsed = llm.processor.post_process_generation(
 
 `benchmarks/benchmark.py` (BART) and `benchmarks/benchmark_florence2.py`
 (Florence-2) compare this engine with `transformers.generate` on the same
-machine, dtype, inputs and output tokens. `benchmarks/verify_parity.py` checks
-the tokens and `benchmarks/throughput.py` measures decode-only throughput.
+machine, dtype, inputs and output tokens; `benchmarks/benchmark_vllm.py` runs the
+same BART points against vLLM.  `benchmarks/verify_parity.py` checks the tokens
+and `benchmarks/throughput.py` measures decode-only throughput.
 
 **Test configuration**
 
@@ -118,6 +119,74 @@ gain ~2.7-2.9x while the x86 rows gain ~1.2-1.5x.  The two x86 boxes additionall
 run the engine's 32-token page size, which engages the full-width AVX-512 attention
 kernel (see the page-size gotcha in `AGENTS.md`), while Graviton 5 and the L4 keep
 theirs (16 and 256).  The L4 column is unchanged: the prepack is CPU-only.
+
+**vs vLLM (NVIDIA L4)**
+
+`benchmarks/benchmark_vllm.py` runs the same points against vLLM, which serves
+BART through two plugins: [`vllm-bart-plugin`](https://github.com/vllm-project/bart-plugin)
+for encoder-decoder support and
+[`vllm-beam-search-plugin`](https://github.com/neuralmagic/vllm-beam-search-plugin)
+for the beam scheduler.  Both engines use their CUDA graph, run bf16 and decode
+the same token count (vLLM's beam path appends one trailing EOS per sequence).
+Greedy is measured with the beam plugin **uninstalled** -- it swaps in a custom
+scheduler that disables vLLM's async scheduling -- so only the `beams=4` rows need
+it loaded.
+
+| point | config | ours ms | ours tok/s | vLLM ms | vLLM tok/s | speedup |
+|---|---|---:|---:|---:|---:|---:|
+| 128->512 | batch=1, beams=1 | 1457 | 351 | 1397 | 366 | 0.96x |
+| 128->512 | batch=8, beams=1 | 1834 | 2233 | 1685 | 2431 | 0.92x |
+| 128->512 | batch=8, beams=4 | 3197 | 1281 | 3458 | 1187 | **1.08x** |
+| 128->512 | batch=8, beams=1, fp32 | 12011 | 341 | 3355 | 1221 | 0.28x |
+| 512->128 | batch=1, beams=1 | 372 | 344 | 361 | 355 | 0.97x |
+| 512->128 | batch=8, beams=1 | 560 | 1828 | 517 | 1980 | 0.92x |
+| 512->128 | batch=8, beams=4 | 900 | 1138 | 1058 | 975 | **1.18x** |
+| 512->128 | batch=8, beams=1, fp32 | 3190 | 321 | 985 | 1040 | 0.31x |
+| 256->256 | batch=1, beams=1 | 727 | 352 | 699 | 366 | 0.96x |
+| 256->256 | batch=8, beams=1 | 950 | 2155 | 870 | 2353 | 0.92x |
+| 256->256 | batch=8, beams=4 | 1737 | 1179 | 1761 | 1167 | **1.01x** |
+| 256->256 | batch=8, beams=1, fp32 | 6026 | 340 | 1723 | 1189 | 0.29x |
+
+At a single new token per step in bf16, vLLM's decode loop is 3-9% leaner than
+this one, which is what the greedy rows show.  Beam search pulls the other way:
+this engine shares KV blocks between beams where the plugin copies a whole beam
+group every step, so `beams=4` is a modest win (`1.01-1.18x`) despite each request
+running four sequences.  fp32 is the clear miss: this engine has no
+FlashAttention-2 path in fp32, so it loses both the fused attention *and* the
+decode CUDA graph that depends on it and goes launch-bound, while vLLM keeps fp32
+on its `TRITON_ATTN` backend.
+
+**Greedy decode scaling (vs vLLM, no beam plugin)**
+
+Greedy scales smoothly with batch on both engines and vLLM stays 3-15% ahead; the
+widest gap is the encoder-heavy `512->128` point at `batch=32` (0.85x).  At
+`batch=1` both are latency-bound (~350 tok/s) and nearly tie, and the gap opens as
+each step starts re-reading more KV.
+
+| point | batch | ours ms | ours tok/s | vLLM ms | vLLM tok/s | speedup |
+|---|---|---:|---:|---:|---:|---:|
+| 128->512 | 1 | 1457 | 351 | 1397 | 366 | 0.96x |
+| 128->512 | 2 | 1567 | 654 | 1475 | 694 | 0.94x |
+| 128->512 | 4 | 1676 | 1222 | 1510 | 1356 | 0.90x |
+| 128->512 | 8 | 1834 | 2233 | 1685 | 2431 | 0.92x |
+| 128->512 | 16 | 2273 | 3604 | 2094 | 3913 | 0.92x |
+| 128->512 | 32 | 3170 | 5168 | 2977 | 5503 | 0.94x |
+| 512->128 | 1 | 372 | 344 | 361 | 355 | 0.97x |
+| 512->128 | 2 | 420 | 609 | 397 | 644 | 0.95x |
+| 512->128 | 4 | 460 | 1112 | 441 | 1162 | 0.96x |
+| 512->128 | 8 | 560 | 1828 | 517 | 1980 | 0.92x |
+| 512->128 | 16 | 779 | 2630 | 693 | 2953 | 0.89x |
+| 512->128 | 32 | 1230 | 3330 | 1051 | 3896 | 0.85x |
+| 256->256 | 1 | 727 | 352 | 699 | 366 | 0.96x |
+| 256->256 | 2 | 797 | 642 | 747 | 686 | 0.94x |
+| 256->256 | 4 | 855 | 1197 | 775 | 1321 | 0.91x |
+| 256->256 | 8 | 950 | 2155 | 870 | 2353 | 0.92x |
+| 256->256 | 16 | 1202 | 3409 | 1100 | 3725 | 0.92x |
+| 256->256 | 32 | 1729 | 4737 | 1563 | 5242 | 0.90x |
+
+Reproduce with `--batches 1,2,4,8,16,32`.  Removing the beam plugin moved vLLM's
+greedy ~1% at `batch=8` (`256->256` 870 ms / 2353 tok/s vs 876 ms / 2337 tok/s
+with it) and ~0.4% in fp32; `batch=1` is inside the run-to-run noise.
 
 **Florence-2** (real 640x480 photo, four tasks: caption, detection, referring
 segmentation and phrase grounding)
