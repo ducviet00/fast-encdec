@@ -127,7 +127,10 @@ dim and page size (`block_size % 32 == 0`), when the tile code compiled in and
 tile execution is available.  Availability is not a CPUID check: the process
 must request `XFEATURE_XTILEDATA` from the kernel (`arch_prctl`, done by
 `torch.cpu._init_amx()`) or `_tile_loadconfig` traps with `SIGILL` even on a CPU
-whose `/proc/cpuinfo` advertises `amx_bf16`.  Both Xeon columns above run it.
+whose `/proc/cpuinfo` advertises `amx_bf16`.  It is worth ~1.1-1.45x per
+attention op, widest once the context is long and the batch is large — so the
+decode-heavy points gain a few percent end-to-end while the encoder-dominated
+ones stay flat.  Both Xeon columns above run it.
 
 **vs vLLM (NVIDIA L4)**
 

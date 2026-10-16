@@ -551,12 +551,19 @@ on this box with the same kind of workload.
   `XFEATURE_XTILEDATA` permission from the Linux kernel via
   `arch_prctl(ARCH_REQ_XCOMP_PERM, 18)` (without that syscall, the kernel traps
   `_tile_loadconfig` with `SIGILL` even when `amx_bf16`/`amx_tile` are present in
-  `/proc/cpuinfo`).  Per decoder op the tile kernel is **1.06-1.43x** faster than
-  the AVX-512 one, widest at high batch x context (the shape every decode step
-  pays).  Reproduce with `--isa`, which pins the kernel's ISA:
+  `/proc/cpuinfo`).  Per decoder op the tile kernel is **1.06-1.45x** faster than
+  the AVX-512 one, and the gain is set by **batch x context** (the compute per
+  query), not by either alone: a Granite `self`-attention sweep is a flat
+  ~1.11-1.15x from batch 8 to 64 at `ctx=256`, but reaches 1.30-1.44x once
+  `ctx>=512` *and* batch>=32 — the shape every decode step pays, which is why the
+  decode-heavy `128->512` point gains and the encoder-dominated `512->128` stays
+  flat.  Reproduce with `--isa`, which pins the kernel's ISA:
   `benchmarks/attn_backend.py --mode kernel --isa vec` vs `--isa amx` (bf16,
   `block_size=32`) reads Emerald `self, batch=8 ctx=256` 103.4 → 91.1 µs,
   `batch=32 ctx=1024` 2139 → 1547 µs; Granite 115.7 → 102.4 and 2339 → 1637 µs.
+  Per-op timings are noisy (**5-10%**, worse at `ctx>=2048`: Granite
+  `ctx=2048, batch=16` read 1.60x one run and 1.30x the next), so read them as
+  bands — the two-run matrix means in the README are the stable numbers.
   The tile GEMM reassociates the bf16 products, so its output
   is not bit-identical to the AVX-512 one — at BART-large shapes the two differ
   by ~1-2 BF16 ULP (cross-attn `batch=8 enc=1024`: max|Δ| 9.8e-4, rel 4.2e-3),
