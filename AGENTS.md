@@ -304,6 +304,8 @@ PYTHONPATH=. $P benchmarks/throughput.py --requests 64 --enc-len 512 --max-token
 PYTHONPATH=. $P benchmarks/attn_backend.py                    # kernel + end-to-end
 PYTHONPATH=. $P benchmarks/attn_backend.py --mode kernel      # ops only, no weights
 PYTHONPATH=. $P benchmarks/attn_backend.py --mode e2e --device cuda
+# AMX-BF16 tile kernel vs the AVX-512 one at the same shapes (on an AMX host)
+PYTHONPATH=. benchmarks/attn_backend.py --mode kernel --isa vec   # then --isa amx
 
 # bf16 GEMM throughput at the engine's BART-large shapes (decode is GEMM-bound)
 PYTHONPATH=. $P benchmarks/gemm.py --threads 4,8
@@ -549,10 +551,13 @@ on this box with the same kind of workload.
   `XFEATURE_XTILEDATA` permission from the Linux kernel via
   `arch_prctl(ARCH_REQ_XCOMP_PERM, 18)` (without that syscall, the kernel traps
   `_tile_loadconfig` with `SIGILL` even when `amx_bf16`/`amx_tile` are present in
-  `/proc/cpuinfo`).  Per decoder op (`benchmarks/attn_backend.py --mode kernel`,
-  bf16, `block_size=32`), `"amx"` is ~15-30% faster than `"vec"` on both Xeons
-  (e.g. Emerald `self, batch=8 ctx=256`: 116.9 → 92.9 µs, `batch=32 ctx=1024`:
-  2133 → 1652 µs).  The tile GEMM reassociates the bf16 products, so its output
+  `/proc/cpuinfo`).  Per decoder op the tile kernel is **1.06-1.43x** faster than
+  the AVX-512 one, widest at high batch x context (the shape every decode step
+  pays).  Reproduce with `--isa`, which pins the kernel's ISA:
+  `benchmarks/attn_backend.py --mode kernel --isa vec` vs `--isa amx` (bf16,
+  `block_size=32`) reads Emerald `self, batch=8 ctx=256` 103.4 → 91.1 µs,
+  `batch=32 ctx=1024` 2139 → 1547 µs; Granite 115.7 → 102.4 and 2339 → 1637 µs.
+  The tile GEMM reassociates the bf16 products, so its output
   is not bit-identical to the AVX-512 one — at BART-large shapes the two differ
   by ~1-2 BF16 ULP (cross-attn `batch=8 enc=1024`: max|Δ| 9.8e-4, rel 4.2e-3),
   which is enough to flip an occasional near-tie token under greedy/beam bf16.

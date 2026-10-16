@@ -20,6 +20,12 @@ The three implementations are:
 Run:  PYTHONPATH=. python benchmarks/attn_backend.py                # both
       PYTHONPATH=. python benchmarks/attn_backend.py --mode kernel  # no weights
       PYTHONPATH=. python benchmarks/attn_backend.py --mode e2e --device cuda
+      PYTHONPATH=. python benchmarks/attn_backend.py --mode kernel --isa amx
+      PYTHONPATH=. python benchmarks/attn_backend.py --mode kernel --isa vec
+
+``--isa`` pins the vLLM CPU kernel's ISA, so ``--isa amx`` vs ``--isa vec`` on an
+AMX-BF16 host measures the tile kernel against the AVX-512 one at the same
+shapes (it needs ``block_size % 32 == 0`` and bf16 to be selectable at all).
 """
 
 import argparse
@@ -142,11 +148,33 @@ def _time_cross(variant, num_seqs, enc_len, block_size, dtype, scale, iters):
     )
 
 
-def kernel_section(dtype, block_size, iters):
+def force_isa(name, dtype, block_size):
+    """Pin the vLLM CPU kernel ISA (``--isa``) and report (selected, host default).
+
+    ``--isa vec`` on an AMX host is how the AMX-BF16 tile kernel is measured
+    against the AVX-512 one at otherwise identical shapes.
+    """
+    from fastencdec.layers import cpu_attn
+
+    native_fn = cpu_attn.select_isa
+    native = native_fn(dtype, block_size, HEAD_DIM) or "unsupported"
+    if name == "auto":
+        return native, native
+    if name == "amx" and not cpu_attn._amx_usable():
+        raise SystemExit("--isa amx: this CPU cannot execute AMX tile instructions")
+
+    def forced(dtype, bs, head_dim):
+        return None if native_fn(dtype, bs, head_dim) is None else name
+
+    cpu_attn.select_isa = forced
+    return name, native
+
+
+def kernel_section(dtype, block_size, iters, isa):
     scale = HEAD_DIM**-0.5
     print(
         f"\n== kernel: decoder attention ops in isolation ({dtype}, "
-        f"heads={HEADS} head_dim={HEAD_DIM}, block_size={block_size}) =="
+        f"heads={HEADS} head_dim={HEAD_DIM}, block_size={block_size}, isa={isa}) =="
     )
     header = (
         f"{'op':<26} "
@@ -288,6 +316,12 @@ def main():
         help="0 = torch default, i.e. the number of physical cores",
     )
     ap.add_argument("--block-size", type=int, default=0, help="0 = device default")
+    ap.add_argument(
+        "--isa",
+        default="auto",
+        choices=["auto", "amx", "vec", "vec16"],
+        help="pin the vLLM CPU kernel ISA (auto = host default)",
+    )
     ap.add_argument("--num-blocks", type=int, default=1024)
     ap.add_argument("--batch", type=int, default=8)
     ap.add_argument("--enc-len", type=int, default=256)
@@ -302,12 +336,13 @@ def main():
     threads = torch.get_num_threads()  # physical cores unless forced
     dtype = getattr(torch, args.dtype)
     block_size = args.block_size or default_block_size(args.device)
+    isa, native = force_isa(args.isa, dtype, block_size)
     print(
         f"attn_backend benchmark: device={args.device} dtype={args.dtype} "
-        f"threads={threads} block_size={block_size}"
+        f"threads={threads} block_size={block_size} isa={isa} (host default {native})"
     )
     if args.mode in ("kernel", "both"):
-        kernel_section(dtype, block_size, args.iters)
+        kernel_section(dtype, block_size, args.iters, isa)
     if args.mode in ("e2e", "both"):
         e2e_section(args, dtype)
 
