@@ -58,9 +58,9 @@ placeholders; the decoder is unchanged.
   there is no GPU on the dev box, so run `--device cuda` benchmarks there. Auth
   is flaky (public-key connections are sometimes refused) — retry. `build_essential`
   was installed for `torch.compile` of the Florence-2 vision tower.
-- CPU benchmarking boxes (the README matrix): `ssh ducviet00@34.142.225.47`
+- CPU benchmarking boxes (the README matrix): `ssh ducviet00@34.124.192.77`
   (Xeon 8581C, Emerald Rapids, `amx_bf16`, 8 vCPU = 4 cores, `~/env-ours`), `ssh
-  ubuntu@54.252.169.176` (Xeon 6975P-C, Granite Rapids, `amx_bf16`, 8 vCPU = 4
+  ubuntu@32.236.201.188` (Xeon 6975P-C, Granite Rapids, `amx_bf16`, 8 vCPU = 4
   cores, `~/venv`) and `ssh ubuntu@3.26.21.19` (Graviton 5 / Neoverse-V3, 8 cores, no
   SMT, `~/venv`).  Each has the repo at `~/fast-encdec` and `car.jpg` at
   `/tmp/fastencdec/florence2_bench.jpg`.  Copy with
@@ -323,29 +323,30 @@ hand-edit or guess.**
 
 | config | ours ms | ours tok/s | hf ms | hf tok/s | speedup |
 |---|---:|---:|---:|---:|---:|
-| batch=1, beams=1, bf16 | 3489 | 73.4 | 5562 | 46.0 | 1.59x |
-| batch=8, beams=1, bf16 | 5134 | 398.9 | 8902 | 230.1 | 1.73x |
-| batch=8, beams=4, bf16 | 7857 | 260.7 | 31060 | 65.9 | 3.95x |
-| batch=8, beams=1, fp32 | 8613 | 237.8 | 24946 | 82.1 | 2.90x |
+| batch=1, beams=1, bf16 | 3562 | 71.9 | 5277 | 48.5 | 1.48x |
+| batch=8, beams=1, bf16 | 5129 | 399.3 | 9048 | 226.3 | 1.76x |
+| batch=8, beams=4, bf16 | 8033 | 254.9 | 31482 | 65.1 | 3.92x |
+| batch=8, beams=1, fp32 | 8749 | 234.1 | 24991 | 82.0 | 2.86x |
 
 One run, with the `pack_weights` prepack on (see the gotcha).  Re-running the same
-script back-to-back with packing disabled read 4513 / 6150 / 9435 / 23794
-ms (1.37x / 1.51x / 3.35x / 1.05x), so the prepack is worth 1.29x / 1.20x /
-1.20x / **2.76x** here — it is the whole of the fp32 row, where eager
+script back-to-back with the prepack disabled read 4309 / 6002 / 9429 / 23769
+ms (1.22x / 1.49x / 3.33x / 1.05x), so the prepack is worth 1.21x / 1.17x /
+1.17x / **2.72x** here — it is the whole of the fp32 row, where eager
 BART-large only ties HF.  The latency-bound batch=1 row varies ~5% with this
-laptop's clock, so its 1.59x is the least reliable cell.  This recording is at
+laptop's clock, so its 1.48x is the least reliable cell.  This recording is at
 the x86 default
-`block_size=32`; at the previous 16 it read 1.16x / 1.49x / 3.44x / 1.03x — that
-page size is the greedy-vs-beam trade-off in the gotcha below.  Absolute times
-are only comparable within one recording: the box ran ~20% slower here than when
-the previous table was taken, which moves the single-sequence row most, so on
-this box only the with-in-run speedup is meaningful.  Built with the vendored
-kernel — if `csrc/` fails to build (no `ninja`, see the gotcha) the same table
-reads 1.02x / 0.89x / 1.33x / 0.91x: greedy loses its edge (0.89-1.02x) and the
-beams=4 win shrinks 3.34x → 1.33x, which is why `cpu_attn.module()` is worth
-checking before trusting any CPU number.  With the kernel this laptop is the
-*fastest* box at these points (8 cores, high clocks), which is why its numbers
-beat the 4-core Xeons' in the README matrix.
+`block_size=32`; re-running at 16 read 1.43x / 1.74x / 3.95x / 2.88x, inside
+the run-to-run noise — this box cannot resolve the page-size trade-off, which
+took two runs per box on the Xeons (gotcha below).  Absolute times are only
+comparable within one recording, so only the within-run speedup is meaningful
+here.  Built with the vendored kernel — if `csrc/` fails to build (no `ninja`,
+see the gotcha) `auto` falls back to SDPA and the same table reads 1.21x /
+0.95x / 1.38x / 2.03x: the bf16 greedy rows lose their edge (0.95-1.21x) and the
+beams=4 win shrinks 3.92x → 1.38x, which is why `cpu_attn.module()` is worth
+checking before trusting any CPU number.  This laptop has the largest *speedup*
+at these points (8 cores, high clocks, and a much slower HF baseline) even
+though the AMX-BF16 Xeons now decode more tokens/s in absolute terms (473 vs
+399 at `256->256, batch=8, greedy`).
 
 `benchmark_florence2.py` runs the same configs on a real 640x480 photo
 (`car.jpg`, scp'd to `/tmp/fastencdec/` so the boxes never hit the Hub) and a
@@ -362,9 +363,10 @@ runs, and every run writes its raw results with `--json`, so the numbers can be
 re-derived rather than trusted (an audit that recomputes all 16 rows from those
 JSONs and diffs them against the README passes).
 
-What to expect from those tables: on CPU greedy is 0.9-2.0x (the encoder is
-shared work and dominates the 512->128 point, where the Xeons sit at 0.94-0.95x)
-and beam search is 1.7-3.9x, because the paged cache shares blocks where HF
+What to expect from those tables: on CPU greedy is 1.3-3.0x, lowest where the
+encoder is shared work and dominates (`512->128`, where the x86 boxes sit at
+1.29-1.50x) and highest on Graviton 5's single-sequence rows; beam search is
+1.9-5.1x, because the paged cache shares blocks where HF
 reorders a full beam cache every step.  On CUDA greedy is 2.4-3.6x - the decode
 CUDA graph removes the per-step launch overhead that dominated small batches
 (eager it was ~1.05x) - while beam search is 2.0-4.2x.  fp32 trails on CUDA
@@ -537,6 +539,25 @@ on this box with the same kind of workload.
   silently degrades to SDPA and gets *slower than HF* (0.75-0.94x) with no error
   — `ninja` is now in the `cpu` extra for exactly this reason, and a bare
   `uv sync` without it is the usual cause.
+  On AMX-BF16 hosts (Xeon 8581C, Xeon 6975P-C) `select_isa` returns `"amx"` (the
+  tile GEMM in `csrc/cpu/cpu_attn_amx.hpp`) instead of `"vec"`: the tile code is
+  compiled in whenever the toolchain accepts `-mamx-tile -mamx-bf16`
+  (`-DCPU_CAPABILITY_AMXBF16`), and it is selected for bf16 with
+  `head_dim % 32 == 0` and `block_size % 32 == 0` — fp32/fp16 stay on the
+  AVX-512 `"vec"` path (the tile GEMM only specializes BF16).  Selection and
+  module load call `torch.cpu._init_amx()`, which checks CPUID and requests
+  `XFEATURE_XTILEDATA` permission from the Linux kernel via
+  `arch_prctl(ARCH_REQ_XCOMP_PERM, 18)` (without that syscall, the kernel traps
+  `_tile_loadconfig` with `SIGILL` even when `amx_bf16`/`amx_tile` are present in
+  `/proc/cpuinfo`).  Per decoder op (`benchmarks/attn_backend.py --mode kernel`,
+  bf16, `block_size=32`), `"amx"` is ~15-30% faster than `"vec"` on both Xeons
+  (e.g. Emerald `self, batch=8 ctx=256`: 116.9 → 92.9 µs, `batch=32 ctx=1024`:
+  2133 → 1652 µs).  The tile GEMM reassociates the bf16 products, so its output
+  is not bit-identical to the AVX-512 one — at BART-large shapes the two differ
+  by ~1-2 BF16 ULP (cross-attn `batch=8 enc=1024`: max|Δ| 9.8e-4, rel 4.2e-3),
+  which is enough to flip an occasional near-tie token under greedy/beam bf16.
+  `verify_parity.py --dtype bfloat16` therefore reports the usual same-length,
+  single-step-difference pattern; fp32 never selects `"amx"` and is unaffected.
 - **CPU page size (`block_size`).** `block_size=None` picks the smallest page the
   device's best kernel accepts (`fastencdec.config.default_block_size`): 256 on
   CUDA, **32 on x86**, 16 on aarch64.  `csrc`'s full-width AVX-512 kernel
@@ -555,7 +576,14 @@ on this box with the same kind of workload.
   while beams=4 loses 0.03-0.09 (2.52x → 2.42x, 3.91x → 3.79x, 2.21x → 2.14x on
   Emerald).  aarch64 is unaffected (16 is already enough for `"neon"`, and a
   smaller page is a cheaper copy).  The same `num_blocks` budget now covers
-  twice the KV tokens (and uses twice the memory).
+  twice the KV tokens (and uses twice the memory).  The AMX tile kernel needs
+  the same 32-alignment (plus bf16-only), so the x86 default already satisfies
+  it on hosts where tiles execute — see the backend gotcha above.  Those
+  greedy-vs-beam deltas were recorded on the AVX-512 path, before AMX was
+  enabled: at `block_size=16` bf16 cannot select `"amx"` (`16 % 32 != 0`), so on
+  the Xeons the 16-vs-32 axis is now confounded with the `"vec16"`-vs-`"amx"`
+  switch, and the greedy rows win on both counts while beams=4 pays the bigger
+  copy.
 - **CUDA / FlashAttention-2.** `device="cuda"` needs the `kernels` package; the
   `kernels-community/flash-attn2` wheel is downloaded once (`get_kernel`, tries
   `version=3` then `2` then unversioned) and cached under the HF cache dir, so

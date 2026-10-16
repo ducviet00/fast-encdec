@@ -5,7 +5,7 @@ A small, readable inference engine for **BART** and **Florence-2**, in the spiri
 
 ## Key Features
 
-* 🚀 **Fast offline inference** - up to 5.1x faster than `transformers.generate` on CPU and 4.2x on a GPU (beam search drives the CPU wins; greedy is 1.2-3.0x on CPU and 2.4-3.6x on GPU)
+* 🚀 **Fast offline inference** - up to 5.1x faster than `transformers.generate` on CPU and 4.2x on a GPU (beam search drives the CPU wins; greedy is 1.3-3.0x on CPU and 2.4-3.6x on GPU)
 * 📖 **Readable codebase** - paged KV cache, continuous batching and beam search in plain PyTorch
 * 🧩 **Two models, one engine** - BART for summarisation, Florence-2 for vision-language tasks
 * ⚡ **CPU and CUDA** - vendored vLLM CPU attention kernel; FlashAttention-2 and a CUDA graph on GPU
@@ -85,24 +85,24 @@ and `benchmarks/throughput.py` measures decode-only throughput.
 
 | point | config | Xeon 8581C | Xeon 6975P-C | Graviton 5 | L4 |
 |---|---|---:|---:|---:|---:|
-| 128->512 | batch=1, beams=1 | 1.50x | 1.47x | 2.99x | 3.29x |
-| 128->512 | batch=8, beams=1 | 1.53x | 1.42x | 1.75x | 2.75x |
-| 128->512 | batch=8, beams=4 | 2.78x | 2.61x | 2.25x | 2.04x |
-| 512->128 | batch=1, beams=1 | 1.49x | 1.39x | 2.73x | 3.23x |
-| 512->128 | batch=8, beams=1 | 1.23x | 1.19x | 1.38x | 2.38x |
-| 512->128 | batch=8, beams=4 | 5.08x | 4.22x | 1.88x | 2.80x |
-| 256->256 | batch=1, beams=1 | 1.55x | 1.43x | 2.88x | 3.36x |
-| 256->256 | batch=8, beams=1 | 1.40x | 1.31x | 1.60x | 2.76x |
-| 256->256 | batch=8, beams=4 | 2.57x | 2.37x | 2.06x | 2.19x |
+| 128->512 | batch=1, beams=1 | 1.54x | 1.53x | 2.99x | 3.29x |
+| 128->512 | batch=8, beams=1 | 1.59x | 1.53x | 1.75x | 2.75x |
+| 128->512 | batch=8, beams=4 | 2.90x | 2.74x | 2.25x | 2.04x |
+| 512->128 | batch=1, beams=1 | 1.50x | 1.47x | 2.73x | 3.23x |
+| 512->128 | batch=8, beams=1 | 1.31x | 1.29x | 1.38x | 2.38x |
+| 512->128 | batch=8, beams=4 | 5.14x | 4.75x | 1.88x | 2.80x |
+| 256->256 | batch=1, beams=1 | 1.52x | 1.51x | 2.88x | 3.36x |
+| 256->256 | batch=8, beams=1 | 1.45x | 1.45x | 1.60x | 2.76x |
+| 256->256 | batch=8, beams=4 | 2.57x | 2.42x | 2.06x | 2.19x |
 
 **Throughput (tokens/s), 256->256**
 
 | config | engine | Xeon 8581C | Xeon 6975P-C | Graviton 5 | L4 |
 |---|---|---:|---:|---:|---:|
-| batch=8, beams=1 | fast-encdec | 420 | 408 | 711 | 1845 |
-| batch=8, beams=1 | transformers | 299 | 312 | 444 | 668 |
-| batch=8, beams=4 | fast-encdec | 234 | 254 | 338 | 975 |
-| batch=8, beams=4 | transformers | 91 | 107 | 164 | 446 |
+| batch=8, beams=1 | fast-encdec | 473 | 440 | 711 | 1845 |
+| batch=8, beams=1 | transformers | 326 | 304 | 444 | 668 |
+| batch=8, beams=4 | fast-encdec | 266 | 263 | 338 | 975 |
+| batch=8, beams=4 | transformers | 104 | 109 | 164 | 446 |
 
 Beam search is still the biggest win: `transformers` reorders the whole beam cache
 every step, while blocks are shared here.  Greedy used to be a near tie, especially
@@ -115,10 +115,19 @@ CPU `nn.Linear` weight is prepacked into oneDNN's blocked layout at load
 (`pack_weights` in the `AGENTS.md` gotchas), which removes the per-call weight
 reorder `F.linear` pays.  On aarch64 that also routes the GEMM through oneDNN-ACL
 instead of torch's fallback kernel, which is why Graviton 5's single-sequence rows
-gain ~2.7-2.9x while the x86 rows gain ~1.2-1.5x.  The two x86 boxes additionally
-run the engine's 32-token page size, which engages the full-width AVX-512 attention
-kernel (see the page-size gotcha in `AGENTS.md`), while Graviton 5 and the L4 keep
-theirs (16 and 256).  The L4 column is unchanged: the prepack is CPU-only.
+gain ~2.7-2.9x while the x86 rows gain ~1.5x.  The two x86 boxes additionally
+run the engine's 32-token page size, which engages the full-width attention
+kernel — the AVX-512 `"vec"` one, or the AMX-BF16 tile kernel where tiles execute
+(see the page-size and backend gotchas in `AGENTS.md`) — while Graviton 5 and the
+L4 keep theirs (16 and 256).  The L4 column is unchanged: the prepack is CPU-only.
+
+The x86 kernel also ships an AMX-BF16 tile path (`csrc/cpu/cpu_attn_amx.hpp`):
+`select_isa` returns `"amx"` instead of `"vec"` for bf16 with a 32-aligned head
+dim and page size (`block_size % 32 == 0`), when the tile code compiled in and
+tile execution is available.  Availability is not a CPUID check: the process
+must request `XFEATURE_XTILEDATA` from the kernel (`arch_prctl`, done by
+`torch.cpu._init_amx()`) or `_tile_loadconfig` traps with `SIGILL` even on a CPU
+whose `/proc/cpuinfo` advertises `amx_bf16`.  Both Xeon columns above run it.
 
 **vs vLLM (NVIDIA L4)**
 
@@ -249,9 +258,9 @@ segmentation and phrase grounding)
 
 | config | Xeon 8581C | Xeon 6975P-C | Graviton 5 | L4 |
 |---|---:|---:|---:|---:|
-| batch=1, beams=1 | 1.34x | 1.39x | 1.30x | 2.54x |
-| batch=8, beams=1 | 1.83x | 2.08x | 1.29x | 3.60x |
-| batch=8, beams=4 | 4.12x | 3.48x | 2.16x | 4.23x |
+| batch=1, beams=1 | 1.36x | 1.34x | 1.30x | 2.54x |
+| batch=8, beams=1 | 1.92x | 2.08x | 1.29x | 3.60x |
+| batch=8, beams=4 | 4.13x | 3.87x | 2.16x | 4.23x |
 
 The Florence-2 numbers move less than BART's: the vision tower and encoder are
 shared work, so the page size and the linear prepack only touch the decoder.  In
