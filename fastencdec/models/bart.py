@@ -342,6 +342,10 @@ class BartForConditionalGeneration(nn.Module):
         )
         return self.model.encoder(encoder_input_ids, positions)
 
+    def forward(self, input_ids: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
+        """Run one decoder step and return logits [B, vocab] (the compiled decode graph)."""
+        return self.compute_logits(self.decoder(input_ids, positions))
+
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Project decoder hidden states to vocabulary logits plus final_logits_bias."""
         return self.lm_head(hidden_states) + self.final_logits_bias

@@ -7,18 +7,6 @@ from ..layers import attention
 from ..utils.context import set_context
 from .cudagraph import DecodeGraphRunner
 
-
-class _DecodeStep(torch.nn.Module):
-    """Decoder stack + lm head as one torch.compile graph (freezing packs both)."""
-
-    def __init__(self, model):
-        super().__init__()
-        self.model = model
-
-    def forward(self, input_ids, positions):
-        return self.model.compute_logits(self.model.decoder(input_ids, positions))
-
-
 # Number of compiled runners in this process; each one costs Dynamo cache entries
 # (a new weight set and the batch-1 specialization), and the limit is per frame.
 _COMPILED_RUNNERS = 0
@@ -84,7 +72,7 @@ class ModelRunner:
             torch._inductor.config.compile_threads = min(
                 4, torch._inductor.config.compile_threads
             )
-            self.decode_step = torch.compile(_DecodeStep(self.model), dynamic=True)
+            self.decode_step = torch.compile(self.model, dynamic=True)
             self.encode_step = torch.compile(self.model.encode, dynamic=True)
         if hasattr(self.model, "get_image_features") and compile_mm_encoder:
             # Inductor's dynamic-conv lowering mis-strides DaViT's windowed
@@ -227,10 +215,9 @@ class ModelRunner:
 
         set_context(**fields)
         with self._inductor_ctx():
+            # model.forward is decoder + lm head, so freezing packs both.
             if self.decode_step is None:
-                hidden = self.decoder(input_ids, positions)
-                return self.model.compute_logits(hidden)
-            # decoder + lm head in one compiled graph (freezing packs both).
+                return self.model(input_ids, positions)
             return self.decode_step(input_ids, positions)
 
     def _inductor_ctx(self):

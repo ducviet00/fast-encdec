@@ -326,10 +326,10 @@ hand-edit or guess.**
 
 | config | ours ms | ours tok/s | hf ms | hf tok/s | speedup |
 |---|---:|---:|---:|---:|---:|
-| batch=1, beams=1, bf16 | 3825 | 66.9 | 6068 | 42.2 | 1.59x |
-| batch=8, beams=1, bf16 | 5183 | 395.1 | 9049 | 226.4 | 1.75x |
-| batch=8, beams=4, bf16 | 7914 | 258.8 | 31599 | 64.8 | 3.99x |
-| batch=8, beams=1, fp32 | 8543 | 239.7 | 24931 | 82.2 | 2.92x |
+| batch=1, beams=1, bf16 | 3438 | 74.5 | 6071 | 42.2 | 1.77x |
+| batch=8, beams=1, bf16 | 5021 | 407.9 | 9102 | 225.0 | 1.81x |
+| batch=8, beams=4, bf16 | 7881 | 259.9 | 31943 | 64.1 | 4.05x |
+| batch=8, beams=1, fp32 | 8774 | 233.4 | 25067 | 81.7 | 2.86x |
 
 Mean of two runs with a cold Inductor cache (`/tmp/torchinductor_*` and
 `~/.cache/torch_extensions` removed first).  This recording is the frozen
@@ -340,7 +340,7 @@ vision-tower graph, with Inductor freezing packing every GEMM; the old manual
 compiles too and verifies token-exact vs HF
 (`verify_parity.py --dtype float32`).  Absolute times shift between recordings
 (~5% with this laptop's clock, worst in the latency-bound `batch=1` row — the
-two runs read 4213/3437 ms there), so only the within-run speedup is meaningful;
+two runs read 3448/3428 ms there), so only the within-run speedup is meaningful;
 the `beams=4` win over HF (4x) is the stable feature of the table.
 
 Built with the vendored kernel — if `csrc/` fails to build (no `ninja`, see the
@@ -490,7 +490,7 @@ on this box with the same kind of workload.
   the vendored kernel is active).** There is no manual prepack anymore.  When
   `compile_decoder` holds (`device.type == "cpu"` + dtype
   float32/bfloat16 + `backend == "vllm"`), the runner `torch.compile`s **two
-  graphs**: `_DecodeStep` (decoder + lm head, one graph — lm-head GEMMs pack
+  graphs**: `model.forward` (decoder + lm head, one graph — lm-head GEMMs pack
   too) via opaque attention custom ops, and `model.encode` for the encoder
   (vision tower included for Florence-2).  Inductor's freezing pass packs all
   of them into `_linear_pointwise` (oneDNN blocked weights; ACL on aarch64),
@@ -720,7 +720,7 @@ on this box with the same kind of workload.
   Hub download), and the flash self-attention path reads the Context directly
   instead of the per-step memo.
 - **CPU: frozen `torch.compile` IS the packing path (always on).** The decode
-  (decoder + lm head via `_DecodeStep`) and BART-encode graphs trace as one
+  (decoder + lm head via the model's `forward`) and BART-encode graphs trace as one
   graph each because the vLLM CPU attention branches are opaque
   `torch.library.custom_op`s (`fastencdec::cpu_vllm_self_attention`,
   `::cpu_vllm_cross_attention`, in `layers/attention.py`, `register_fake`

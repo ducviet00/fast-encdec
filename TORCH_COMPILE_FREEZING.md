@@ -274,7 +274,7 @@ compiles too and verifies **token-exact vs HF**).  What built on §6.1:
 
 - **Two or three graphs per runner**, all wrapped in
   `torch._inductor.config.patch(freezing=True)` contexts:
-  `_DecodeStep` = decoder + `compute_logits` (lm head packs inside the graph —
+  `model.forward` = decoder + `compute_logits` (lm head packs inside the graph —
   72 `_linear_pointwise`, 0 `aten.addmm`; dynamic B: one artifact for every
   batch size), `model.encode` (the encoder GEMMs, dynamic over batch + encoder
   length), and for Florence-2 the vision tower + projector

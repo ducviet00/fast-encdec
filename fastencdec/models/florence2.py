@@ -424,6 +424,10 @@ class Florence2ForConditionalGeneration(nn.Module):
         """Run the vision tower and multimodal projector to produce visual token embeddings."""
         return self.model.multi_modal_projector(self.model.vision_tower(pixel_values))
 
+    def forward(self, input_ids: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
+        """Run one decoder step and return logits [B, vocab] (the compiled decode graph)."""
+        return self.compute_logits(self.decoder(input_ids, positions))
+
     @torch.no_grad()
     def encode(
         self,
