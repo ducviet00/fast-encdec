@@ -6,7 +6,8 @@ batch of mixed encoder lengths, both dtypes (fp32 and bf16) and both CPU page
 sizes (16 = the 16-wide ``vec16`` kernel, 32 = the full-width ``vec`` one).
 With backend ``vllm`` every decode runs the frozen
 torch.compile path (the compiled runner is the CPU default), so this also
-checks that the compiled graph produces the same tokens as eager SDPA.  Skips
+checks that the compiled graph matches eager SDPA.  The random model emits the
+same token everywhere, so the second check is on the first-step logits.  Skips
 silently when the extension cannot build (no compiler / unsupported machine).
 
 Run with:  PYTHONPATH=. python tests/test_attn_backend.py
@@ -21,6 +22,7 @@ import torch
 
 from fastencdec.config import Config
 from fastencdec.engine.llm_engine import LLMEngine
+from fastencdec.engine.sequence import Sequence
 from fastencdec.layers import cpu_attn
 from fastencdec.models.bart import BartForConditionalGeneration
 from fastencdec.sampling_params import SamplingParams
@@ -71,6 +73,24 @@ def decode(
     return [engine.results[i] for i in ids]
 
 
+def first_step_logits(model, backend, requests, block_size, dtype):
+    """Prefill the batch once and return the first-step logits [batch, vocab]."""
+    config = Config(
+        num_blocks=256,
+        block_size=block_size,
+        max_num_seqs=8,
+        dtype=dtype,
+        attn_backend=backend,
+    )
+    engine = LLMEngine(model, config, eos_token_id=EOS)
+    params = SamplingParams(max_tokens=1, temperature=0.0)
+    for i, (encoder_ids, decoder_ids, pixel_values) in enumerate(requests):
+        engine.scheduler.add(
+            Sequence(i, decoder_ids, encoder_ids, params, pixel_values)
+        )
+    return engine.runner.run(engine.scheduler.schedule())
+
+
 def main():
     if cpu_attn.select_isa(torch.float32, 32, 32) is None:
         print("SKIP: no kernel for this machine")
@@ -98,6 +118,17 @@ def main():
                         f"[{status}] dtype={dtype} isa={isa} block_size={block_size} "
                         f"beams={beams} seq={i}: {have}"
                     )
+            # Tokens are degenerate on this random model; the logits are not.
+            ref = first_step_logits(model_dt, "sdpa", requests, block_size, dtype)
+            got = first_step_logits(model_dt, "vllm", requests, block_size, dtype)
+            diff = (ref - got).abs().max().item()
+            tol = 1e-3 if dtype == torch.float32 else 0.5
+            status = "OK" if diff <= tol else "MISMATCH"
+            failures += status == "MISMATCH"
+            print(
+                f"[{status}] dtype={dtype} isa={isa} block_size={block_size} "
+                f"logits max|diff|={diff:.2e} (tol {tol})"
+            )
     if failures:
         raise SystemExit(f"{failures} mismatches")
 

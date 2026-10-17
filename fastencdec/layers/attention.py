@@ -11,7 +11,8 @@ _PREFER = "auto"
 # Per-step kernel metadata memoized by Context identity.
 _DERIVED: tuple = (None, None, None)
 # Cross-attention layers registered for the opaque vLLM CPU custom ops, by handle.
-_CROSS_LAYERS: list = []
+_CROSS_LAYERS: dict = {}
+_NEXT_CROSS_HANDLE = 0
 
 
 def set_backend(name: str) -> None:
@@ -199,11 +200,17 @@ def register_cross_layer(layer) -> int:
     the FX-graph cache can replay a compiled decoder without running the trace,
     so any trace-time registration would be skipped.
     """
+    global _NEXT_CROSS_HANDLE
     handle = getattr(layer, "cpu_cross_handle", None)
     if handle is None:
-        handle = len(_CROSS_LAYERS)
+        # Drop layers whose model has been freed so a long-lived process that
+        # rebuilds engines does not accumulate them.
+        for dead in [h for h, ref in _CROSS_LAYERS.items() if ref() is None]:
+            del _CROSS_LAYERS[dead]
+        handle = _NEXT_CROSS_HANDLE
+        _NEXT_CROSS_HANDLE += 1
         layer.cpu_cross_handle = handle
-        _CROSS_LAYERS.append(weakref.ref(layer))
+        _CROSS_LAYERS[handle] = weakref.ref(layer)
     return handle
 
 

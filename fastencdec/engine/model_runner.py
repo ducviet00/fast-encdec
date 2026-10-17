@@ -19,6 +19,11 @@ class _DecodeStep(torch.nn.Module):
         return self.model.compute_logits(self.model.decoder(input_ids, positions))
 
 
+# Number of compiled runners in this process; each one costs Dynamo cache entries
+# (a new weight set and the batch-1 specialization), and the limit is per frame.
+_COMPILED_RUNNERS = 0
+
+
 class ModelRunner:
     """Manages KV caches, encoder caching, step preparation, and model execution."""
 
@@ -31,6 +36,7 @@ class ModelRunner:
         device="cpu",
         max_num_seqs=32,
         use_cudagraph=True,
+        compile_mm_encoder=True,
     ):
         self.device = torch.device(device)
         self.model = model.eval()
@@ -58,19 +64,33 @@ class ModelRunner:
         self.decoder = model.decoder
         self.decode_step = None
         self.encode_step = None
+        self.mm_step = None
         if self.compile_decoder:
             # Symbolic batch / encoder length keeps memory bounded (freezing
-            # duplicates the packed weights per shape). The multimodal tower
-            # needs static shapes: Inductor's dynamic-conv lowering mis-strides
-            # DaViT's windowed feature maps.
-            dynamic = not hasattr(self.model, "get_image_features")
+            # duplicates the packed weights per shape). Florence-2's tower is
+            # compiled on its own (static, see below) so the text encoder -
+            # whose length varies with the task prompt - stays dynamic.
+            global _COMPILED_RUNNERS
+            _COMPILED_RUNNERS += 1
+            # Dynamo falls back to eager once a frame has more than
+            # recompile_limit cache entries, and every engine adds entries
+            # (weights, batch-1 specialization). Grow the cap with the number of
+            # engines so a process holding several does not lose the packing.
+            torch._dynamo.config.recompile_limit = max(
+                torch._dynamo.config.recompile_limit, 2 * _COMPILED_RUNNERS + 4
+            )
             # Four parallel workers compile fast without the GB-scale memory
             # spike of the default (thread-count) worker pool on small boxes.
             torch._inductor.config.compile_threads = min(
                 4, torch._inductor.config.compile_threads
             )
-            self.decode_step = torch.compile(_DecodeStep(self.model), dynamic=dynamic)
-            self.encode_step = torch.compile(self.model.encode, dynamic=dynamic)
+            self.decode_step = torch.compile(_DecodeStep(self.model), dynamic=True)
+            self.encode_step = torch.compile(self.model.encode, dynamic=True)
+        if hasattr(self.model, "get_image_features") and compile_mm_encoder:
+            # Inductor's dynamic-conv lowering mis-strides DaViT's windowed
+            # feature maps, so the tower keeps static shapes (one graph per
+            # image shape, which is fixed for a real workload).
+            self.mm_step = torch.compile(self.model.get_image_features, dynamic=False)
         self.use_cudagraph = use_cudagraph and (
             self.device.type == "cuda"
             and attention.backend(self.device, dtype, self.head_dim, self.block_size)
@@ -119,7 +139,11 @@ class ModelRunner:
             else:
                 px = torch.stack([s.pixel_values for s in group]).to(self.device)
                 with self._inductor_ctx():
-                    hidden = encode(ids, pixel_values=px)
+                    if self.mm_step is None:
+                        embeds = self.model.get_image_features(px)
+                    else:
+                        embeds = self.mm_step(px)
+                    hidden = encode(ids, image_embeds=embeds)
             for layer in self.decoder_layers:
                 attn = layer.encoder_attn
                 shape = (len(group), ids.shape[1], attn.num_heads, attn.head_dim)

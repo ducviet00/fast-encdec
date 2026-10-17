@@ -215,6 +215,9 @@ def run_ours(args, tokenizer, scenarios):
                 )
                 dump(args, rows)
             del llm
+            # Compiled engines stay alive in Dynamo's caches; drop them so a
+            # multi-engine benchmark does not accumulate packed weight copies.
+            torch._dynamo.reset()
             _empty_cache()
     return rows
 

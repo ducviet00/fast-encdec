@@ -272,24 +272,33 @@ GEMM-story now, on both dtypes, and it is on by default
 (`compile_decoder = CPU + backend=="vllm"` in `ModelRunner.__init__`; fp32
 compiles too and verifies **token-exact vs HF**).  What built on §6.1:
 
-- **Two graphs per runner**, both wrapped in
+- **Two or three graphs per runner**, all wrapped in
   `torch._inductor.config.patch(freezing=True)` contexts:
   `_DecodeStep` = decoder + `compute_logits` (lm head packs inside the graph —
   72 `_linear_pointwise`, 0 `aten.addmm`; dynamic B: one artifact for every
-  batch size), and `model.encode` (encoder GEMMs + the whole Florence-2 vision
-  tower/projector graph).
+  batch size), `model.encode` (the encoder GEMMs, dynamic over batch + encoder
+  length), and for Florence-2 the vision tower + projector
+  (`get_image_features`, its own **static** graph — see below).
 - **Semantics preserved**: the CUDA decode path is untouched (`use_cudagraph`
-  captures the eager decoder); a batch of separate LLM instances co-exists.
-- **The compile happens once per process and ~4 s at cache hit**; first run
-  pays ~10-25 s per graph for the two graphs (Inductor compile_threads capped
-  at 4 so the parallel C++ workers don't spike GBs on small boxes).
+  captures the eager decoder); a batch of separate LLM instances co-exists —
+  now with the Dynamo budget to match: each engine costs ~4 cache entries (two
+  frames × the batch-1 specialization), so `ModelRunner.__init__` raises
+  `torch._dynamo.config.recompile_limit` to `2 * engines + 4`.  Without that, a
+  process with six engines (the default `benchmark.py` run) silently ran the
+  last two eager.
+- **The compile is once per *engine*, ~4 s at cache hit** (the graph is guarded
+  on weight identity, so a new model re-traces even on an artifact-cache hit);
+  first run pays ~10-25 s per graph (Inductor compile_threads capped at 4 so the
+  parallel C++ workers don't spike GBs on small boxes).
 - Benchmark table: the new dev-box baseline in `AGENTS.md` ("Benchmark
   baseline") records this state.  The per-shape memory bound measured above
   (0.74 GB bf16 / 1.6 GB fp32 per STATIC artifact for bart-large) is real; the
-  decode + BART-encode graphs are therefore `dynamic=True` (one artifact across
-  all batch sizes / encoder lengths), while the Florence-2 `encode` compiles
-  static because dynamic convs mis-stride DaViT (`assert_tensor_metadata`
-  failures in the generated kernel).
+  decode and all text-encoder graphs are therefore `dynamic=True` (one artifact
+  across all batch sizes / encoder lengths).  Only the Florence-2 tower compiles
+  static, because dynamic convs mis-stride DaViT (`assert_tensor_metadata`
+  failures in the generated kernel) — the runner keeps it out of the text
+  graph (it passes precomputed `image_embeds` into `encode`) so the two do not
+  contaminate each other.
 - fp32 token-exactness: the freezing pack on fp32 lowers to `mkl._mkl_linear`
   (a fused MKL GEMM) — verified token-for-token equal vs HF on BART beams=1/4,
   Florence beams=1/3 (`verify_parity.py --dtype float32`).

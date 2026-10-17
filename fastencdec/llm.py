@@ -48,10 +48,6 @@ class LLM:
             self.model = Florence2ForConditionalGeneration(hf_config)
             load_hf_weights(self.model, model_path, hf_model_cls=HFFlorence2)
             self.model.to(dtype).to(device)
-            if compile_mm_encoder and device == "cuda":
-                # On CPU the runner compiles the whole encode call (vision tower
-                # included); on CUDA nothing else is compiled, so do it here.
-                self.model.compile_mm_encoder()
             text_config = hf_config.text_config
         else:
             self.tokenizer = AutoTokenizer.from_pretrained(model_path)
@@ -75,6 +71,7 @@ class LLM:
             attn_backend=attn_backend,
             device=device,
             use_cudagraph=use_cudagraph,
+            compile_mm_encoder=compile_mm_encoder,
         )
         self.engine = LLMEngine(self.model, config, eos_token_id=self.eos_token_id)
 

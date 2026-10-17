@@ -253,6 +253,11 @@ def main():
                 }
                 print(".", end="", flush=True)
             del llm
+            # Compiled engines are kept alive by Dynamo's frame caches (guards
+            # hold the module, freezing holds a packed copy of its weights), so
+            # a multi-engine run accumulates one engine's worth of memory per
+            # scenario. Drop that state before loading the reference model.
+            torch._dynamo.reset()
 
             hf = AutoModelForSeq2SeqLM.from_pretrained(args.model, dtype=dtype).eval()
             if args.device.startswith("cuda"):
