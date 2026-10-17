@@ -22,6 +22,9 @@ and the speedup.
   PYTHONPATH=. python benchmarks/benchmark.py                 # cpu
   PYTHONPATH=. python benchmarks/benchmark.py --device cuda
   PYTHONPATH=. python benchmarks/benchmark.py --scenarios 256->256
+  # --compile: ours runs torch.compile + freezing on the whole decoder
+  # (CPU + bf16 + vendored kernel only; ~10-13 s one-time compile per batch size).
+  PYTHONPATH=. python benchmarks/benchmark.py --scenarios 256->256 --compile
 """
 
 import argparse
@@ -184,6 +187,12 @@ def main():
         help="0 = device default (256 cuda, 32 x86 cpu, 16 aarch64)",
     )
     ap.add_argument("--scenarios", default="", help="comma list, default all")
+    ap.add_argument(
+        "--compile",
+        action="store_true",
+        help="ours: torch.compile the whole decoder (CPU: one graph + freezing GEMM "
+        "packing; the manual prepack then skips the decoder linears)",
+    )
     ap.add_argument("--warmup", type=int, default=1)
     ap.add_argument("--repeats", type=int, default=1)
     ap.add_argument("--json", default=None, help="write raw results to a JSON file")
@@ -229,6 +238,7 @@ def main():
                 block_size=block_size,
                 dtype=dtype,
                 device=args.device,
+                compile_model=args.compile,
             )
             for label, batch, beams, _ in configs:
                 dt, toks = timed(

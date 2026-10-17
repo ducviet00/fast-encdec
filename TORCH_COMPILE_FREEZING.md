@@ -254,16 +254,69 @@ Short answer: **no**.
    and the eager default is marginally faster too (the baseline table in
    AGENTS.md was refreshed). Tests pass (`test_parity`, `test_attn_backend`,
    `test_beam`, `test_packed_linear`, `test_florence2`).
-2. **Verdict on replacing the manual prepack with compile+freezing: no.**
-   With packing proven equal (§4.2), the compile path still loses at
-   `256->256, batch=8` (6467 ms vs the fresh eager baseline 5061 ms with manual
-   prepack — 28% behind) because the remaining pybind-call sites keep the graph
-   shattered and every decode step pays the subgraph dispatch. The manual
-   `packed_linear` backend stays until the attention ops are `torch.library.custom_op`s
-   *and* the per-step dispatch overhead shrinks; only then is
-   removing `pack_weights` worth re-measuring.
+2. ~~**Verdict on replacing the manual prepack with compile+freezing: no.**~~
+   **Superseded:** the custom-op re-plumb *did* land, and it changed the
+   verdict.  See §6.1 below.
 3. Never expect packing from compiled *helpers* (trap §3.3); compile the
    module's own forward.
+
+### 6.1 The landed state (compile_model=True, bf16 CPU) — second round
+
+The remaining 53 pybind breaks were removed by wrapping the whole vLLM CPU
+attention branch in two opaque `torch.library.custom_op`s
+(`fastencdec::cpu_vllm_self_attention`, `::cpu_vllm_cross_attention`,
+registered in `layers/attention.py`), each with a `register_fake` that just
+returns `torch.empty_like(query)`:
+
+- the **op bodies run at call time**, not at trace time — they read the
+  module-level `Context`, call `_self_derived` (per-step metadata memo),
+  run `_cross_staged` (cross staging incl. the weakref layer registry),
+  and mutate the paged caches through the pybind module — all invisible to
+  Dynamo.  The self op declares `mutates_args={"k_cache", "v_cache"}`;
+  profiling confirmed Inductor adds **no cache copies** for this (per-step
+  `aten::copy_` count and time are identical to eager).
+- cross-attention layers register at **`__init__` time**
+  (`register_cross_layer` from `BartDecoderCrossAttention.__init__`); the int
+  handle bakes into the graph eagerly.  Registration used to happen lazily in
+  traced Python and produced an `IndexError` under a **cached replay**: the
+  Inductor FX graph cache (`/tmp/torchinductor_*`) replays compiled artifacts
+  across processes **without running the trace**, so trace-time side effects
+  are skipped.  Rule: no state mutation inside traced code.
+- `decoder_cross_attention` takes the (un-serializable) attention module only
+  where the backend is known non-traceable or in eager paths; the custom op
+  receives `(query, scale, handle, block_size)` — scalars only.
+- `ModelRunner.__init__` gates the whole-decoder compile on
+  bf16 + CPU + backend `"vllm"` and wraps each decoder call in
+  `torch._inductor.config.patch(freezing=True)`; `_prepare` bucket-pads the
+  block tables (16-block buckets) so table growth does not recompile.
+- `packed_linear.apply` gains an `exclude=` parameter; with the compiled
+  decoder it skips `model.decoder` — those 84 GEMMs/step are packed inside the
+  graph by freezing instead (verified in the artifact: 84
+  `mkldnn._linear_pointwise`, 0 `aten.addmm`).  The encoder, lm-head and every
+  fp32 linear keep the manual prepack.
+
+Measured on the dev CPU box (`256->256, batch=8`), same-day eager vs compiled
+(benchmark.py `--compile`, one run each of a back-to-back pair):
+
+| row | eager prepack | compiled | Δ |
+|---|---:|---:|---:|
+| batch=1, beams=1, bf16 | 3739 | 3375 | **−9%** |
+| batch=8, beams=1, bf16 | 5318 | 5147 | −5% |
+| batch=8, beams=4, bf16 | 8490 | 7865 | −6% |
+| batch=8, beams=1, fp32 | 9247 | 9276 | = (compile gated off) |
+
+The win comes from pointwise fusion: eager dispatches ~1.9 ms/step of Python
+aten kernels (`aten::add` 2618, `native_layer_norm` 2393, `gelu` 780 per 64
+steps); the compiled graph fuses those chains into its own C++ loops.  GEMM
+output is equal (`_linear_pointwise` either way).  Greedy tokens are identical
+to eager (the same kernels, same order — checked by `tests/test_attn_backend`
+compiled parity and `benchmark.py --compile`'s same-token-count guard vs HF).
+
+Remaining costs / next steps, in order of impact: per-distinct-batch-size
+recompiles (~10-13 s for the first size; fixed-size offline batches are the
+intended use — segment/finetune bucket pins like `DecodeGraphRunner` if this
+ever needs to be the default), and the still-eager `compute_logits` (one large
+GEMM; compiling it measured nothing in a toy probe).
 
 ## 7. Repro
 

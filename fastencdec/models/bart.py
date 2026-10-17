@@ -9,6 +9,7 @@ from ..layers.attention import (
     decoder_cross_attention,
     decoder_self_attention,
     encoder_self_attention,
+    register_cross_layer,
 )
 
 ACT2FN = {"gelu": F.gelu}
@@ -33,14 +34,15 @@ _COMPILED = False
 def enable_compile(enable: bool = True) -> None:
     """Toggle torch.compile fusion for the per-layer pointwise helpers."""
     global _add_layer_norm, _activation_linear, _COMPILED
-    if enable and not _COMPILED:
+    if enable == _COMPILED:
+        return
+    if enable:
         _add_layer_norm = torch.compile(_add_layer_norm_impl)
         _activation_linear = torch.compile(_activation_linear_impl)
-        _COMPILED = True
-    elif not enable and _COMPILED:
+    else:
         _add_layer_norm = _add_layer_norm_impl
         _activation_linear = _activation_linear_impl
-        _COMPILED = False
+    _COMPILED = enable
 
 
 class BartLearnedPositionalEmbedding(nn.Embedding):
@@ -176,6 +178,7 @@ class BartDecoderCrossAttention(_BartAttentionBase):
         self.encoder_kv_cache: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
         self.cross_cache = None
         self.block_size = 16
+        register_cross_layer(self)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Project decoder queries and attend over cached encoder K/V."""

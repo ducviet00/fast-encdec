@@ -1,3 +1,5 @@
+import weakref
+
 import torch
 import torch.nn.functional as F
 
@@ -8,6 +10,8 @@ _BACKENDS = ("auto", "vllm", "flash", "sdpa")
 _PREFER = "auto"
 # Per-step kernel metadata memoized by Context identity.
 _DERIVED: tuple = (None, None, None)
+# Cross-attention layers registered for the opaque vLLM CPU custom ops, by handle.
+_CROSS_LAYERS: list = []
 
 
 def set_backend(name: str) -> None:
@@ -188,6 +192,111 @@ def _self_derived(ctx, backend, num_heads, head_dim, dtype, block_size):
     return data
 
 
+def register_cross_layer(layer) -> int:
+    """Register a cross-attention layer once and return its opaque-op handle.
+
+    Called from BartDecoderCrossAttention.__init__ — **never** from traced code:
+    the FX-graph cache can replay a compiled decoder without running the trace,
+    so any trace-time registration would be skipped.
+    """
+    handle = getattr(layer, "cpu_cross_handle", None)
+    if handle is None:
+        handle = len(_CROSS_LAYERS)
+        layer.cpu_cross_handle = handle
+        _CROSS_LAYERS.append(weakref.ref(layer))
+    return handle
+
+
+def _cross_layer(handle: int):
+    """Resolve a registered cross-attention layer by handle."""
+    layer = _CROSS_LAYERS[handle]()
+    if layer is None:
+        raise RuntimeError("cross-attention layer handle no longer alive")
+    return layer
+
+
+@torch.library.custom_op(
+    "fastencdec::cpu_vllm_self_attention", mutates_args={"k_cache", "v_cache"}
+)
+def _cpu_vllm_self_attention(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    scale: float,
+    block_size: int,
+) -> torch.Tensor:
+    """Write K/V into the paged cache and run causal self-attention with the vLLM CPU kernel.
+
+    Opaque to torch.compile: kernels, Context reads, and the per-step metadata
+    memo all run at call time so the compiled decoder traces as a single graph.
+    """
+    ctx = get_context()
+    num_heads, head_dim = query.shape[1], query.shape[2]
+    data = _self_derived(ctx, "vllm", num_heads, head_dim, query.dtype, block_size)
+    cpu_attn.module().reshape_and_cache(
+        key, value, k_cache, v_cache, ctx.slot_mapping, data["isa"]
+    )
+    return cpu_attn.module().attention_forward(
+        query,
+        k_cache,
+        v_cache,
+        data["query_start_loc"],
+        data["cache_seqlens"],
+        scale,
+        False,
+        -1,
+        ctx.block_tables,
+        data["metadata"],
+        data["dynamic_causal"],
+    )
+
+
+@_cpu_vllm_self_attention.register_fake
+def _(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    scale: float,
+    block_size: int,
+) -> torch.Tensor:
+    return torch.empty_like(query)
+
+
+@torch.library.custom_op("fastencdec::cpu_vllm_cross_attention", mutates_args={})
+def _cpu_vllm_cross_attention(
+    query: torch.Tensor, scale: float, handle: int, block_size: int
+) -> torch.Tensor:
+    """Run cross-attention with the vLLM CPU kernel over the layer's staged encoder K/V."""
+    layer = _cross_layer(handle)
+    ctx = get_context()
+    num_heads, head_dim = query.shape[1], query.shape[2]
+    k_cache, v_cache, block_table, cache_seqlens, metadata = _cross_staged(
+        layer, ctx, "vllm", block_size, num_heads, head_dim, query.dtype
+    )
+    return cpu_attn.module().attention_forward(
+        query,
+        k_cache,
+        v_cache,
+        torch.arange(query.shape[0] + 1, dtype=torch.int32, device=query.device),
+        cache_seqlens,
+        scale,
+        False,
+        -1,
+        block_table,
+        metadata,
+        None,
+    )
+
+
+@_cpu_vllm_cross_attention.register_fake
+def _(query: torch.Tensor, scale: float, handle: int, block_size: int) -> torch.Tensor:
+    return torch.empty_like(query)
+
+
 def decoder_self_attention(query, key, value, k_cache, v_cache, scale, block_size):
     """Write new K/V into the paged cache and run causal self-attention over cached keys."""
     ctx = get_context()
@@ -215,6 +324,12 @@ def decoder_self_attention(query, key, value, k_cache, v_cache, scale, block_siz
         )
         return out.squeeze(1)
 
+    if backend == "vllm":
+        # Opaque custom op: the kernel path reads Context and mutates the caches,
+        # so torch.compile never traces it (no graph breaks, no cache re-materialization).
+        return _cpu_vllm_self_attention(
+            query, key, value, k_cache, v_cache, scale, block_size
+        )
     data = _self_derived(ctx, backend, num_heads, head_dim, query.dtype, block_size)
     _store(
         key,
@@ -226,20 +341,6 @@ def decoder_self_attention(query, key, value, k_cache, v_cache, scale, block_siz
         backend,
         data.get("isa"),
     )
-    if backend == "vllm":
-        return cpu_attn.module().attention_forward(
-            query,
-            k_cache,
-            v_cache,
-            data["query_start_loc"],
-            data["cache_seqlens"],
-            scale,
-            False,
-            -1,
-            ctx.block_tables,
-            data["metadata"],
-            data["dynamic_causal"],
-        )
     return _sdpa_paged(query, k_cache, v_cache, data["key_slot_ids"], ctx, scale)
 
 
@@ -333,6 +434,12 @@ def decoder_cross_attention(query, layer, scale, block_size):
     ctx = get_context()
     num_heads, head_dim = query.shape[1], query.shape[2]
     backend = _paged_backend(query.device, query.dtype, head_dim, block_size)
+    if backend == "vllm" and ctx.cross_block_tables is None:
+        # Opaque custom op: staging reads the layer's request-keyed state, so it runs
+        # outside the compiled graph (see _cpu_vllm_cross_attention).
+        return _cpu_vllm_cross_attention(
+            query, scale, layer.cpu_cross_handle, block_size
+        )
     if ctx.cross_block_tables is not None:
         # CUDA-graph path uses preallocated static cross_cache and block tables.
         k_cache, v_cache = layer.cross_cache

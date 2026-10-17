@@ -36,13 +36,16 @@ def _forward(packed: torch.Tensor, bias: torch.Tensor):
     return forward
 
 
-def apply(model: nn.Module, m_hint: int) -> int:
+def apply(model: nn.Module, m_hint: int, exclude: nn.Module | None = None) -> int:
     """Prepack all supported nn.Linear weights in model for oneDNN and return the packed count."""
     if not available():
         logger.info("mkldnn prepacked linear unavailable, using F.linear")
         return 0
+    skip = {id(m) for m in exclude.modules()} if exclude is not None else set()
     packed = 0
     for module in model.modules():
+        if id(module) in skip:
+            continue
         if not isinstance(module, nn.Linear) or module.weight.dtype not in _DTYPES:
             continue
         try:

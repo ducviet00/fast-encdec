@@ -2,9 +2,13 @@
 
 Builds a tiny BART whose ``head_dim`` the kernel supports (32) and checks that
 greedy and beam decoding match the pure-PyTorch path token for token, for a
-batch of mixed encoder lengths and both CPU page sizes (16 = the 16-wide
-``vec16`` kernel, 32 = the full-width ``vec`` one).  Skips silently when the
-extension cannot build (no compiler / unsupported machine).
+batch of mixed encoder lengths, both dtypes the tile kernel specializes (fp32 on
+the AVX-512 path, bf16 which also exercises ``isa="amx"`` on AMX-BF16 hosts)
+and both CPU page sizes (16 = the 16-wide ``vec16`` kernel, 32 = the full-width
+``vec``/``amx`` one).  It also checks that the whole-decoder torch.compile path
+(``compile_model=True``, bf16 + a 32-wide page) produces the same tokens as the
+eager kernel path.  Skips silently when the extension cannot build (no
+compiler / unsupported machine).
 
 Run with:  PYTHONPATH=. python tests/test_attn_backend.py
 """
@@ -48,13 +52,22 @@ def build_model():
     return BartForConditionalGeneration(config).eval()
 
 
-def decode(model, backend, requests, params, block_size):
+def decode(
+    model,
+    backend,
+    requests,
+    params,
+    block_size,
+    dtype=torch.float32,
+    compile_model=False,
+):
     config = Config(
         num_blocks=256,
         block_size=block_size,
         max_num_seqs=8,
-        dtype=torch.float32,
+        dtype=dtype,
         attn_backend=backend,
+        compile_model=compile_model,
     )
     engine = LLMEngine(model, config, eos_token_id=EOS)
     ids = engine.generate(requests, params)
@@ -73,17 +86,40 @@ def main():
         (torch.randint(3, VOCAB, (9,)).tolist(), [1], None),
     ]
     failures = 0
-    for block_size in (16, 32):
-        for beams in (1, 2):
-            params = SamplingParams(max_tokens=10, num_beams=beams, temperature=0.0)
-            ref = decode(model, "sdpa", requests, params, block_size)
-            got = decode(model, "vllm", requests, params, block_size)
-            for i, (want, have) in enumerate(zip(ref, got)):
-                status = "OK" if want == have else "MISMATCH"
-                failures += status == "MISMATCH"
-                print(
-                    f"[{status}] block_size={block_size} beams={beams} seq={i}: {have}"
-                )
+    for dtype in (torch.float32, torch.bfloat16):
+        model_dt = build_model().to(dtype) if dtype != torch.float32 else model
+        for block_size in (16, 32):
+            isa = cpu_attn.select_isa(dtype, block_size, 32)
+            for beams in (1, 2):
+                params = SamplingParams(max_tokens=10, num_beams=beams, temperature=0.0)
+                ref = decode(model_dt, "sdpa", requests, params, block_size, dtype)
+                got = decode(model_dt, "vllm", requests, params, block_size, dtype)
+                for i, (want, have) in enumerate(zip(ref, got)):
+                    status = "OK" if want == have else "MISMATCH"
+                    failures += status == "MISMATCH"
+                    print(
+                        f"[{status}] dtype={dtype} isa={isa} block_size={block_size} "
+                        f"beams={beams} seq={i}: {have}"
+                    )
+                # bf16 + a full-width page is what the whole-decoder compile needs
+                # (one graph, freezing-packed GEMMs, opaque attention custom ops);
+                # a fresh model instance keeps module state from the eager passes.
+                if dtype is torch.bfloat16 and block_size == 32:
+                    compiled = decode(
+                        model_dt,
+                        "vllm",
+                        requests,
+                        params,
+                        block_size,
+                        dtype,
+                        compile_model=True,
+                    )
+                    for i, (want, have) in enumerate(zip(got, compiled)):
+                        status = "OK" if want == have else "MISMATCH"
+                        failures += status == "MISMATCH"
+                        print(
+                            f"[{status}] compiled: isa={isa} beams={beams} seq={i}: {have}"
+                        )
     if failures:
         raise SystemExit(f"{failures} mismatches")
 

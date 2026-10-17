@@ -323,34 +323,51 @@ hand-edit or guess.**
 
 | config | ours ms | ours tok/s | hf ms | hf tok/s | speedup |
 |---|---:|---:|---:|---:|---:|
-| batch=1, beams=1, bf16 | 3474 | 73.7 | 5369 | 47.7 | 1.55x |
-| batch=8, beams=1, bf16 | 5061 | 404.7 | 8914 | 229.8 | 1.76x |
-| batch=8, beams=4, bf16 | 7922 | 258.5 | 31275 | 65.5 | 3.95x |
-| batch=8, beams=1, fp32 | 8658 | 236.6 | 24794 | 82.6 | 2.86x |
+| batch=1, beams=1, bf16 | 3739 | 68.5 | 6116 | 41.9 | 1.64x |
+| batch=8, beams=1, bf16 | 5318 | 385.1 | 9139 | 224.1 | 1.72x |
+| batch=8, beams=4, bf16 | 8490 | 241.2 | 31459 | 65.1 | 3.71x |
+| batch=8, beams=1, fp32 | 9247 | 221.5 | 25183 | 81.3 | 2.72x |
 
-This recording is after hoisting the CPU capability checks in
-`layers/cpu_attn.py` into once-per-process globals (`TORCH_COMPILE_FREEZING.md`),
-which removed the only eager-path CPU probes `select_isa` made per attention
-call (two torch CPU queries per op before); the delta is inside run noise.
+This recording (eager with the manual prepack, `compile_model=False`) is after
+hoisting the CPU capability checks in `layers/cpu_attn.py` into once-per-process
+globals (`TORCH_COMPILE_FREEZING.md`) and moving the packing call into
+`ModelRunner.__init__` (same behavior as when it lived in `LLM`); the delta is
+inside run noise.  The box state shifted between recordings: the same four rows
+read around 3474 / 5061 / 7922 / 8658 ms on the previous commit — absolute times
+are only comparable within one recording, so only the within-run speedup is
+meaningful.
+
+With `compile_model=True` (bf16 rows: one compiled decoder graph, freezing-packed
+GEMMs — see the torch.compile gotcha), the same run reads:
+
+| config | ours ms | ours tok/s | hf ms | hf tok/s | speedup | vs eager |
+|---|---:|---:|---:|---:|---:|---:|
+| batch=1, beams=1, bf16 | 3375 | 75.9 | 6097 | 42.0 | 1.81x | -9% |
+| batch=8, beams=1, bf16 | 5147 | 397.9 | 9174 | 223.2 | 1.78x | -5% |
+| batch=8, beams=4, bf16 | 7865 | 260.4 | 31957 | 64.1 | 4.06x | -6% |
+| batch=8, beams=1, fp32 | 9276 | 220.8 | 24969 | 82.0 | 2.69x | = |
+
+(f32 is unaffected: the compile path is bf16-only and fp32 keeps the manual
+prepack.)  The first generate pays a one-time ~10-13 s Inductor compile of the
+decoder, plus one compile per distinct batch size as the running batch changes.
 
 One run, with the `pack_weights` prepack on (see the gotcha).  Re-running the same
 script back-to-back with packing disabled read 4513 / 6150 / 9435 / 23794
 ms (1.37x / 1.51x / 3.35x / 1.05x), so the prepack is worth 1.29x / 1.20x /
 1.20x / **2.76x** here — it is the whole of the fp32 row, where eager
 BART-large only ties HF.  The latency-bound batch=1 row varies ~5% with this
-laptop's clock, so its 1.59x is the least reliable cell.  This recording is at
+laptop's clock, so its cell is the least reliable one.  This recording is at
 the x86 default
-`block_size=32`; at the previous 16 it read 1.16x / 1.49x / 3.44x / 1.03x — that
-page size is the greedy-vs-beam trade-off in the gotcha below.  Absolute times
-are only comparable within one recording: the box ran ~20% slower here than when
-the previous table was taken, which moves the single-sequence row most, so on
-this box only the with-in-run speedup is meaningful.  Built with the vendored
-kernel — if `csrc/` fails to build (no `ninja`, see the gotcha) the same table
-reads 1.02x / 0.89x / 1.33x / 0.91x: greedy loses its edge (0.89-1.02x) and the
-beams=4 win shrinks 3.34x → 1.33x, which is why `cpu_attn.module()` is worth
-checking before trusting any CPU number.  With the kernel this laptop is the
-*fastest* box at these points (8 cores, high clocks), which is why its numbers
-beat the 4-core Xeons' in the README matrix.
+`block_size=32`; re-running at 16 read 1.43x / 1.74x / 3.95x / 2.88x, inside
+the run-to-run noise — this box cannot resolve the page-size trade-off, which
+took two runs per box on the Xeons (gotcha below).  Built with the vendored
+kernel — if `csrc/` fails to build (no `ninja`,
+see the gotcha) `auto` falls back to SDPA and the same table reads 1.21x /
+0.95x / 1.38x / 2.03x: the bf16 greedy rows lose their edge (0.95-1.21x) and the
+beams=4 win shrinks 3.92x → 1.38x, which is why `cpu_attn.module()` is worth
+checking before trusting any CPU number.  This laptop has the largest *speedup*
+at these points (8 cores, high clocks, and a much slower HF baseline) even
+though the Xeons decode more tokens/s in absolute terms.
 
 `benchmark_florence2.py` runs the same configs on a real 640x480 photo
 (`car.jpg`, scp'd to `/tmp/fastencdec/` so the boxes never hit the Hub) and a
@@ -676,49 +693,77 @@ on this box with the same kind of workload.
   global rather than `functools.lru_cache` (Dynamo inlines an `lru_cache` body and
   would trace the Hub download), and the flash self-attention path reads the
   Context directly instead of the per-step memo.
-- **`torch.compile` + graph freezing on CPU.** The Inductor weight-prepack
-  recipe (`torch._inductor.config.cpp.weight_prepack = True`,
-  `config.freezing = True`, then `torch.compile(model)`) does work, but only on
+- **`torch.compile` + graph freezing on CPU (`compile_model=True`, off by
+  default).** The Inductor weight-prepack recipe (`torch._inductor.config.cpp.weight_prepack = True`,
+  `config.freezing = True`, then `torch.compile(model)`) works but only on
   models that are pure torch: on a plain `Linear+GELU+Linear` it emits
   `mkldnn::_linear_pointwise` and gives 1.48x (bf16) / 2.28x (fp32) on the Xeon
   and 1.67x / 1.97x on Graviton.  Two traps sit in front of it: freezing only
   happens when `not torch.is_grad_enabled()`, so the forward must be under
   `torch.no_grad()` (`torch/_inductor/compile_fx.py`), and `recompile_limit`
   (default 8) is below the 12 decoder layers, which silently drops back to
-  eager.  It does not pay off on this engine: the attention is a pybind op that
-  also reads the module-level `Context`, so Dynamo graph-breaks there — its own
-  remedy is "wrap the custom kernel into an opaque custom op" — and the ~84
-  subgraphs per step cost more than the packing buys (`256->256, batch=8`: eager
-  6700 ms, compile without freezing 7490, compile + freezing 6950, manual
-  prepack 5150).  The remaining break census after hoisting the ISA probes
-  (`TORCH_COMPILE_FREEZING.md§4.2`): ~53 all pybind — `reshape_and_cache` ×40,
-  `attention_forward` ×9, `build_metadata` ×4 — the custom-op re-plumb is the
-  only way to shrink it, and compile+freezing still measured 6467 ms vs eager
-  5860 (0.91x) even with Inductor packing all 48 decoder GEMMs; the per-step
-  Python dispatch of the shattered graph is what loses, so the manual prepack
-  stays.  `layers/cpu_attn.py` therefore resolves AVX-512 capability once
-  into module globals (`_resolve_isa`) and caches the built module in a plain
-  global — do not put the per-call dispatch back on
-  `torch.cpu._is_avx512_supported` or `lru_cache` calls: Dynamo traces
-  into each of them (skip-listed or pybind) once per call site.
-  `torch._dynamo.allow_in_graph` is not enough either: Dynamo
-  still calls the wrapped function on fake tensors, which the kernel cannot run.
-  Registering the attention as a `torch.library.custom_op` with
-  `register_fake` *does* work — the whole decoder then compiles into one graph
-  and lands within 2-14% of the manual prepack (5250 ms Xeon, 5030 ms Graviton,
-  tokens identical) — but `decoder_cross_attention` takes the attention module
-  as an argument, which cannot be a custom-op input, so it needs re-plumbing to
-  pass the staged tensors.  CPU post-op fusion is not worth the plumbing either:
+  eager.
+  **The whole-decoder CPU path is now wired** (this is what `--compile` in
+  `benchmarks/benchmark.py` enables): the vLLM CPU attention branch is wrapped
+  in two opaque `torch.library.custom_op`s (`fastencdec::cpu_vllm_self_attention`,
+  `::cpu_vllm_cross_attention`, in `layers/attention.py`) with `register_fake`
+  impls, so Dynamo never traces the pybind module, the module-level `Context`
+  reads, the per-step metadata memo, the cross-attention staging, or the cache
+  mutation (`mutates_args` covers the self caches) — the compiled decoder runs
+  as **one graph** with zero breaks, and Inductor freezing (patched on around
+  each decoder call via `torch._inductor.config.patch(freezing=True)`) packs
+  **all 84 decoder GEMMs/step** into `_linear_pointwise` — confirmed in the
+  artifact: 0 `aten.addmm`, 84 pointwise.  `compile_model=True` then replaces
+  the manual prepack *for the decoder subtree* (`packed_linear.apply` excludes
+  `model.decoder`; encoder/lm-head/fp32 stay manually packed) and reads 3375 /
+  5147 / 7865 ms (~5-9% under the eager-prepack rows; see the baseline tables).
+  fp32 compiles to `mkl._mkl_linear` and loses to the manual prepack (12.6 s →
+  15.9 s in an early run), so the compile path is **bf16-only**, gated in
+  `ModelRunner.__init__` on `dtype is torch.bfloat16` + CPU + backend `"vllm"`.
+  The beats: eager pays ~1.9 ms/step of Python-dispatched pointwise kernels
+  (2618 `aten::add`, 2393 `native_layer_norm`, 780 `gelu` per 64 steps); the
+  compiled graph fuses those chains into its own C++ loops (~0.8 ms/step) with
+  equal GEMM output.  Remaining per-batch-size behavior: the graph recompiles
+  for every distinct running batch size (blocks tables are bucket-padded in
+  `_prepare` to 16-block buckets so growth does not recompile) — a batch that
+  shrinks as requests finish recompiles once per new size, so fixed-size
+  offline batches are the intended use.
+  History of why nothing cheaper worked, kept as a record: compile+freezing on
+  the *unplumbed* decoder broke on every pybind call (~84 subgraphs/step) and
+  measured 0.91x eager (6467 vs 5860 ms) — the remaining break census after
+  hoisting the ISA probes (`TORCH_COMPILE_FREEZING.md§4.2`) was ~53, all pybind,
+  which is what drove the custom-op re-plumb; `allow_in_graph` is not enough
+  (Dynamo calls the function on fake tensors); `layers/cpu_attn.py` therefore
+  resolves its capability flags once into module globals and caches the built
+  module in a plain global — do not put the per-call dispatch back on
+  `torch.cpu._is_avx512_supported` or `lru_cache` calls (Dynamo traces into
+  each once per call site).  CPU post-op
+  fusion is not worth the plumbing either:
   `linear+gelu` (`_linear_pointwise(..., "gelu", [-1], "none")`, exact like
   `F.gelu`) saves 0.002-0.005 ms per `fc1`, under 1% of a step — which is why
-  `compile_model` (Inductor fusing `_add_layer_norm`/`_activation_linear`)
-  measures ~7% *slower* on CPU.  Florence-2 is the exception that proves the
+  per-helper fusion (`_add_layer_norm`/`_activation_linear`) measures ~7%
+  *slower* on CPU; it stays enabled only on CUDA.
+  Florence-2 is the exception that proves the
   rule: `compile_mm_encoder` compiles the (pure-torch) DaViT tower fine, the
   packed forward is `torch.compiler.disable`d so Inductor never sees the opaque
   blocked weight (it fails on its `stride=[1, 0]` otherwise), which keeps the
   linear out of the graph — yet `compile + prepack` is still the fastest
   `get_image_features` (356 ms vs 369 compiled-unpacked vs 394 eager at 577
   tokens).
+- **The Inductor FX graph cache replays without running the trace.**
+  `/tmp/torchinductor_*` caches compiled artifacts across processes; a cached
+  graph can be **replayed without ever executing the Python of a fresh Dynamo
+  trace**.  Any trace-time side effect is therefore invisible on a cache hit —
+  the concrete failure: the cross-attention layer registry used to register
+  lazily inside the traced `decoder_cross_attention`, a cached replay called
+  `fastencdec::cpu_vllm_cross_attention.default(..., 0, ...)` with a baked
+  handle while the registry was still empty (`IndexError: list index out of
+  range`).  Rule: no module/global/attribute mutation inside traced code;
+  state must be established in `__init__` or at engine load
+  (`register_cross_layer` is called from `BartDecoderCrossAttention.__init__`,
+  and the lesson generalizes to anything Dynamo-visible).  When debugging a
+  cached-replay failure, `rm -rf /tmp/torchinductor_<user>` first — a cache
+  hit hides the trace path entirely.
 - **Fused q/k/v projections.** Each self-attention holds one `qkv_proj`
   (`[D -> 3D]`) where HF has `q_proj`/`k_proj`/`v_proj`, and cross-attention
   holds `kv_proj` + `q_proj` (K and V are both projected from the encoder

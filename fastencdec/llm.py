@@ -3,7 +3,6 @@ from transformers import AutoConfig, AutoTokenizer, GenerationConfig
 
 from .config import Config
 from .engine.llm_engine import LLMEngine
-from .layers import packed_linear
 from .models.bart import BartForConditionalGeneration
 from .models.florence2 import Florence2ForConditionalGeneration
 from .outputs import CompletionOutput, RequestOutput
@@ -62,9 +61,6 @@ class LLM:
 
         self.decoder_start_token_id = text_config.decoder_start_token_id
         self.eos_token_id = text_config.eos_token_id
-
-        if torch.device(device).type == "cpu":
-            packed_linear.apply(self.model, max_num_seqs)
 
         self.generation_config = _load_generation_config(model_path)
         self.default_sampling_params = SamplingParams.from_generation_config(
