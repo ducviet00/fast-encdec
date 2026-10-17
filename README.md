@@ -124,7 +124,11 @@ engine's 32-token page size, which engages the full-width AVX-512 attention
 kernel (see the page-size gotcha in `AGENTS.md`), while Graviton 5 keeps 16.
 The L4 column is unchanged by any of this: it runs FlashAttention-2 plus the
 decode CUDA graph, and the CUDA graph is why its rows stay ahead even where the
-CPU boxes tie (`beams=4`).
+CPU boxes tie (`beams=4`).  It is re-recorded with each table but does not move
+with the CPU work: across recordings its own milliseconds stay flat to ~1%
+(e.g. `512->128, batch=1`: 378 -> 381 ms) while the `transformers` baseline on
+the 4-vCPU box moves 4-8%, which is what shifts the L4 ratios by up to ~0.2 —
+including between two runs of the same commit (3.87x vs 4.11x).
 
 **vs vLLM (NVIDIA L4)**
 
