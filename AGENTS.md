@@ -323,10 +323,15 @@ hand-edit or guess.**
 
 | config | ours ms | ours tok/s | hf ms | hf tok/s | speedup |
 |---|---:|---:|---:|---:|---:|
-| batch=1, beams=1, bf16 | 3489 | 73.4 | 5562 | 46.0 | 1.59x |
-| batch=8, beams=1, bf16 | 5134 | 398.9 | 8902 | 230.1 | 1.73x |
-| batch=8, beams=4, bf16 | 7857 | 260.7 | 31060 | 65.9 | 3.95x |
-| batch=8, beams=1, fp32 | 8613 | 237.8 | 24946 | 82.1 | 2.90x |
+| batch=1, beams=1, bf16 | 3474 | 73.7 | 5369 | 47.7 | 1.55x |
+| batch=8, beams=1, bf16 | 5061 | 404.7 | 8914 | 229.8 | 1.76x |
+| batch=8, beams=4, bf16 | 7922 | 258.5 | 31275 | 65.5 | 3.95x |
+| batch=8, beams=1, fp32 | 8658 | 236.6 | 24794 | 82.6 | 2.86x |
+
+This recording is after hoisting the CPU capability checks in
+`layers/cpu_attn.py` into once-per-process globals (`TORCH_COMPILE_FREEZING.md`),
+which removed the only eager-path CPU probes `select_isa` made per attention
+call (two torch CPU queries per op before); the delta is inside run noise.
 
 One run, with the `pack_weights` prepack on (see the gotcha).  Re-running the same
 script back-to-back with packing disabled read 4513 / 6150 / 9435 / 23794
@@ -685,7 +690,18 @@ on this box with the same kind of workload.
   remedy is "wrap the custom kernel into an opaque custom op" — and the ~84
   subgraphs per step cost more than the packing buys (`256->256, batch=8`: eager
   6700 ms, compile without freezing 7490, compile + freezing 6950, manual
-  prepack 5150).  `torch._dynamo.allow_in_graph` is not enough either: Dynamo
+  prepack 5150).  The remaining break census after hoisting the ISA probes
+  (`TORCH_COMPILE_FREEZING.md§4.2`): ~53 all pybind — `reshape_and_cache` ×40,
+  `attention_forward` ×9, `build_metadata` ×4 — the custom-op re-plumb is the
+  only way to shrink it, and compile+freezing still measured 6467 ms vs eager
+  5860 (0.91x) even with Inductor packing all 48 decoder GEMMs; the per-step
+  Python dispatch of the shattered graph is what loses, so the manual prepack
+  stays.  `layers/cpu_attn.py` therefore resolves AVX-512 capability once
+  into module globals (`_resolve_isa`) and caches the built module in a plain
+  global — do not put the per-call dispatch back on
+  `torch.cpu._is_avx512_supported` or `lru_cache` calls: Dynamo traces
+  into each of them (skip-listed or pybind) once per call site.
+  `torch._dynamo.allow_in_graph` is not enough either: Dynamo
   still calls the wrapped function on fake tensors, which the kernel cannot run.
   Registering the attention as a `torch.library.custom_op` with
   `register_fake` *does* work — the whole decoder then compiles into one graph
