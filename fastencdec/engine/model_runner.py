@@ -3,10 +3,20 @@ from contextlib import nullcontext
 
 import torch
 
-from ..layers import attention, packed_linear
-from ..models import bart
+from ..layers import attention
 from ..utils.context import set_context
 from .cudagraph import DecodeGraphRunner
+
+
+class _DecodeStep(torch.nn.Module):
+    """Decoder stack + lm head as one torch.compile graph (freezing packs both)."""
+
+    def __init__(self, model):
+        super().__init__()
+        self.model = model
+
+    def forward(self, input_ids, positions):
+        return self.model.compute_logits(self.model.decoder(input_ids, positions))
 
 
 class ModelRunner:
@@ -21,7 +31,6 @@ class ModelRunner:
         device="cpu",
         max_num_seqs=32,
         use_cudagraph=True,
-        compile_model=False,
     ):
         self.device = torch.device(device)
         self.model = model.eval()
@@ -35,30 +44,33 @@ class ModelRunner:
         self.cache_layers = [layer.self_attn for layer in self.decoder_layers]
         self.num_heads = self.cache_layers[0].num_heads
         self.head_dim = self.cache_layers[0].head_dim
-        # Whole-decoder compile (CPU + vendored kernel, bf16 only) replaces the
-        # per-helper fusion: the attention ops are opaque custom ops, so Dynamo
-        # traces one graph and freezing packs all decoder GEMMs like the manual
-        # prepack does. fp32 compiles to mkl._mkl_linear and loses to the prepack.
+        # Frozen torch.compile is the whole GEMM story on CPU: the paged attention
+        # ops are opaque custom ops, so Dynamo traces the decoder + lm head as one
+        # graph, and Inductor freezing packs every GEMM (decoder, lm head, and the
+        # encoder's) into oneDNN blocked kernels. Needs the vendored kernel: the
+        # SDPA fallback reads the per-step Context, which tracing would bake in.
         self.compile_decoder = (
-            compile_model
-            and dtype is torch.bfloat16
-            and self.device.type == "cpu"
+            self.device.type == "cpu"
+            and dtype in (torch.float32, torch.bfloat16)
             and attention.backend(self.device, dtype, self.head_dim, self.block_size)
             == "vllm"
         )
-        # cpu: whole-decoder compile or the manual prepack — the per-helper fusion
-        # measured ~7% slower there. cuda: keep the per-helper fusion.
-        bart.enable_compile(
-            compile_model and self.device.type == "cuda" and not self.compile_decoder
-        )
-        # With the compiled decoder those linears pack inside the graph (Inductor
-        # freezing); the encoder / lm-head always stay on the manual prepack.
-        if self.device.type == "cpu":
-            exclude = model.decoder if self.compile_decoder else None
-            packed_linear.apply(self.model, max_num_seqs, exclude=exclude)
         self.decoder = model.decoder
+        self.decode_step = None
+        self.encode_step = None
         if self.compile_decoder:
-            self.decoder = torch.compile(model.decoder, dynamic=False)
+            # Symbolic batch / encoder length keeps memory bounded (freezing
+            # duplicates the packed weights per shape). The multimodal tower
+            # needs static shapes: Inductor's dynamic-conv lowering mis-strides
+            # DaViT's windowed feature maps.
+            dynamic = not hasattr(self.model, "get_image_features")
+            # Four parallel workers compile fast without the GB-scale memory
+            # spike of the default (thread-count) worker pool on small boxes.
+            torch._inductor.config.compile_threads = min(
+                4, torch._inductor.config.compile_threads
+            )
+            self.decode_step = torch.compile(_DecodeStep(self.model), dynamic=dynamic)
+            self.encode_step = torch.compile(self.model.encode, dynamic=dynamic)
         self.use_cudagraph = use_cudagraph and (
             self.device.type == "cuda"
             and attention.backend(self.device, dtype, self.head_dim, self.block_size)
@@ -94,6 +106,7 @@ class ModelRunner:
                 None if seq.pixel_values is None else tuple(seq.pixel_values.shape)
             )
             groups[(len(seq.encoder_token_ids), px_shape)].append(seq)
+        encode = self.encode_step or self.model.encode
         for group in groups.values():
             ids = torch.tensor(
                 [s.encoder_token_ids for s in group],
@@ -101,10 +114,12 @@ class ModelRunner:
                 device=self.device,
             )
             if group[0].pixel_values is None:
-                hidden = self.model.encode(ids)
+                with self._inductor_ctx():
+                    hidden = encode(ids)
             else:
                 px = torch.stack([s.pixel_values for s in group]).to(self.device)
-                hidden = self.model.encode(ids, pixel_values=px)
+                with self._inductor_ctx():
+                    hidden = encode(ids, pixel_values=px)
             for layer in self.decoder_layers:
                 attn = layer.encoder_attn
                 shape = (len(group), ids.shape[1], attn.num_heads, attn.head_dim)
@@ -155,12 +170,6 @@ class ModelRunner:
             seq_block_tables.append(seq.block_table)
 
         max_blocks = max(len(t) for t in seq_block_tables)
-        if self.compile_decoder:
-            # Bucketed table width keeps the compiled graph alive while sequences
-            # grow (the kernel reads only the rows the cache lens ask for).
-            max_blocks = min(
-                ((max_blocks + 15) // 16) * 16, self.block_manager.num_blocks
-            )
         padded = [t + [0] * (max_blocks - len(t)) for t in seq_block_tables]
         # Pinned host memory + non_blocking avoids stream syncs on CUDA.
         pin = self.device.type == "cuda"
@@ -194,11 +203,14 @@ class ModelRunner:
 
         set_context(**fields)
         with self._inductor_ctx():
-            hidden = self.decoder(input_ids, positions)
-        return self.model.compute_logits(hidden)
+            if self.decode_step is None:
+                hidden = self.decoder(input_ids, positions)
+                return self.model.compute_logits(hidden)
+            # decoder + lm head in one compiled graph (freezing packs both).
+            return self.decode_step(input_ids, positions)
 
     def _inductor_ctx(self):
-        """Patch Inductor freezing on for the compiled decoder call (packing at compile)."""
+        """Patch Inductor freezing on for compiled calls (packing at compile)."""
         if self.compile_decoder:
             return torch._inductor.config.patch(freezing=True)
         return nullcontext()

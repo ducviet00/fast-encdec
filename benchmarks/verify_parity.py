@@ -15,6 +15,7 @@ BART uses fixed-length decoding (EOS suppressed) so both engines emit exactly
 
 import argparse
 import os
+import subprocess
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -74,7 +75,9 @@ def _status(a, b):
 def bart(dtype, beams, max_tokens, device="cpu"):
     from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
 
-    num_blocks, block_size = block_config(device, 2048 * 16)
+    num_blocks, block_size = block_config(
+        device, 2048 * (16 if dtype is not torch.float32 else 4)
+    )
     llm = LLM(
         BART,
         num_blocks=num_blocks,
@@ -122,7 +125,9 @@ def florence(dtype, beams, max_tokens, device="cpu"):
     from transformers import Florence2ForConditionalGeneration as HFFlorence2
 
     image = load_image()
-    num_blocks, block_size = block_config(device, 4096 * 16)
+    num_blocks, block_size = block_config(
+        device, 4096 * (16 if dtype is not torch.float32 else 4)
+    )
     llm = LLM(
         FLORENCE,
         num_blocks=num_blocks,
@@ -185,13 +190,35 @@ def main():
     ap.add_argument("--dtype", default="bfloat16", choices=["float32", "bfloat16"])
     ap.add_argument("--device", default="cpu", help="cpu or cuda (cuda:N works)")
     ap.add_argument("--max-tokens", type=int, default=32)
+    ap.add_argument("--kind", default=None, help=argparse.SUPPRESS)  # internal
+    ap.add_argument("--beams", type=int, default=0, help=argparse.SUPPRESS)  # internal
     args = ap.parse_args()
     dtype = getattr(torch, args.dtype)
+
+    if args.kind is None:
+        # One subprocess per (model, beam) phase: the fp32 engine + reference
+        # + frozen weight copies only fit an 11 GB box one phase at a time.
+        phases = [("bart", b) for b in (1, 4)] + [("florence", b) for b in (1, 3)]
+        for kind, beams in phases:
+            cmd = [
+                sys.executable,
+                __file__,
+                f"--dtype={args.dtype}",
+                f"--device={args.device}",
+                f"--max-tokens={args.max_tokens}",
+                f"--kind={kind}",
+                f"--beams={beams}",
+            ]
+            env = dict(
+                os.environ, PYTHONPATH=os.path.dirname(os.path.dirname(__file__))
+            )
+            if subprocess.run(cmd, check=False, env=env).returncode:
+                raise SystemExit(f"phase {kind} beams={beams} failed")
+        return
+
     print(f"== {args.dtype} on {args.device} ==", flush=True)
-    for beams in (1, 4):
-        bart(dtype, beams, args.max_tokens, args.device)
-    for beams in (1, 3):
-        florence(dtype, beams, args.max_tokens, args.device)
+    phase = bart if args.kind == "bart" else florence
+    phase(dtype, args.beams, args.max_tokens, args.device)
 
 
 if __name__ == "__main__":

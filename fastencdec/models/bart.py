@@ -15,34 +15,14 @@ from ..layers.attention import (
 ACT2FN = {"gelu": F.gelu}
 
 
-# Pointwise helpers swapped with torch.compile versions when compile_model=True.
-def _add_layer_norm_impl(norm, residual, x):
+def _add_layer_norm(norm, residual, x):
     """Apply residual addition followed by layer normalization."""
     return norm(residual + x)
 
 
-def _activation_linear_impl(linear, activation, x):
+def _activation_linear(linear, activation, x):
     """Apply a linear projection followed by an activation function."""
     return activation(linear(x))
-
-
-_add_layer_norm = _add_layer_norm_impl
-_activation_linear = _activation_linear_impl
-_COMPILED = False
-
-
-def enable_compile(enable: bool = True) -> None:
-    """Toggle torch.compile fusion for the per-layer pointwise helpers."""
-    global _add_layer_norm, _activation_linear, _COMPILED
-    if enable == _COMPILED:
-        return
-    if enable:
-        _add_layer_norm = torch.compile(_add_layer_norm_impl)
-        _activation_linear = torch.compile(_activation_linear_impl)
-    else:
-        _add_layer_norm = _add_layer_norm_impl
-        _activation_linear = _activation_linear_impl
-    _COMPILED = enable
 
 
 class BartLearnedPositionalEmbedding(nn.Embedding):

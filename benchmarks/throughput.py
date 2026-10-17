@@ -54,9 +54,6 @@ def main():
         default=True,
         help="decode CUDA graph (default on; CUDA + flash only)",
     )
-    ap.add_argument(
-        "--compile-model", action="store_true", help="torch.compile decoder"
-    )
     ap.add_argument("--warmup", type=int, default=1)
     ap.add_argument("--repeats", type=int, default=2)
     ap.add_argument("--profile", action="store_true", help="torch.profiler breakdown")
@@ -80,7 +77,6 @@ def main():
         dtype=dtype,
         device=args.device,
         use_cudagraph=args.use_cudagraph,
-        compile_model=args.compile_model,
     )
     prompt = make_prompt(tokenizer, args.enc_len)
     prompts = [prompt] * n
@@ -111,7 +107,7 @@ def main():
         f"model={args.model} device={args.device} dtype={args.dtype} "
         f"requests={n} enc_len={args.enc_len} max_tokens={args.max_tokens} "
         f"block_size={block_size} num_blocks={num_blocks} "
-        f"cudagraph={args.use_cudagraph} compile={args.compile_model}"
+        f"cudagraph={args.use_cudagraph}"
     )
     print(
         f"best {best * 1e3:8.0f} ms   {generated} tokens   "

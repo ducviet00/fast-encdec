@@ -260,6 +260,52 @@ Short answer: **no**.
 3. Never expect packing from compiled *helpers* (trap §3.3); compile the
    module's own forward.
 
+### 6.2 The landed state (`compile` is the CPU default; manual prepack removed)
+
+The manual `packed_linear` path is gone: frozen torch.compile is the only CPU
+GEMM-story now, on both dtypes, and it is on by default
+(`compile_decoder = CPU + backend=="vllm"` in `ModelRunner.__init__`; fp32
+compiles too and verifies **token-exact vs HF**).  What built on §6.1:
+
+- **Two graphs per runner**, both wrapped in
+  `torch._inductor.config.patch(freezing=True)` contexts:
+  `_DecodeStep` = decoder + `compute_logits` (lm head packs inside the graph —
+  72 `_linear_pointwise`, 0 `aten.addmm`; dynamic B: one artifact for every
+  batch size), and `model.encode` (encoder GEMMs + the whole Florence-2 vision
+  tower/projector graph).
+- **Semantics preserved**: the CUDA decode path is untouched (`use_cudagraph`
+  captures the eager decoder); a batch of separate LLM instances co-exists.
+- **The compile happens once per process and ~4 s at cache hit**; first run
+  pays ~10-25 s per graph for the two graphs (Inductor compile_threads capped
+  at 4 so the parallel C++ workers don't spike GBs on small boxes).
+- Benchmark table: the new dev-box baseline in `AGENTS.md` ("Benchmark
+  baseline") records this state.  The per-shape memory bound measured above
+  (0.74 GB bf16 / 1.6 GB fp32 per STATIC artifact for bart-large) is real; the
+  decode + BART-encode graphs are therefore `dynamic=True` (one artifact across
+  all batch sizes / encoder lengths), while the Florence-2 `encode` compiles
+  static because dynamic convs mis-stride DaViT (`assert_tensor_metadata`
+  failures in the generated kernel).
+- fp32 token-exactness: the freezing pack on fp32 lowers to `mkl._mkl_linear`
+  (a fused MKL GEMM) — verified token-for-token equal vs HF on BART beams=1/4,
+  Florence beams=1/3 (`verify_parity.py --dtype float32`).
+- `verify_parity.py` now runs each (model, beams) phase in its own subprocess
+  (fp32's two engines + reference + artifacts only fit an 11 GB box one phase
+  at a time) and snaps fp32 KV budgets down (bf16: `2048*16` → fp32:
+  `2048*4`).
+
+- fp32 token-exactness: the freezing pack on fp32 lowers to `mkl._mkl_linear`
+  (a fused MKL GEMM) — verified token-for-token equal vs HF on BART beams=1/4,
+  Florence beams=1/3 (`verify_parity.py --dtype float32`).
+- `verify_parity.py` now runs each (model, beams) phase in its own subprocess
+  (fp32's two engines + reference + artifacts only fit an 11 GB box one phase
+  at a time) and snaps fp32 KV budgets down (bf16: `2048*16` → fp32:
+  `2048*4`).
+
+Everything below (§6.1) stays true about *how* the custom ops make the graph
+single-holed and the FX-cache rules — only its last two bullets (the
+`exclude=` parameter, "compile is bf16-only") are superseded: `packed_linear`
+was deleted entirely and fp32 compiles now too.
+
 ### 6.1 The landed state (compile_model=True, bf16 CPU) — second round
 
 The remaining 53 pybind breaks were removed by wrapping the whole vLLM CPU
