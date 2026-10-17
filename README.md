@@ -108,6 +108,16 @@ Beam search is still the biggest win: `transformers` reorders the whole beam cac
 every step, while blocks are shared here.  Greedy stays ahead too, especially
 at `512->128` where the encoder is shared work.
 
+Two caveats when diffing this table against an older recording.  These are
+ratios, and on the 4-core Xeon instances the denominator is the unstable side:
+two runs of this same commit read 1.52x and 1.31x on `128->512, batch=1`
+(ours 7856/8311 ms, HF 11926/10905 ms) and 2.24x vs 2.60x on `256->256, b=8,
+beams=4` (ours 10646/9464 ms), i.e. a cell can move ~0.1-0.35 on its own.  And
+the engine's own absolute times are flat across recordings where HF's are not
+(Emerald `512->128, beams=4`: ours 5.90 s in a pre-fix session, 5.90/5.85 s
+here; HF 30.8 s then, 30.0/28.6 s now), so a few tenths of drift in a Xeon
+cell is the baseline, not the engine.
+
 Each cell is the average of two independent runs, and every run writes its raw
 results with `--json`, so the numbers can be re-derived rather than trusted.  On
 CPU the engine runs the vendored vLLM attention kernel behind two opaque
