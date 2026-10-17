@@ -2,10 +2,9 @@
 
 Builds a tiny BART whose ``head_dim`` the kernel supports (32) and checks that
 greedy and beam decoding match the pure-PyTorch path token for token, for a
-batch of mixed encoder lengths, both dtypes the tile kernel specializes (fp32 on
-the AVX-512 path, bf16 which also exercises ``isa="amx"`` on AMX-BF16 hosts)
-and both CPU page sizes (16 = the 16-wide ``vec16`` kernel, 32 = the full-width
-``vec``/``amx`` one).  With backend ``vllm`` every decode runs the frozen
+batch of mixed encoder lengths, both dtypes (fp32 and bf16) and both CPU page
+sizes (16 = the 16-wide ``vec16`` kernel, 32 = the full-width ``vec`` one).
+With backend ``vllm`` every decode runs the frozen
 torch.compile path (the compiled runner is the CPU default), so this also
 checks that the compiled graph produces the same tokens as eager SDPA.  Skips
 silently when the extension cannot build (no compiler / unsupported machine).

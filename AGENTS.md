@@ -60,11 +60,12 @@ placeholders; the decoder is unchanged.
   there is no GPU on the dev box, so run `--device cuda` benchmarks there. Auth
   is flaky (public-key connections are sometimes refused) — retry. `build_essential`
   was installed for `torch.compile` of the Florence-2 vision tower.
-- CPU benchmarking boxes (the README matrix): `ssh ducviet00@34.142.225.47`
+- CPU benchmarking boxes (the README matrix): `ssh ducviet00@34.126.100.74`
   (Xeon 8581C, Emerald Rapids, `amx_bf16`, 8 vCPU = 4 cores, `~/env-ours`), `ssh
-  ubuntu@54.252.169.176` (Xeon 6975P-C, Granite Rapids, `amx_bf16`, 8 vCPU = 4
-  cores, `~/venv`) and `ssh ubuntu@3.26.21.19` (Graviton 5 / Neoverse-V3, 8 cores, no
-  SMT, `~/venv`).  Each has the repo at `~/fast-encdec` and `car.jpg` at
+  ubuntu@32.236.201.188` (Xeon 6975P-C, Granite Rapids, `amx_bf16`, 8 vCPU = 4
+  cores, `~/venv`) and `ssh ubuntu@13.210.12.162` (Graviton 5 / Neoverse-V3, 8 cores, no
+  SMT, `~/venv`).  These boxes rotate (older IPs than this recording are
+  unreachable); check the host is alive before trusting its numbers.  Each has the repo at `~/fast-encdec` and `car.jpg` at
   `/tmp/fastencdec/florence2_bench.jpg`.  Copy with
   `tar czf - ... | ssh box 'tar xzf - -C ~/fast-encdec'` — and all three needed
   `gcc g++ make ninja-build python3-dev` before `csrc/` would build (torch's
@@ -325,10 +326,10 @@ hand-edit or guess.**
 
 | config | ours ms | ours tok/s | hf ms | hf tok/s | speedup |
 |---|---:|---:|---:|---:|---:|
-| batch=1, beams=1, bf16 | 3433 | 74.6 | 5800 | 44.1 | 1.69x |
-| batch=8, beams=1, bf16 | 4999 | 409.6 | 8949 | 228.9 | 1.79x |
-| batch=8, beams=4, bf16 | 7926 | 258.4 | 31790 | 64.4 | 4.01x |
-| batch=8, beams=1, fp32 | 8673 | 236.1 | 25472 | 80.4 | 2.94x |
+| batch=1, beams=1, bf16 | 3698 | 69.2 | 6157 | 41.6 | 1.66x |
+| batch=8, beams=1, bf16 | 5128 | 399.4 | 9010 | 227.3 | 1.76x |
+| batch=8, beams=4, bf16 | 7950 | 257.6 | 32057 | 63.9 | 4.03x |
+| batch=8, beams=1, fp32 | 9168 | 223.4 | 25548 | 80.2 | 2.79x |
 
 This recording is the frozen `torch.compile` default: one dynamic decode graph
 (decoder + lm head) and one dynamic encoder graph, with Inductor freezing packing
@@ -508,7 +509,12 @@ on this box with the same kind of workload.
   **static** because Inductor's dynamic-conv lowering mis-strides DaViT's
   windowed feature maps (`assert_tensor_metadata` failures) — acceptable there,
   since image shapes (and usually batch, within an LLM instance) are fixed.
-  First use pays a one-time Inductor compile per graph (artifacts cached in
+  The static mm graph recompiles per distinct batch, and the change is watched
+  by `torch._dynamo`'s `recompile_limit` (8): a process where the batch
+  shrinks mid-run (8→6 as requests finish, seen on the Graviton Florence
+  benchmark) hits it and logs cache-size complaints — fixed-size offline
+  batches are the intended use, as for the decoder.  First use pays a one-time
+  Inductor compile per graph (artifacts cached in
   `/tmp/torchinductor_*` across processes, and the FX cache can **replay a
   graph without running the trace** — no trace-time side effects allowed; see
   the FX-cache gotcha), and parallel workers are capped at 4 to avoid a GB-scale
@@ -591,7 +597,10 @@ on this box with the same kind of workload.
   CUDA graph switches off with it — on the L4, `batch=8, beams=1, bf16` then
   measured 347 tok/s where the flash path gives 1817.  Check
   `flash_attn.module()` before trusting CUDA numbers, exactly as
-  `cpu_attn.module()` gates the CPU ones.
+  `cpu_attn.module()` gates the CPU ones.  (The L4's `ours`-side runs must
+  therefore go ONLINE: `get_kernel` fails under `HF_HUB_OFFLINE=1` even with
+  the kernel snapshots cached in `~/.cache/huggingface/kernels`, so unset that
+  variable for the ours engine and keep it set for the vLLM side.)
   The backend uses `flash_attn_with_kvcache` (page-major cache
   read through the block table) for self- and cross-attention: the dedicated
   decode kernel is ~3x cheaper per call than `flash_attn_varlen_func`, which

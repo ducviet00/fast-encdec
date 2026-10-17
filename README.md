@@ -85,40 +85,46 @@ and `benchmarks/throughput.py` measures decode-only throughput.
 
 | point | config | Xeon 8581C | Xeon 6975P-C | Graviton 5 | L4 |
 |---|---|---:|---:|---:|---:|
-| 128->512 | batch=1, beams=1 | 1.50x | 1.47x | 2.99x | 3.29x |
-| 128->512 | batch=8, beams=1 | 1.53x | 1.42x | 1.75x | 2.75x |
-| 128->512 | batch=8, beams=4 | 2.78x | 2.61x | 2.25x | 2.04x |
-| 512->128 | batch=1, beams=1 | 1.49x | 1.39x | 2.73x | 3.23x |
-| 512->128 | batch=8, beams=1 | 1.23x | 1.19x | 1.38x | 2.38x |
-| 512->128 | batch=8, beams=4 | 5.08x | 4.22x | 1.88x | 2.80x |
-| 256->256 | batch=1, beams=1 | 1.55x | 1.43x | 2.88x | 3.36x |
-| 256->256 | batch=8, beams=1 | 1.40x | 1.31x | 1.60x | 2.76x |
-| 256->256 | batch=8, beams=4 | 2.57x | 2.37x | 2.06x | 2.19x |
+| 128->512 | batch=1, beams=1 | 1.47x | 1.56x | 3.45x | 3.89x |
+| 128->512 | batch=8, beams=1 | 1.45x | 1.48x | 1.91x | 3.12x |
+| 128->512 | batch=8, beams=4 | 2.50x | 2.67x | 2.38x | 2.10x |
+| 512->128 | batch=1, beams=1 | 1.36x | 1.48x | 2.98x | 3.86x |
+| 512->128 | batch=8, beams=1 | 1.18x | 1.24x | 1.48x | 2.70x |
+| 512->128 | batch=8, beams=4 | 5.10x | 4.76x | 2.04x | 2.85x |
+| 256->256 | batch=1, beams=1 | 1.48x | 1.53x | 3.34x | 3.94x |
+| 256->256 | batch=8, beams=1 | 1.29x | 1.37x | 1.76x | 3.04x |
+| 256->256 | batch=8, beams=4 | 2.39x | 2.42x | 2.22x | 2.23x |
 
 **Throughput (tokens/s), 256->256**
 
 | config | engine | Xeon 8581C | Xeon 6975P-C | Graviton 5 | L4 |
 |---|---|---:|---:|---:|---:|
-| batch=8, beams=1 | fast-encdec | 420 | 408 | 711 | 1845 |
-| batch=8, beams=1 | transformers | 299 | 312 | 444 | 668 |
-| batch=8, beams=4 | fast-encdec | 234 | 254 | 338 | 975 |
-| batch=8, beams=4 | transformers | 91 | 107 | 164 | 446 |
+| batch=8, beams=1 | fast-encdec | 300 | 417 | 743 | 2122 |
+| batch=8, beams=1 | transformers | 233 | 305 | 422 | 699 |
+| batch=8, beams=4 | fast-encdec | 184 | 256 | 355 | 1011 |
+| batch=8, beams=4 | transformers | 77 | 106 | 160 | 453 |
 
 Beam search is still the biggest win: `transformers` reorders the whole beam cache
-every step, while blocks are shared here.  Greedy used to be a near tie, especially
-at `512->128` where the encoder is shared work; prepacking the CPU linear weights
-(below) moved every greedy row.
+every step, while blocks are shared here.  Greedy stays ahead too, especially
+at `512->128` where the encoder is shared work.
 
 Each cell is the average of two independent runs, and every run writes its raw
-results with `--json`, so the numbers can be re-derived rather than trusted.  Every
-CPU `nn.Linear` weight is prepacked into oneDNN's blocked layout at load
-(`pack_weights` in the `AGENTS.md` gotchas), which removes the per-call weight
-reorder `F.linear` pays.  On aarch64 that also routes the GEMM through oneDNN-ACL
-instead of torch's fallback kernel, which is why Graviton 5's single-sequence rows
-gain ~2.7-2.9x while the x86 rows gain ~1.2-1.5x.  The two x86 boxes additionally
-run the engine's 32-token page size, which engages the full-width AVX-512 attention
-kernel (see the page-size gotcha in `AGENTS.md`), while Graviton 5 and the L4 keep
-theirs (16 and 256).  The L4 column is unchanged: the prepack is CPU-only.
+results with `--json`, so the numbers can be re-derived rather than trusted.  On
+CPU the engine runs the vendored vLLM attention kernel behind two opaque
+`torch.library.custom_op`s, which makes the whole decoder + lm head (and the
+encoder) trace as **one frozen `torch.compile` graph**: Inductor's freezing pass
+packs every GEMM into oneDNN's blocked layouts — the same op a manual weight
+prepack used to feed, produced at compile time instead of at load, with the
+per-layer pointwise ops fused into the linear epilogues for free (`AGENTS.md`
+"CPU GEMM packing" gotcha; CPU-only, fp32 and bf16, and fp32 there stays
+token-for-token identical to `transformers`).  On aarch64 the packing routes
+through oneDNN-ACL, which is why Graviton 5's single-sequence rows gain
+~3.0-3.5x while the x86 rows gain ~1.2-1.6x.  The two x86 boxes run the
+engine's 32-token page size, which engages the full-width AVX-512 attention
+kernel (see the page-size gotcha in `AGENTS.md`), while Graviton 5 keeps 16.
+The L4 column is unchanged by any of this: it runs FlashAttention-2 plus the
+decode CUDA graph, and the CUDA graph is why its rows stay ahead even where the
+CPU boxes tie (`beams=4`).
 
 **vs vLLM (NVIDIA L4)**
 
@@ -249,22 +255,23 @@ segmentation and phrase grounding)
 
 | config | Xeon 8581C | Xeon 6975P-C | Graviton 5 | L4 |
 |---|---:|---:|---:|---:|
-| batch=1, beams=1 | 1.34x | 1.39x | 1.30x | 2.54x |
-| batch=8, beams=1 | 1.83x | 2.08x | 1.29x | 3.60x |
-| batch=8, beams=4 | 4.12x | 3.48x | 2.16x | 4.23x |
+| batch=1, beams=1 | 1.91x | 1.82x | 1.46x | 2.64x |
+| batch=8, beams=1 | 1.92x | 2.32x | 1.43x | 3.75x |
+| batch=8, beams=4 | 3.53x | 3.47x | 2.31x | 4.24x |
+| batch=8, beams=1, fp32 | 1.36x | 1.39x | 1.10x | 0.81x |
 
 The Florence-2 numbers move less than BART's: the vision tower and encoder are
-shared work, so the page size and the linear prepack only touch the decoder.  In
-fp32 this engine reproduces `transformers` token for token; in bf16 the output
-length always matches.
+shared work, so on CPU they are part of the same frozen compile graph — the
+compile covers them automatically — while decode rows ride the same decoder
+graph as BART.  In fp32 this engine reproduces `transformers` token for token;
+in bf16 the output length always matches.
 
 ## Tests
 
 ```bash
 python tests/test_parity.py        # vs transformers, tiny random BART
 python tests/test_florence2.py     # vs transformers, tiny random Florence-2
-python tests/test_attn_backend.py  # vLLM CPU kernel vs SDPA
-python tests/test_packed_linear.py # packed CPU linears (fallback + token parity)
+python tests/test_attn_backend.py  # vLLM CPU kernel vs SDPA (compiled path)
 python tests/test_gpu_flash.py     # FlashAttention-2 vs SDPA (CUDA only)
 ```
 

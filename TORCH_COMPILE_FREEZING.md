@@ -1,7 +1,9 @@
 # Why `torch.compile` + graph freezing does (does not) produce `mkldnn._linear_pointwise` weight prepacking
 
 Findings, 2026-10-17. Environment: dev box (AMD Ryzen 7 7840H, Zen 4, `avx512_bf16`,
-no AMX), Python 3.11, **torch 2.14.0+cpu**, fast-encdec @ `1092eb5`.
+no AMX), Python 3.11, **torch 2.14.0+cpu**. The §4.2/§6.1 break-census numbers
+were taken on a dev tree that also carried a (later unmerged) AMX attention
+experiment; this branch carries everything else described here.
 
 Answers for the three questions that motivated this doc:
 
@@ -204,13 +206,15 @@ dynamo's compile report):
 | `aten::clone` / `aten::contiguous` between subgraphs | 432 / 420 |
 
 Of the ~70 breaks/forward, **52 are ours to remove today**: 39 from
-`torch.cpu._is_avx512_supported` and 13 from `torch.cpu._init_amx` — both are
-re-checked inside our `layers/cpu_attn.py` `_x86_kernel_ok()` / `_amx_usable()`,
-which `select_isa()` reaches from the op-dispatch path on *every* attention
-call (`layers/attention.py:42,168,284`). They are torch CPU-API calls resolved
+`torch.cpu._is_avx512_supported` (+ its bf16 sibling) and 13 from
+`torch.cpu._init_amx` — the latter only because the census tree still carried
+the AMX attention experiment; this branch's `layers/cpu_attn.py`
+`_x86_kernel_ok()` contains only the AVX-512 pair, so its per-call break total
+is 39. They run inside `select_isa()` on the op-dispatch path on *every*
+attention call (`layers/attention.py:42,168,284`). They are torch CPU-API calls
+resolved
 per process, so caching the answers as plain bools on the module removes the
-breaks (the existing `lru_cache` on `_amx_usable` only protects the compiler
-probe subprocess, not the torch checks; and an `lru_cache` would not help under
+breaks (`lru_cache` does not help under
 Dynamo anyway — it re-fires per fake-tensor frame).
 The remaining 17 (9 `attention_forward`, 8 `reshape_and_cache`) are the pybind
 kernels that need `torch.library.custom_op` + `register_fake`, as AGENTS.md
@@ -244,7 +248,8 @@ Short answer: **no**.
 ## 6. What to actually do (if/when revisiting compile on this engine)
 
 1. ~~**Freeze the capability checks.**~~ **Done** (same-day): `cpu_attn.py`
-   resolves AVX-512/AMX capability once into module globals (`_resolve_isa`)
+   resolves the AVX-512 capability pair once into module globals
+   (`_resolve_isa`, minus the census tree's AMX probe)
    and caches the built extension in a plain global (`_BUILT`) instead of
    `lru_cache` — Dynamo ignores cache wrappers and was tracing `_build()` per
    call site (41 `posix.stat` breaks from `os.path.exists`). Post-fix break
@@ -253,7 +258,7 @@ Short answer: **no**.
    **6467 ms vs eager 5860 (0.91x, was 0.84x)** with packing unchanged (48),
    and the eager default is marginally faster too (the baseline table in
    AGENTS.md was refreshed). Tests pass (`test_parity`, `test_attn_backend`,
-   `test_beam`, `test_packed_linear`, `test_florence2`).
+   `test_beam`, `test_florence2`).
 2. ~~**Verdict on replacing the manual prepack with compile+freezing: no.**~~
    **Superseded:** the custom-op re-plumb *did* land, and it changed the
    verdict.  See §6.1 below.
@@ -285,14 +290,6 @@ compiles too and verifies **token-exact vs HF**).  What built on §6.1:
   all batch sizes / encoder lengths), while the Florence-2 `encode` compiles
   static because dynamic convs mis-stride DaViT (`assert_tensor_metadata`
   failures in the generated kernel).
-- fp32 token-exactness: the freezing pack on fp32 lowers to `mkl._mkl_linear`
-  (a fused MKL GEMM) — verified token-for-token equal vs HF on BART beams=1/4,
-  Florence beams=1/3 (`verify_parity.py --dtype float32`).
-- `verify_parity.py` now runs each (model, beams) phase in its own subprocess
-  (fp32's two engines + reference + artifacts only fit an 11 GB box one phase
-  at a time) and snaps fp32 KV budgets down (bf16: `2048*16` → fp32:
-  `2048*4`).
-
 - fp32 token-exactness: the freezing pack on fp32 lowers to `mkl._mkl_linear`
   (a fused MKL GEMM) — verified token-for-token equal vs HF on BART beams=1/4,
   Florence beams=1/3 (`verify_parity.py --dtype float32`).
