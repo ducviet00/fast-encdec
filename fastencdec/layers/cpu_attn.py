@@ -1,4 +1,3 @@
-import functools
 import os
 import platform
 import subprocess
@@ -17,6 +16,23 @@ _HEAD_DIMS_32 = {32, 64, 96, 128, 160, 192, 224, 256, 512}
 _HEAD_DIMS_16 = {48, 80, 112}
 _FLOAT_DTYPES = {torch.float32, torch.bfloat16, torch.float16}
 
+# Process-static CPU facts resolved once (see _resolve_isa); the per-call
+# dispatch path only reads plain globals, so Dynamo never traces into the
+# torch.cpu capability probes on compiled runs.
+_ON_ARM = platform.machine().lower() in ("arm64", "aarch64")
+_ISA_RESOLVED = False
+_ISA_X86_OK = False
+
+
+def _resolve_isa() -> None:
+    """Resolve this CPU's ISA capability flags once, before the kernels run."""
+    global _ISA_RESOLVED, _ISA_X86_OK
+    if _ISA_RESOLVED:
+        return
+    if not _ON_ARM:
+        _ISA_X86_OK = _x86_kernel_ok()
+    _ISA_RESOLVED = True
+
 
 def _x86_kernel_ok() -> bool:
     """Return True if this x86 CPU supports AVX-512 and AVX-512 BF16."""
@@ -31,13 +47,14 @@ def _x86_kernel_ok() -> bool:
 
 def select_isa(dtype, block_size: int, head_dim: int) -> str | None:
     """Return the vLLM CPU kernel ISA ('neon', 'vec', or 'vec16') if supported, else None."""
+    _resolve_isa()
     if dtype not in _FLOAT_DTYPES or block_size % 16 != 0:
         return None
-    if platform.machine().lower() in ("arm64", "aarch64"):
+    if _ON_ARM:
         if head_dim in _HEAD_DIMS_32:
             return "neon"
         return "vec16" if head_dim in _HEAD_DIMS_16 else None
-    if not _x86_kernel_ok():
+    if not _ISA_X86_OK:
         return None
     if head_dim in _HEAD_DIMS_32 and block_size % 32 == 0:
         return "vec"
@@ -100,13 +117,21 @@ def _build():
     )
 
 
-@functools.lru_cache(maxsize=1)
+_BUILT = None
+
+
 def module():
     """Return the compiled CPU attention extension module, or None if build fails."""
-    try:
-        return _build()
-    except Exception:  # noqa: BLE001
-        return None
+    # A plain global instead of functools.lru_cache: Dynamo traces cache-wrapped
+    # bodies (reaching _build()'s os.path.exists) once per call site.
+    global _BUILT
+    if _BUILT is None:
+        try:
+            _resolve_isa()
+            _BUILT = _build()
+        except Exception:  # noqa: BLE001
+            _BUILT = False
+    return _BUILT or None
 
 
 def require():

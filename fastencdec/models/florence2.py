@@ -424,17 +424,22 @@ class Florence2ForConditionalGeneration(nn.Module):
         """Run the vision tower and multimodal projector to produce visual token embeddings."""
         return self.model.multi_modal_projector(self.model.vision_tower(pixel_values))
 
-    def compile_mm_encoder(self, mode: str = "default", dynamic: bool = False) -> None:
-        """Wrap get_image_features with torch.compile."""
-        self.get_image_features = torch.compile(
-            self.get_image_features, mode=mode, dynamic=dynamic
-        )
+    def forward(self, input_ids: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
+        """Run one decoder step and return logits [B, vocab] (the compiled decode graph)."""
+        return self.compute_logits(self.decoder(input_ids, positions))
 
     @torch.no_grad()
     def encode(
-        self, encoder_input_ids: torch.Tensor, pixel_values: torch.Tensor | None = None
+        self,
+        encoder_input_ids: torch.Tensor,
+        pixel_values: torch.Tensor | None = None,
+        image_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Scatter projected visual tokens into image_token_id slots and run the BART encoder."""
+        """Scatter projected visual tokens into image_token_id slots and run the BART encoder.
+
+        ``image_embeds`` lets the runner pass features it already computed (the
+        tower compiles with static shapes, this graph with dynamic ones).
+        """
         language_model = self.model.language_model
         positions = (
             torch.arange(encoder_input_ids.shape[1], device=encoder_input_ids.device)
@@ -442,13 +447,13 @@ class Florence2ForConditionalGeneration(nn.Module):
             .expand_as(encoder_input_ids)
         )
         inputs_embeds = language_model.shared(encoder_input_ids)
-        if pixel_values is not None:
-            image_features = self.get_image_features(pixel_values).to(
-                inputs_embeds.dtype
-            )
+        if image_embeds is None and pixel_values is not None:
+            image_embeds = self.get_image_features(pixel_values)
+        if image_embeds is not None:
+            image_embeds = image_embeds.to(inputs_embeds.dtype)
             image_mask = encoder_input_ids == self.config.image_token_id
             inputs_embeds = inputs_embeds.masked_scatter(
-                image_mask.unsqueeze(-1), image_features
+                image_mask.unsqueeze(-1), image_embeds
             )
         return language_model.encoder(positions=positions, inputs_embeds=inputs_embeds)
 

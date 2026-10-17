@@ -9,38 +9,20 @@ from ..layers.attention import (
     decoder_cross_attention,
     decoder_self_attention,
     encoder_self_attention,
+    register_cross_layer,
 )
 
 ACT2FN = {"gelu": F.gelu}
 
 
-# Pointwise helpers swapped with torch.compile versions when compile_model=True.
-def _add_layer_norm_impl(norm, residual, x):
+def _add_layer_norm(norm, residual, x):
     """Apply residual addition followed by layer normalization."""
     return norm(residual + x)
 
 
-def _activation_linear_impl(linear, activation, x):
+def _activation_linear(linear, activation, x):
     """Apply a linear projection followed by an activation function."""
     return activation(linear(x))
-
-
-_add_layer_norm = _add_layer_norm_impl
-_activation_linear = _activation_linear_impl
-_COMPILED = False
-
-
-def enable_compile(enable: bool = True) -> None:
-    """Toggle torch.compile fusion for the per-layer pointwise helpers."""
-    global _add_layer_norm, _activation_linear, _COMPILED
-    if enable and not _COMPILED:
-        _add_layer_norm = torch.compile(_add_layer_norm_impl)
-        _activation_linear = torch.compile(_activation_linear_impl)
-        _COMPILED = True
-    elif not enable and _COMPILED:
-        _add_layer_norm = _add_layer_norm_impl
-        _activation_linear = _activation_linear_impl
-        _COMPILED = False
 
 
 class BartLearnedPositionalEmbedding(nn.Embedding):
@@ -176,6 +158,7 @@ class BartDecoderCrossAttention(_BartAttentionBase):
         self.encoder_kv_cache: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
         self.cross_cache = None
         self.block_size = 16
+        register_cross_layer(self)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Project decoder queries and attend over cached encoder K/V."""
@@ -358,6 +341,10 @@ class BartForConditionalGeneration(nn.Module):
             .expand_as(encoder_input_ids)
         )
         return self.model.encoder(encoder_input_ids, positions)
+
+    def forward(self, input_ids: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
+        """Run one decoder step and return logits [B, vocab] (the compiled decode graph)."""
+        return self.compute_logits(self.decoder(input_ids, positions))
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Project decoder hidden states to vocabulary logits plus final_logits_bias."""

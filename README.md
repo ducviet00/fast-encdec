@@ -5,7 +5,7 @@ A small, readable inference engine for **BART** and **Florence-2**, in the spiri
 
 ## Key Features
 
-* 🚀 **Fast offline inference** - up to 5.1x faster than `transformers.generate` on CPU and 4.2x on a GPU (beam search drives the CPU wins; greedy is 1.2-3.0x on CPU and 2.4-3.6x on GPU)
+* 🚀 **Fast offline inference** - up to 5.0x faster than `transformers.generate` on CPU and 4.2x on a GPU (beam search drives the CPU wins; greedy is 1.1-3.5x on CPU and 2.7-4.0x on GPU)
 * 📖 **Readable codebase** - paged KV cache, continuous batching and beam search in plain PyTorch
 * 🧩 **Two models, one engine** - BART for summarisation, Florence-2 for vision-language tasks
 * ⚡ **CPU and CUDA** - vendored vLLM CPU attention kernel; FlashAttention-2 and a CUDA graph on GPU
@@ -85,40 +85,60 @@ and `benchmarks/throughput.py` measures decode-only throughput.
 
 | point | config | Xeon 8581C | Xeon 6975P-C | Graviton 5 | L4 |
 |---|---|---:|---:|---:|---:|
-| 128->512 | batch=1, beams=1 | 1.50x | 1.47x | 2.99x | 3.29x |
-| 128->512 | batch=8, beams=1 | 1.53x | 1.42x | 1.75x | 2.75x |
-| 128->512 | batch=8, beams=4 | 2.78x | 2.61x | 2.25x | 2.04x |
-| 512->128 | batch=1, beams=1 | 1.49x | 1.39x | 2.73x | 3.23x |
-| 512->128 | batch=8, beams=1 | 1.23x | 1.19x | 1.38x | 2.38x |
-| 512->128 | batch=8, beams=4 | 5.08x | 4.22x | 1.88x | 2.80x |
-| 256->256 | batch=1, beams=1 | 1.55x | 1.43x | 2.88x | 3.36x |
-| 256->256 | batch=8, beams=1 | 1.40x | 1.31x | 1.60x | 2.76x |
-| 256->256 | batch=8, beams=4 | 2.57x | 2.37x | 2.06x | 2.19x |
+| 128->512 | batch=1, beams=1 | 1.42x | 1.54x | 3.47x | 3.86x |
+| 128->512 | batch=8, beams=1 | 1.44x | 1.48x | 1.91x | 3.16x |
+| 128->512 | batch=8, beams=4 | 2.73x | 2.68x | 2.38x | 2.10x |
+| 512->128 | batch=1, beams=1 | 1.43x | 1.47x | 2.97x | 3.99x |
+| 512->128 | batch=8, beams=1 | 1.11x | 1.22x | 1.51x | 2.73x |
+| 512->128 | batch=8, beams=4 | 4.98x | 4.48x | 2.05x | 2.88x |
+| 256->256 | batch=1, beams=1 | 1.45x | 1.51x | 3.22x | 3.98x |
+| 256->256 | batch=8, beams=1 | 1.33x | 1.35x | 1.77x | 3.12x |
+| 256->256 | batch=8, beams=4 | 2.42x | 2.33x | 2.25x | 2.22x |
 
 **Throughput (tokens/s), 256->256**
 
 | config | engine | Xeon 8581C | Xeon 6975P-C | Graviton 5 | L4 |
 |---|---|---:|---:|---:|---:|
-| batch=8, beams=1 | fast-encdec | 420 | 408 | 711 | 1845 |
-| batch=8, beams=1 | transformers | 299 | 312 | 444 | 668 |
-| batch=8, beams=4 | fast-encdec | 234 | 254 | 338 | 975 |
-| batch=8, beams=4 | transformers | 91 | 107 | 164 | 446 |
+| batch=8, beams=1 | fast-encdec | 361 | 411 | 731 | 2090 |
+| batch=8, beams=1 | transformers | 272 | 304 | 413 | 670 |
+| batch=8, beams=4 | fast-encdec | 204 | 248 | 353 | 985 |
+| batch=8, beams=4 | transformers | 85 | 106 | 157 | 444 |
 
 Beam search is still the biggest win: `transformers` reorders the whole beam cache
-every step, while blocks are shared here.  Greedy used to be a near tie, especially
-at `512->128` where the encoder is shared work; prepacking the CPU linear weights
-(below) moved every greedy row.
+every step, while blocks are shared here.  Greedy stays ahead too, especially
+at `512->128` where the encoder is shared work.
+
+Two caveats when diffing this table against an older recording.  These are
+ratios, and on the 4-core Xeon instances the denominator is the unstable side:
+two runs of this same commit read 1.52x and 1.31x on `128->512, batch=1`
+(ours 7856/8311 ms, HF 11926/10905 ms) and 2.24x vs 2.60x on `256->256, b=8,
+beams=4` (ours 10646/9464 ms), i.e. a cell can move ~0.1-0.35 on its own.  And
+the engine's own absolute times are flat across recordings where HF's are not
+(Emerald `512->128, beams=4`: ours 5.90 s in a pre-fix session, 5.90/5.85 s
+here; HF 30.8 s then, 30.0/28.6 s now), so a few tenths of drift in a Xeon
+cell is the baseline, not the engine.
 
 Each cell is the average of two independent runs, and every run writes its raw
-results with `--json`, so the numbers can be re-derived rather than trusted.  Every
-CPU `nn.Linear` weight is prepacked into oneDNN's blocked layout at load
-(`pack_weights` in the `AGENTS.md` gotchas), which removes the per-call weight
-reorder `F.linear` pays.  On aarch64 that also routes the GEMM through oneDNN-ACL
-instead of torch's fallback kernel, which is why Graviton 5's single-sequence rows
-gain ~2.7-2.9x while the x86 rows gain ~1.2-1.5x.  The two x86 boxes additionally
-run the engine's 32-token page size, which engages the full-width AVX-512 attention
-kernel (see the page-size gotcha in `AGENTS.md`), while Graviton 5 and the L4 keep
-theirs (16 and 256).  The L4 column is unchanged: the prepack is CPU-only.
+results with `--json`, so the numbers can be re-derived rather than trusted.  On
+CPU the engine runs the vendored vLLM attention kernel behind two opaque
+`torch.library.custom_op`s, which makes the decoder + lm head and the encoder
+trace as **frozen `torch.compile` graphs**: Inductor's freezing pass packs every
+GEMM into oneDNN's blocked layouts — the same op a manual weight prepack used to
+feed, produced at compile time instead of at load, with the per-layer pointwise
+ops fused into the linear epilogues for free (`AGENTS.md` "CPU GEMM packing"
+gotcha; CPU-only, fp32 and bf16, and fp32 there stays token-for-token identical
+to `transformers`).  On aarch64 the packing routes
+through oneDNN-ACL, which is why Graviton 5's single-sequence rows gain
+~3.0-3.5x while the x86 rows gain ~1.2-1.6x.  The two x86 boxes run the
+engine's 32-token page size, which engages the full-width AVX-512 attention
+kernel (see the page-size gotcha in `AGENTS.md`), while Graviton 5 keeps 16.
+The L4 column is unchanged by any of this: it runs FlashAttention-2 plus the
+decode CUDA graph, and the CUDA graph is why its rows stay ahead even where the
+CPU boxes tie (`beams=4`).  It is re-recorded with each table but does not move
+with the CPU work: across recordings its own milliseconds stay flat to ~1%
+(e.g. `512->128, batch=1`: 378 -> 381 ms) while the `transformers` baseline on
+the 4-vCPU box moves 4-8%, which is what shifts the L4 ratios by up to ~0.2 —
+including between two runs of the same commit (3.87x vs 4.11x).
 
 **vs vLLM (NVIDIA L4)**
 
@@ -134,23 +154,23 @@ it loaded.
 
 | point | config | ours ms | ours tok/s | vLLM ms | vLLM tok/s | speedup |
 |---|---|---:|---:|---:|---:|---:|
-| 128->512 | batch=1, beams=1 | 1457 | 351 | 1397 | 366 | 0.96x |
-| 128->512 | batch=8, beams=1 | 1834 | 2233 | 1685 | 2431 | 0.92x |
-| 128->512 | batch=8, beams=4 | 3197 | 1281 | 3458 | 1187 | **1.08x** |
-| 128->512 | batch=8, beams=1, fp32 | 12011 | 341 | 3355 | 1221 | 0.28x |
-| 512->128 | batch=1, beams=1 | 372 | 344 | 361 | 355 | 0.97x |
-| 512->128 | batch=8, beams=1 | 560 | 1828 | 517 | 1980 | 0.92x |
-| 512->128 | batch=8, beams=4 | 900 | 1138 | 1058 | 975 | **1.18x** |
-| 512->128 | batch=8, beams=1, fp32 | 3190 | 321 | 985 | 1040 | 0.31x |
-| 256->256 | batch=1, beams=1 | 727 | 352 | 699 | 366 | 0.96x |
-| 256->256 | batch=8, beams=1 | 950 | 2155 | 870 | 2353 | 0.92x |
-| 256->256 | batch=8, beams=4 | 1737 | 1179 | 1761 | 1167 | **1.01x** |
-| 256->256 | batch=8, beams=1, fp32 | 6026 | 340 | 1723 | 1189 | 0.29x |
+| 128->512 | batch=1, beams=1 | 1466 | 349 | 1405 | 364 | 0.96x |
+| 128->512 | batch=8, beams=1 | 1859 | 2203 | 1706 | 2401 | 0.92x |
+| 128->512 | batch=8, beams=4 | 3243 | 1263 | 3495 | 1174 | **1.08x** |
+| 128->512 | batch=8, beams=1, fp32 | 12262 | 334 | 3377 | 1213 | 0.28x |
+| 512->128 | batch=1, beams=1 | 375 | 341 | 366 | 349 | 0.98x |
+| 512->128 | batch=8, beams=1 | 568 | 1801 | 517 | 1981 | 0.91x |
+| 512->128 | batch=8, beams=4 | 914 | 1120 | 1052 | 981 | **1.15x** |
+| 512->128 | batch=8, beams=1, fp32 | 3220 | 318 | 991 | 1033 | 0.31x |
+| 256->256 | batch=1, beams=1 | 736 | 348 | 707 | 362 | 0.96x |
+| 256->256 | batch=8, beams=1 | 961 | 2130 | 874 | 2343 | 0.91x |
+| 256->256 | batch=8, beams=4 | 1758 | 1165 | 1740 | 1182 | 0.99x |
+| 256->256 | batch=8, beams=1, fp32 | 6188 | 331 | 1732 | 1182 | 0.28x |
 
-At a single new token per step in bf16, vLLM's decode loop is 3-9% leaner than
+At a single new token per step in bf16, vLLM's decode loop is 1-9% leaner than
 this one, which is what the greedy rows show.  Beam search pulls the other way:
 this engine shares KV blocks between beams where the plugin copies a whole beam
-group every step, so `beams=4` is a modest win (`1.01-1.18x`) despite each request
+group every step, so `beams=4` is a modest win (`0.99-1.15x`) despite each request
 running four sequences.  fp32 is the clear miss: this engine has no
 FlashAttention-2 path in fp32, so it loses both the fused attention *and* the
 decode CUDA graph that depends on it and goes launch-bound, while vLLM keeps fp32
@@ -158,35 +178,36 @@ on its `TRITON_ATTN` backend.
 
 **Greedy decode scaling (vs vLLM, no beam plugin)**
 
-Greedy scales smoothly with batch on both engines and vLLM stays 3-15% ahead; the
-widest gap is the encoder-heavy `512->128` point at `batch=32` (0.85x).  At
+Greedy scales smoothly with batch on both engines and vLLM stays 1-14% ahead; the
+widest gap is the encoder-heavy `512->128` point at `batch=32` (0.86x).  At
 `batch=1` both are latency-bound (~350 tok/s) and nearly tie, and the gap opens as
 each step starts re-reading more KV.
 
 | point | batch | ours ms | ours tok/s | vLLM ms | vLLM tok/s | speedup |
 |---|---|---:|---:|---:|---:|---:|
-| 128->512 | 1 | 1457 | 351 | 1397 | 366 | 0.96x |
-| 128->512 | 2 | 1567 | 654 | 1475 | 694 | 0.94x |
-| 128->512 | 4 | 1676 | 1222 | 1510 | 1356 | 0.90x |
-| 128->512 | 8 | 1834 | 2233 | 1685 | 2431 | 0.92x |
-| 128->512 | 16 | 2273 | 3604 | 2094 | 3913 | 0.92x |
-| 128->512 | 32 | 3170 | 5168 | 2977 | 5503 | 0.94x |
-| 512->128 | 1 | 372 | 344 | 361 | 355 | 0.97x |
-| 512->128 | 2 | 420 | 609 | 397 | 644 | 0.95x |
-| 512->128 | 4 | 460 | 1112 | 441 | 1162 | 0.96x |
-| 512->128 | 8 | 560 | 1828 | 517 | 1980 | 0.92x |
-| 512->128 | 16 | 779 | 2630 | 693 | 2953 | 0.89x |
-| 512->128 | 32 | 1230 | 3330 | 1051 | 3896 | 0.85x |
-| 256->256 | 1 | 727 | 352 | 699 | 366 | 0.96x |
-| 256->256 | 2 | 797 | 642 | 747 | 686 | 0.94x |
-| 256->256 | 4 | 855 | 1197 | 775 | 1321 | 0.91x |
-| 256->256 | 8 | 950 | 2155 | 870 | 2353 | 0.92x |
-| 256->256 | 16 | 1202 | 3409 | 1100 | 3725 | 0.92x |
-| 256->256 | 32 | 1729 | 4737 | 1563 | 5242 | 0.90x |
+| 128->512 | 1 | 1463 | 350 | 1389 | 369 | 0.95x |
+| 128->512 | 2 | 1572 | 651 | 1476 | 694 | 0.94x |
+| 128->512 | 4 | 1679 | 1220 | 1534 | 1335 | 0.91x |
+| 128->512 | 8 | 1859 | 2204 | 1708 | 2398 | 0.92x |
+| 128->512 | 16 | 2305 | 3554 | 2114 | 3875 | 0.92x |
+| 128->512 | 32 | 3209 | 5106 | 2997 | 5466 | 0.93x |
+| 512->128 | 1 | 375 | 341 | 372 | 344 | 0.99x |
+| 512->128 | 2 | 422 | 607 | 400 | 641 | 0.95x |
+| 512->128 | 4 | 463 | 1105 | 441 | 1160 | 0.95x |
+| 512->128 | 8 | 567 | 1807 | 520 | 1970 | 0.92x |
+| 512->128 | 16 | 788 | 2600 | 701 | 2922 | 0.89x |
+| 512->128 | 32 | 1243 | 3296 | 1067 | 3841 | 0.86x |
+| 256->256 | 1 | 735 | 348 | 692 | 370 | 0.94x |
+| 256->256 | 2 | 802 | 638 | 753 | 680 | 0.94x |
+| 256->256 | 4 | 859 | 1192 | 779 | 1314 | 0.91x |
+| 256->256 | 8 | 961 | 2131 | 876 | 2338 | 0.91x |
+| 256->256 | 16 | 1215 | 3373 | 1096 | 3739 | 0.90x |
+| 256->256 | 32 | 1737 | 4716 | 1561 | 5248 | 0.90x |
 
-Reproduce with `--batches 1,2,4,8,16,32`.  Removing the beam plugin moved vLLM's
-greedy ~1% at `batch=8` (`256->256` 870 ms / 2353 tok/s vs 876 ms / 2337 tok/s
-with it) and ~0.4% in fp32; `batch=1` is inside the run-to-run noise.
+Reproduce with `--batches 1,2,4,8,16,32`.  These rows are measured with the beam
+plugin uninstalled (the script picks `VLLM_PLUGINS=bart` for a `--batches` run),
+since that plugin replaces vLLM's scheduler with one that disables async
+scheduling; `batch=1` is inside the run-to-run noise either way.
 
 **vs vLLM (Graviton 5, CPU)**
 
@@ -200,48 +221,48 @@ unless noted, one process per engine, warmup 1 + best-of-3.
 
 | point | config | ours ms | ours tok/s | vLLM ms | vLLM tok/s | speedup |
 |---|---|---:|---:|---:|---:|---:|
-| 128->512 | batch=1, beams=1 | 3361 | 152.3 | 3473 | 147.4 | 1.03x |
-| 128->512 | batch=8, beams=1 | 4761 | 860.4 | 5862 | 698.7 | 1.23x |
-| 128->512 | batch=8, beams=1, fp32 | 8629 | 474.7 | 9734 | 420.8 | 1.13x |
-| 512->128 | batch=1, beams=1 | 972 | 131.7 | 1829 | 70.0 | **1.88x** |
-| 512->128 | batch=8, beams=1 | 2149 | 476.6 | 9016 | 113.6 | **4.20x** |
-| 512->128 | batch=8, beams=1, fp32 | 5049 | 202.8 | 5603 | 182.8 | 1.11x |
-| 256->256 | batch=1, beams=1 | 1730 | 148.0 | 1972 | 129.8 | 1.14x |
-| 256->256 | batch=8, beams=1 | 2703 | 757.7 | 4915 | 416.7 | **1.82x** |
-| 256->256 | batch=8, beams=1, fp32 | 5333 | 384.1 | 6024 | 340.0 | 1.13x |
+| 128->512 | batch=1, beams=1 | 3358 | 152.5 | 3485 | 146.9 | 1.04x |
+| 128->512 | batch=8, beams=1 | 4744 | 863.5 | 6017 | 680.7 | 1.27x |
+| 128->512 | batch=8, beams=1, fp32 | 8784 | 466.3 | 9907 | 413.4 | 1.13x |
+| 512->128 | batch=1, beams=1 | 1002 | 127.8 | 1839 | 69.6 | **1.84x** |
+| 512->128 | batch=8, beams=1 | 2143 | 477.9 | 9049 | 113.2 | **4.22x** |
+| 512->128 | batch=8, beams=1, fp32 | 5017 | 204.1 | 5656 | 181.1 | 1.13x |
+| 256->256 | batch=1, beams=1 | 1765 | 145.1 | 1997 | 128.2 | 1.13x |
+| 256->256 | batch=8, beams=1 | 2661 | 769.7 | 4985 | 410.8 | **1.87x** |
+| 256->256 | batch=8, beams=1, fp32 | 5334 | 384.0 | 6109 | 335.3 | 1.15x |
 
 | point | batch | ours ms | ours tok/s | vLLM ms | vLLM tok/s | speedup |
 |---|---|---:|---:|---:|---:|---:|
-| 128->512 | 1 | 3366 | 152.1 | 3612 | 141.7 | 1.07x |
-| 128->512 | 2 | 3672 | 278.9 | 4501 | 227.5 | 1.23x |
-| 128->512 | 4 | 4058 | 504.7 | 4942 | 414.4 | 1.22x |
-| 128->512 | 8 | 4766 | 859.5 | 5975 | 685.5 | 1.25x |
-| 128->512 | 16 | 7648 | 1071.2 | 9676 | 846.6 | 1.27x |
-| 128->512 | 32 | 12757 | 1284.3 | 15775 | 1038.6 | 1.24x |
-| 512->128 | 1 | 992 | 129.0 | 1877 | 68.2 | 1.89x |
-| 512->128 | 2 | 1165 | 219.8 | 3062 | 83.6 | 2.63x |
-| 512->128 | 4 | 1489 | 343.9 | 5029 | 101.8 | 3.38x |
-| 512->128 | 8 | 2164 | 473.3 | 9070 | 112.9 | 4.19x |
-| 512->128 | 16 | 3827 | 535.2 | 17522 | 116.9 | 4.58x |
-| 512->128 | 32 | 7172 | 571.1 | 34178 | 119.8 | **4.77x** |
-| 256->256 | 1 | 1713 | 149.5 | 2098 | 122.0 | 1.22x |
-| 256->256 | 2 | 1910 | 268.0 | 2768 | 185.0 | 1.45x |
-| 256->256 | 4 | 2188 | 467.9 | 3492 | 293.2 | 1.60x |
-| 256->256 | 8 | 2695 | 760.0 | 4994 | 410.1 | 1.85x |
-| 256->256 | 16 | 4369 | 937.5 | 8758 | 467.7 | 2.00x |
-| 256->256 | 32 | 7627 | 1074.1 | 15709 | 521.5 | 2.06x |
+| 128->512 | 1 | 3370 | 151.9 | 3542 | 144.6 | 1.05x |
+| 128->512 | 2 | 3717 | 275.5 | 4496 | 227.8 | 1.21x |
+| 128->512 | 4 | 4140 | 494.7 | 4950 | 413.7 | 1.20x |
+| 128->512 | 8 | 4883 | 838.8 | 6022 | 680.2 | 1.23x |
+| 128->512 | 16 | 7830 | 1046.2 | 9700 | 844.6 | 1.24x |
+| 128->512 | 32 | 12916 | 1268.5 | 15827 | 1035.2 | 1.23x |
+| 512->128 | 1 | 982 | 130.4 | 1861 | 68.8 | 1.90x |
+| 512->128 | 2 | 1155 | 221.6 | 3042 | 84.1 | 2.63x |
+| 512->128 | 4 | 1478 | 346.5 | 5015 | 102.1 | 3.39x |
+| 512->128 | 8 | 2123 | 482.3 | 9039 | 113.3 | 4.26x |
+| 512->128 | 16 | 3775 | 542.5 | 17496 | 117.1 | 4.63x |
+| 512->128 | 32 | 6988 | 586.2 | 34082 | 120.2 | **4.88x** |
+| 256->256 | 1 | 1736 | 147.5 | 2017 | 126.9 | 1.16x |
+| 256->256 | 2 | 1944 | 263.4 | 2764 | 185.2 | 1.42x |
+| 256->256 | 4 | 2228 | 459.7 | 3481 | 294.2 | 1.56x |
+| 256->256 | 8 | 2779 | 737.1 | 4970 | 412.0 | 1.79x |
+| 256->256 | 16 | 4426 | 925.4 | 8764 | 467.3 | 1.98x |
+| 256->256 | 32 | 7672 | 1067.8 | 15712 | 521.4 | 2.05x |
 
 This engine is ahead on every CPU row, because the two shapes fail differently for
 vLLM.  Where the encoder dominates (`512->128`) its CPU path barely batches: it
-goes 68 -> 120 tok/s from `batch=1` to `batch=32` while this engine goes
-129 -> 571, so the margin grows with batch to 4.8x.  Where the decode dominates
-(`128->512`) the two are close (1.03-1.27x) - a single-token CPU decode is the
-same bandwidth-bound GEMM work in both engines.  fp32 is flat ~1.1x, since
+goes 69 -> 120 tok/s from `batch=1` to `batch=32` while this engine goes
+130 -> 586, so the margin grows with batch to 4.88x.  Where the decode dominates
+(`128->512`) the two are close (1.05-1.27x) - a single-token CPU decode is the
+same bandwidth-bound GEMM work in both engines.  fp32 is 1.13-1.15x, since
 neither engine has a fused attention path to lose there.
 
 Beam search has no vLLM reference on CPU, so its rows are this engine's own: at
-`batch=8, beams=4, bf16` it reaches 386 tok/s at `128->512`, 273 at `512->128`
-and 362 at `256->256`.  Measure those against `transformers` with
+`batch=8, beams=4, bf16` it reaches 386 tok/s at `128->512`, 279 at `512->128`
+and 366 at `256->256`.  Measure those against `transformers` with
 `benchmarks/benchmark.py` instead.
 
 **Florence-2** (real 640x480 photo, four tasks: caption, detection, referring
@@ -249,12 +270,17 @@ segmentation and phrase grounding)
 
 | config | Xeon 8581C | Xeon 6975P-C | Graviton 5 | L4 |
 |---|---:|---:|---:|---:|
-| batch=1, beams=1 | 1.34x | 1.39x | 1.30x | 2.54x |
-| batch=8, beams=1 | 1.83x | 2.08x | 1.29x | 3.60x |
-| batch=8, beams=4 | 4.12x | 3.48x | 2.16x | 4.23x |
+| batch=1, beams=1 | 1.88x | 1.80x | 1.47x | 2.75x |
+| batch=8, beams=1 | 2.06x | 2.38x | 1.43x | 3.69x |
+| batch=8, beams=4 | 3.68x | 3.86x | 2.35x | 4.21x |
+| batch=8, beams=1, fp32 | 1.65x | 1.70x | 1.36x | 0.81x |
 
-The Florence-2 numbers move less than BART's: the vision tower and encoder are
-shared work, so the page size and the linear prepack only touch the decoder.  In
+The Florence-2 numbers move less than BART's: the vision tower and text encoder
+are shared work, so on CPU they are frozen compile graphs of their own (the
+tower static per image shape, the text encoder dynamic over prompt length) and
+decode rows ride the same decoder graph as BART.  That split is what the fp32
+rows gained from — every task prompt used to get its own graph, which pushed the
+engine past Dynamo's cache budget (1.36x before, 1.65x now on the 8581C).  In
 fp32 this engine reproduces `transformers` token for token; in bf16 the output
 length always matches.
 
@@ -263,8 +289,7 @@ length always matches.
 ```bash
 python tests/test_parity.py        # vs transformers, tiny random BART
 python tests/test_florence2.py     # vs transformers, tiny random Florence-2
-python tests/test_attn_backend.py  # vLLM CPU kernel vs SDPA
-python tests/test_packed_linear.py # packed CPU linears (fallback + token parity)
+python tests/test_attn_backend.py  # vLLM CPU kernel vs SDPA (compiled path)
 python tests/test_gpu_flash.py     # FlashAttention-2 vs SDPA (CUDA only)
 ```
 

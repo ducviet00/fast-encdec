@@ -1,11 +1,15 @@
 from collections import defaultdict
+from contextlib import nullcontext
 
 import torch
 
 from ..layers import attention
-from ..models import bart
 from ..utils.context import set_context
 from .cudagraph import DecodeGraphRunner
+
+# Number of compiled runners in this process; each one costs Dynamo cache entries
+# (a new weight set and the batch-1 specialization), and the limit is per frame.
+_COMPILED_RUNNERS = 0
 
 
 class ModelRunner:
@@ -20,7 +24,7 @@ class ModelRunner:
         device="cpu",
         max_num_seqs=32,
         use_cudagraph=True,
-        compile_model=False,
+        compile_mm_encoder=True,
     ):
         self.device = torch.device(device)
         self.model = model.eval()
@@ -28,15 +32,53 @@ class ModelRunner:
         self.block_size = block_manager.block_size
         self.dtype = dtype
         self.decoder_layers = list(model.decoder_layers)
-        # Fuse per-layer pointwise ops (add+norm, act+fc1) when compile_model=True.
-        bart.enable_compile(compile_model)
-        self.decoder = model.decoder
 
         attention.set_backend(attn_backend)
 
         self.cache_layers = [layer.self_attn for layer in self.decoder_layers]
         self.num_heads = self.cache_layers[0].num_heads
         self.head_dim = self.cache_layers[0].head_dim
+        # Frozen torch.compile is the whole GEMM story on CPU: the paged attention
+        # ops are opaque custom ops, so Dynamo traces the decoder + lm head as one
+        # graph, and Inductor freezing packs every GEMM (decoder, lm head, and the
+        # encoder's) into oneDNN blocked kernels. Needs the vendored kernel: the
+        # SDPA fallback reads the per-step Context, which tracing would bake in.
+        self.compile_decoder = (
+            self.device.type == "cpu"
+            and dtype in (torch.float32, torch.bfloat16)
+            and attention.backend(self.device, dtype, self.head_dim, self.block_size)
+            == "vllm"
+        )
+        self.decoder = model.decoder
+        self.decode_step = None
+        self.encode_step = None
+        self.mm_step = None
+        if self.compile_decoder:
+            # Symbolic batch / encoder length keeps memory bounded (freezing
+            # duplicates the packed weights per shape). Florence-2's tower is
+            # compiled on its own (static, see below) so the text encoder -
+            # whose length varies with the task prompt - stays dynamic.
+            global _COMPILED_RUNNERS
+            _COMPILED_RUNNERS += 1
+            # Dynamo falls back to eager once a frame has more than
+            # recompile_limit cache entries, and every engine adds entries
+            # (weights, batch-1 specialization). Grow the cap with the number of
+            # engines so a process holding several does not lose the packing.
+            torch._dynamo.config.recompile_limit = max(
+                torch._dynamo.config.recompile_limit, 2 * _COMPILED_RUNNERS + 4
+            )
+            # Four parallel workers compile fast without the GB-scale memory
+            # spike of the default (thread-count) worker pool on small boxes.
+            torch._inductor.config.compile_threads = min(
+                4, torch._inductor.config.compile_threads
+            )
+            self.decode_step = torch.compile(self.model, dynamic=True)
+            self.encode_step = torch.compile(self.model.encode, dynamic=True)
+        if hasattr(self.model, "get_image_features") and compile_mm_encoder:
+            # Inductor's dynamic-conv lowering mis-strides DaViT's windowed
+            # feature maps, so the tower keeps static shapes (one graph per
+            # image shape, which is fixed for a real workload).
+            self.mm_step = torch.compile(self.model.get_image_features, dynamic=False)
         self.use_cudagraph = use_cudagraph and (
             self.device.type == "cuda"
             and attention.backend(self.device, dtype, self.head_dim, self.block_size)
@@ -72,6 +114,7 @@ class ModelRunner:
                 None if seq.pixel_values is None else tuple(seq.pixel_values.shape)
             )
             groups[(len(seq.encoder_token_ids), px_shape)].append(seq)
+        encode = self.encode_step or self.model.encode
         for group in groups.values():
             ids = torch.tensor(
                 [s.encoder_token_ids for s in group],
@@ -79,10 +122,16 @@ class ModelRunner:
                 device=self.device,
             )
             if group[0].pixel_values is None:
-                hidden = self.model.encode(ids)
+                with self._inductor_ctx():
+                    hidden = encode(ids)
             else:
                 px = torch.stack([s.pixel_values for s in group]).to(self.device)
-                hidden = self.model.encode(ids, pixel_values=px)
+                with self._inductor_ctx():
+                    if self.mm_step is None:
+                        embeds = self.model.get_image_features(px)
+                    else:
+                        embeds = self.mm_step(px)
+                    hidden = encode(ids, image_embeds=embeds)
             for layer in self.decoder_layers:
                 attn = layer.encoder_attn
                 shape = (len(group), ids.shape[1], attn.num_heads, attn.head_dim)
@@ -165,5 +214,14 @@ class ModelRunner:
                 return self.model.compute_logits(hidden)
 
         set_context(**fields)
-        hidden = self.decoder(input_ids, positions)
-        return self.model.compute_logits(hidden)
+        with self._inductor_ctx():
+            # model.forward is decoder + lm head, so freezing packs both.
+            if self.decode_step is None:
+                return self.model(input_ids, positions)
+            return self.decode_step(input_ids, positions)
+
+    def _inductor_ctx(self):
+        """Patch Inductor freezing on for compiled calls (packing at compile)."""
+        if self.compile_decoder:
+            return torch._inductor.config.patch(freezing=True)
+        return nullcontext()

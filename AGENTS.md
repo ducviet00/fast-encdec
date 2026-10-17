@@ -13,10 +13,12 @@ for offline encoder-decoder decoding:
 - **No padding** — attention is per-sequence, so variable-length prompts and
   batches waste no compute.
 - **Beam search** on top of the same paged cache.
-- **Pure PyTorch** on CPU, with an optional **CUDA** path for the decoder
-  attention. On CPU, BF16 GEMMs go through oneDNN's `avx512_core_bf16` on
-  modern x86; on CUDA the decoder self-/cross-attention (and the BART encoder
-  self-attention) run on **FlashAttention-2**.
+- **Frozen `torch.compile` on CPU** (with the optional **CUDA** path for the
+  decoder attention). One dynamic graph covers decoder + lm head and one the
+  encoder; Inductor weight-freezing packs every GEMM into oneDNN's blocked
+  layouts (BF16 `avx512_core_bf16` on modern x86, ACL on aarch64); on CUDA the
+  decoder self-/cross-attention (and the BART encoder self-attention) run on
+  **FlashAttention-2**.
 
 The model (`fastencdec/models/bart.py`) is a near-verbatim copy of the
 HuggingFace BART reference; the attention kernels differ, and the attention
@@ -58,11 +60,12 @@ placeholders; the decoder is unchanged.
   there is no GPU on the dev box, so run `--device cuda` benchmarks there. Auth
   is flaky (public-key connections are sometimes refused) — retry. `build_essential`
   was installed for `torch.compile` of the Florence-2 vision tower.
-- CPU benchmarking boxes (the README matrix): `ssh ducviet00@34.142.225.47`
+- CPU benchmarking boxes (the README matrix): `ssh ducviet00@34.126.100.74`
   (Xeon 8581C, Emerald Rapids, `amx_bf16`, 8 vCPU = 4 cores, `~/env-ours`), `ssh
-  ubuntu@54.252.169.176` (Xeon 6975P-C, Granite Rapids, `amx_bf16`, 8 vCPU = 4
-  cores, `~/venv`) and `ssh ubuntu@3.26.21.19` (Graviton 5 / Neoverse-V3, 8 cores, no
-  SMT, `~/venv`).  Each has the repo at `~/fast-encdec` and `car.jpg` at
+  ubuntu@32.236.201.188` (Xeon 6975P-C, Granite Rapids, `amx_bf16`, 8 vCPU = 4
+  cores, `~/venv`) and `ssh ubuntu@13.210.12.162` (Graviton 5 / Neoverse-V3, 8 cores, no
+  SMT, `~/venv`).  These boxes rotate (older IPs than this recording are
+  unreachable); check the host is alive before trusting its numbers.  Each has the repo at `~/fast-encdec` and `car.jpg` at
   `/tmp/fastencdec/florence2_bench.jpg`.  Copy with
   `tar czf - ... | ssh box 'tar xzf - -C ~/fast-encdec'` — and all three needed
   `gcc g++ make ninja-build python3-dev` before `csrc/` would build (torch's
@@ -100,7 +103,6 @@ fastencdec/
     cpu_attn.py        JIT build + wrapper for the vendored vLLM CPU kernels
     flash_attn.py      lazy loader for the kernels-community/flash-attn2 kernel (CUDA)
     logits_processor.py  pure-torch LogitsProcessor (built once per generate)
-    packed_linear.py   oneDNN blocked-weight CPU linears (packed once at load)
     sampler.py         greedy / multinomial sampling (Sampler nn.Module)
   models/
     bart.py            BART model (encoder / decoder / cross-attn)
@@ -124,7 +126,6 @@ tests/test_parity.py
 tests/test_attn_backend.py
 tests/test_florence2.py
 tests/test_beam.py
-tests/test_packed_linear.py
 tests/test_gpu_flash.py
 ```
 
@@ -248,7 +249,9 @@ PYTHONPATH=. $P tests/test_parity.py
 # vendored vLLM kernel vs the SDPA path (tiny BART with head_dim=32)
 PYTHONPATH=. $P tests/test_attn_backend.py
 
-# token-by-token parity vs HF on the real checkpoints (fp32 exact; bf16 same length)
+# token-by-token parity vs HF on the real checkpoints (fp32 exact; bf16 same length).
+# fp32 needs ~8 GB above loading both engines: each (model, beams) phase runs in
+# its own subprocess, and fp32 KV budgets are snapped down to fit an 11 GB box.
 PYTHONPATH=. $P benchmarks/verify_parity.py --dtype float32
 
 # Florence-2 parity (tiny random Florence-2; image features + greedy/beam vs HF)
@@ -298,7 +301,7 @@ PYTHONPATH=. $P benchmarks/benchmark_florence2.py --device cuda
 # decode throughput (nano-vllm-style: N requests, fixed enc length + output)
 PYTHONPATH=. $P benchmarks/throughput.py --requests 128 --enc-len 512 --max-tokens 512
 PYTHONPATH=. $P benchmarks/throughput.py --requests 32 --enc-len 512 --max-tokens 256 --no-cudagraph
-PYTHONPATH=. $P benchmarks/throughput.py --requests 64 --enc-len 512 --max-tokens 256 --compile-model
+PYTHONPATH=. $P benchmarks/throughput.py --requests 64 --enc-len 512 --max-tokens 256
 
 # attention implementation: vendored vLLM CPU kernel vs SDPA vs eager
 PYTHONPATH=. $P benchmarks/attn_backend.py                    # kernel + end-to-end
@@ -323,29 +326,30 @@ hand-edit or guess.**
 
 | config | ours ms | ours tok/s | hf ms | hf tok/s | speedup |
 |---|---:|---:|---:|---:|---:|
-| batch=1, beams=1, bf16 | 3489 | 73.4 | 5562 | 46.0 | 1.59x |
-| batch=8, beams=1, bf16 | 5134 | 398.9 | 8902 | 230.1 | 1.73x |
-| batch=8, beams=4, bf16 | 7857 | 260.7 | 31060 | 65.9 | 3.95x |
-| batch=8, beams=1, fp32 | 8613 | 237.8 | 24946 | 82.1 | 2.90x |
+| batch=1, beams=1, bf16 | 3438 | 74.5 | 6071 | 42.2 | 1.77x |
+| batch=8, beams=1, bf16 | 5021 | 407.9 | 9102 | 225.0 | 1.81x |
+| batch=8, beams=4, bf16 | 7881 | 259.9 | 31943 | 64.1 | 4.05x |
+| batch=8, beams=1, fp32 | 8774 | 233.4 | 25067 | 81.7 | 2.86x |
 
-One run, with the `pack_weights` prepack on (see the gotcha).  Re-running the same
-script back-to-back with packing disabled read 4513 / 6150 / 9435 / 23794
-ms (1.37x / 1.51x / 3.35x / 1.05x), so the prepack is worth 1.29x / 1.20x /
-1.20x / **2.76x** here — it is the whole of the fp32 row, where eager
-BART-large only ties HF.  The latency-bound batch=1 row varies ~5% with this
-laptop's clock, so its 1.59x is the least reliable cell.  This recording is at
-the x86 default
-`block_size=32`; at the previous 16 it read 1.16x / 1.49x / 3.44x / 1.03x — that
-page size is the greedy-vs-beam trade-off in the gotcha below.  Absolute times
-are only comparable within one recording: the box ran ~20% slower here than when
-the previous table was taken, which moves the single-sequence row most, so on
-this box only the with-in-run speedup is meaningful.  Built with the vendored
-kernel — if `csrc/` fails to build (no `ninja`, see the gotcha) the same table
-reads 1.02x / 0.89x / 1.33x / 0.91x: greedy loses its edge (0.89-1.02x) and the
-beams=4 win shrinks 3.34x → 1.33x, which is why `cpu_attn.module()` is worth
-checking before trusting any CPU number.  With the kernel this laptop is the
-*fastest* box at these points (8 cores, high clocks), which is why its numbers
-beat the 4-core Xeons' in the README matrix.
+Mean of two runs with a cold Inductor cache (`/tmp/torchinductor_*` and
+`~/.cache/torch_extensions` removed first).  This recording is the frozen
+`torch.compile` default: one dynamic decode graph
+(decoder + lm head), one dynamic encoder graph and, for Florence-2, a static
+vision-tower graph, with Inductor freezing packing every GEMM; the old manual
+`pack_weights` prepack is gone (see the CPU GEMM packing gotcha).  The fp32 row
+compiles too and verifies token-exact vs HF
+(`verify_parity.py --dtype float32`).  Absolute times shift between recordings
+(~5% with this laptop's clock, worst in the latency-bound `batch=1` row — the
+two runs read 3448/3428 ms there), so only the within-run speedup is meaningful;
+the `beams=4` win over HF (4x) is the stable feature of the table.
+
+Built with the vendored kernel — if `csrc/` fails to build (no `ninja`, see the
+gotcha) `auto` falls back to SDPA and the compiled gate turns off with it, so
+every row reads like the old unpacked-eager numbers (0.75-1.38x), which is why
+`cpu_attn.module()` is worth checking before trusting any CPU number.  This
+laptop still has the largest *speedup* at these points (8 cores, high clocks,
+and a much slower HF baseline) even though the Xeons decode more tokens/s in
+absolute terms.
 
 `benchmark_florence2.py` runs the same configs on a real 640x480 photo
 (`car.jpg`, scp'd to `/tmp/fastencdec/` so the boxes never hit the Hub) and a
@@ -362,12 +366,12 @@ runs, and every run writes its raw results with `--json`, so the numbers can be
 re-derived rather than trusted (an audit that recomputes all 16 rows from those
 JSONs and diffs them against the README passes).
 
-What to expect from those tables: on CPU greedy is 0.9-2.0x (the encoder is
-shared work and dominates the 512->128 point, where the Xeons sit at 0.94-0.95x)
-and beam search is 1.7-3.9x, because the paged cache shares blocks where HF
-reorders a full beam cache every step.  On CUDA greedy is 2.4-3.6x - the decode
+What to expect from those tables: on CPU greedy is 1.1-3.5x (the encoder is
+shared work and dominates the 512->128 point, where the Xeons sit at 1.11-1.43x)
+and beam search is 2.0-5.0x, because the paged cache shares blocks where HF
+reorders a full beam cache every step.  On CUDA greedy is 2.7-4.0x - the decode
 CUDA graph removes the per-step launch overhead that dominated small batches
-(eager it was ~1.05x) - while beam search is 2.0-4.2x.  fp32 trails on CUDA
+(eager it was ~1.05x) - while beam search is 2.1-2.9x.  fp32 trails on CUDA
 (there is no FlashAttention-2 path).
 
 `benchmarks/benchmark_vllm.py` is the same comparison against **vLLM** on the L4
@@ -380,47 +384,47 @@ in a custom scheduler that disables async scheduling - see the gotcha):
 
 | point | config | ours ms | ours tok/s | vLLM ms | vLLM tok/s | speedup |
 |---|---:|---:|---:|---:|---:|---:|
-| 128->512 | batch=1, beams=1 | 1457 | 351 | 1397 | 366 | 0.96x |
-| 128->512 | batch=8, beams=1 | 1834 | 2233 | 1685 | 2431 | 0.92x |
-| 128->512 | batch=8, beams=4 | 3197 | 1281 | 3458 | 1187 | 1.08x |
-| 128->512 | batch=8, beams=1, fp32 | 12011 | 341 | 3355 | 1221 | 0.28x |
-| 512->128 | batch=1, beams=1 | 372 | 344 | 361 | 355 | 0.97x |
-| 512->128 | batch=8, beams=1 | 560 | 1828 | 517 | 1980 | 0.92x |
-| 512->128 | batch=8, beams=4 | 900 | 1138 | 1058 | 975 | 1.18x |
-| 512->128 | batch=8, beams=1, fp32 | 3190 | 321 | 985 | 1040 | 0.31x |
-| 256->256 | batch=1, beams=1 | 727 | 352 | 699 | 366 | 0.96x |
-| 256->256 | batch=8, beams=1 | 950 | 2155 | 870 | 2353 | 0.92x |
-| 256->256 | batch=8, beams=4 | 1737 | 1179 | 1761 | 1167 | 1.01x |
-| 256->256 | batch=8, beams=1, fp32 | 6026 | 340 | 1723 | 1189 | 0.29x |
+| 128->512 | batch=1, beams=1 | 1466 | 349 | 1405 | 364 | 0.96x |
+| 128->512 | batch=8, beams=1 | 1859 | 2203 | 1706 | 2401 | 0.92x |
+| 128->512 | batch=8, beams=4 | 3243 | 1263 | 3495 | 1174 | 1.08x |
+| 128->512 | batch=8, beams=1, fp32 | 12262 | 334 | 3377 | 1213 | 0.28x |
+| 512->128 | batch=1, beams=1 | 375 | 341 | 366 | 349 | 0.98x |
+| 512->128 | batch=8, beams=1 | 568 | 1801 | 517 | 1981 | 0.91x |
+| 512->128 | batch=8, beams=4 | 914 | 1120 | 1052 | 981 | 1.15x |
+| 512->128 | batch=8, beams=1, fp32 | 3220 | 318 | 991 | 1033 | 0.31x |
+| 256->256 | batch=1, beams=1 | 736 | 348 | 707 | 362 | 0.96x |
+| 256->256 | batch=8, beams=1 | 961 | 2130 | 874 | 2343 | 0.91x |
+| 256->256 | batch=8, beams=4 | 1758 | 1165 | 1740 | 1182 | 0.99x |
+| 256->256 | batch=8, beams=1, fp32 | 6188 | 331 | 1732 | 1182 | 0.28x |
 
 Greedy alone, sweeping the batch size (`--batches 1,2,4,8,16,32`, no beam plugin):
 
 | point | batch | ours ms | ours tok/s | vLLM ms | vLLM tok/s | speedup |
 |---|---:|---:|---:|---:|---:|---:|
-| 128->512 | 1 | 1457 | 351 | 1397 | 366 | 0.96x |
-| 128->512 | 2 | 1567 | 654 | 1475 | 694 | 0.94x |
-| 128->512 | 4 | 1676 | 1222 | 1510 | 1356 | 0.90x |
-| 128->512 | 8 | 1834 | 2233 | 1685 | 2431 | 0.92x |
-| 128->512 | 16 | 2273 | 3604 | 2094 | 3913 | 0.92x |
-| 128->512 | 32 | 3170 | 5168 | 2977 | 5503 | 0.94x |
-| 512->128 | 1 | 372 | 344 | 361 | 355 | 0.97x |
-| 512->128 | 2 | 420 | 609 | 397 | 644 | 0.95x |
-| 512->128 | 4 | 460 | 1112 | 441 | 1162 | 0.96x |
-| 512->128 | 8 | 560 | 1828 | 517 | 1980 | 0.92x |
-| 512->128 | 16 | 779 | 2630 | 693 | 2953 | 0.89x |
-| 512->128 | 32 | 1230 | 3330 | 1051 | 3896 | 0.85x |
-| 256->256 | 1 | 727 | 352 | 699 | 366 | 0.96x |
-| 256->256 | 2 | 797 | 642 | 747 | 686 | 0.94x |
-| 256->256 | 4 | 855 | 1197 | 775 | 1321 | 0.91x |
-| 256->256 | 8 | 950 | 2155 | 870 | 2353 | 0.92x |
-| 256->256 | 16 | 1202 | 3409 | 1100 | 3725 | 0.92x |
-| 256->256 | 32 | 1729 | 4737 | 1563 | 5242 | 0.90x |
+| 128->512 | 1 | 1463 | 350 | 1389 | 369 | 0.95x |
+| 128->512 | 2 | 1572 | 651 | 1476 | 694 | 0.94x |
+| 128->512 | 4 | 1679 | 1220 | 1534 | 1335 | 0.91x |
+| 128->512 | 8 | 1859 | 2204 | 1708 | 2398 | 0.92x |
+| 128->512 | 16 | 2305 | 3554 | 2114 | 3875 | 0.92x |
+| 128->512 | 32 | 3209 | 5106 | 2997 | 5466 | 0.93x |
+| 512->128 | 1 | 375 | 341 | 372 | 344 | 0.99x |
+| 512->128 | 2 | 422 | 607 | 400 | 641 | 0.95x |
+| 512->128 | 4 | 463 | 1105 | 441 | 1160 | 0.95x |
+| 512->128 | 8 | 567 | 1807 | 520 | 1970 | 0.92x |
+| 512->128 | 16 | 788 | 2600 | 701 | 2922 | 0.89x |
+| 512->128 | 32 | 1243 | 3296 | 1067 | 3841 | 0.86x |
+| 256->256 | 1 | 735 | 348 | 692 | 370 | 0.94x |
+| 256->256 | 2 | 802 | 638 | 753 | 680 | 0.94x |
+| 256->256 | 4 | 859 | 1192 | 779 | 1314 | 0.91x |
+| 256->256 | 8 | 961 | 2131 | 876 | 2338 | 0.91x |
+| 256->256 | 16 | 1215 | 3373 | 1096 | 3739 | 0.90x |
+| 256->256 | 32 | 1737 | 4716 | 1561 | 5248 | 0.90x |
 
 The shape is the HF comparison shrunk down.  vLLM's single-token decode loop is
-3-9% leaner in bf16, so greedy loses 0.92-0.97x; the gap widens with batch
-(`512->128, batch=32` is 0.85x) and is ~0 at `batch=1`, where both are
+1-9% leaner in bf16, so greedy loses 0.91-0.98x; the gap widens with batch
+(`512->128, batch=32` is 0.86x) and is ~0 at `batch=1`, where both are
 latency-bound.  Block sharing between beams turns greedy's loss back into a small
-win at `beams=4` (1.01-1.18x) where the plugin copy-on-writes a whole beam group
+win at `beams=4` (0.99-1.15x) where the plugin copy-on-writes a whole beam group
 every step.  fp32 is the one-sided loss (0.28-0.31x): with no FlashAttention-2
 path the engine also loses the decode CUDA graph that depends on it, so a batch=8
 decode runs at the batch=1 rate (launch-bound), while vLLM keeps fp32 on
@@ -434,8 +438,8 @@ default, `--no-cudagraph` disables it):
 
 | requests | max_tokens | eager tok/s | cudagraph tok/s |
 |---|---:|---:|---:|
-| 32 | 256 | 2674 | 3423 |
-| 128 | 256 | 4575 | 4657 |
+| 32 | 256 | 2828 | 3633 |
+| 128 | 256 | 4607 | 4723 |
 
 At batch ≥ 32 the decode is GPU-bound and re-reads the KV cache every step
 (`flash_fwd_splitkv_kernel` is ~2/3 of the CUDA time), so eager and the CUDA
@@ -482,16 +486,66 @@ on this box with the same kind of workload.
   exhausted.
 - **BF16 vs FP32**: BF16 ≈ 2× on GEMM-heavy work via oneDNN; attention is
   FP32-accumulate in both.
-- **CPU packed linears (`pack_weights`, on by default).** At load, every CPU
-  `nn.Linear` weight is rewritten once with
-  `torch.ops.mkldnn._reorder_linear_weight` and run through
-  `torch.ops.mkldnn._linear_pointwise` — oneDNN on x86, oneDNN-ACL on aarch64,
-  the same pair Inductor's weight-prepack pass emits.  That removes the per-call
-  weight reorder `F.linear` pays and is worth ~1.3x (Xeon Emerald) / ~1.55x
-  (Graviton Neoverse-V3) end-to-end at `256->256, batch=8`; decode is the
-  bandwidth-bound part, so the encoder and the fp32 rows gain less.  It is always
-  on for CPU and logs the count; a host without the ops keeps `F.linear`.  The
-  original `weight` is kept, so weight memory doubles.
+- **CPU GEMM packing: frozen `torch.compile`, always on (CPU, fp32/bf16, when
+  the vendored kernel is active).** There is no manual prepack anymore.  When
+  `compile_decoder` holds (`device.type == "cpu"` + dtype
+  float32/bfloat16 + `backend == "vllm"`), the runner `torch.compile`s **two
+  graphs**: `model.forward` (decoder + lm head, one graph — lm-head GEMMs pack
+  too) via opaque attention custom ops, and `model.encode` for the encoder
+  (vision tower included for Florence-2).  Inductor's freezing pass packs all
+  of them into `_linear_pointwise` (oneDNN blocked weights; ACL on aarch64),
+  the same op the old manual prepack fed; the artifact also fuses pointwise
+  chains (`linear+gelu`, residual-add into the linear epilogue) for free.  fp32
+  compiles as well and — measured — stays **token-for-token identical to HF**
+  (`mkl`/pointwise fp32 GEMM numerics are exact enough), so fp32 lost nothing.
+  See `TORCH_COMPILE_FREEZING.md` for how the gate chain works
+  (`compile_fx.py`: freezing needs `not torch.is_grad_enabled()`, so forwards
+  run under `torch.no_grad()`).  Two rules: (1) the CPU SDPA fallback is NOT
+  compiled — it reads the per-step `Context` globals, which tracing would bake
+  in — so if `csrc/` cannot build, CPU is plain unpacked eager and
+  *slower than HF* (0.75-0.94x SDPA-loop penalty; check `cpu_attn.module()`);
+  (2) shapes must stay dynamic: a static graph **duplicates every frozen weight
+  per compiled shape** (measured +0.74 GB bf16 / +1.6 GB fp32 per artifact for
+  bart-large, per batch size or encoder length), so the decode graph and the
+  encode graphs are `dynamic=True` — one artifact across all batch sizes /
+  encoder lengths.  The only static graph is Florence-2's vision tower
+  (`get_image_features`, compiled on its own by the runner): Inductor's
+  dynamic-conv lowering mis-strides DaViT's windowed feature maps
+  (`assert_tensor_metadata` failures), so it keeps static shapes and recompiles
+  once per image shape (a real workload uses one).  The **text** encoder must
+  not be in that graph: its length is 577 visual tokens + the task prompt, which
+  varies per request, and compiling it static cost one graph per task plus one
+  per batch size as EOS shrank the batch — enough to exhaust Dynamo's cache in
+  a single `benchmark_florence2.py` run.  The runner therefore precomputes
+  `get_image_features(px)` (its own graph) and passes the features into
+  `model.encode(ids, image_embeds=...)`, so the text graph stays dynamic.
+  First use pays a one-time
+  Inductor compile per graph (artifacts cached in
+  `/tmp/torchinductor_*` across processes, and the FX cache can **replay a
+  graph without running the trace** — no trace-time side effects allowed; see
+  the FX-cache gotcha), and parallel workers are capped at 4 to avoid a GB-scale
+  compile memory spike on small boxes.
+- **Dynamo's `recompile_limit` is a budget, not a formality.** A compiled frame
+  keeps at most `recompile_limit` (default 8) cache entries, then Dynamo logs
+  `hit config.recompile_limit` and runs the frame **eager** — no error, just the
+  packing gone.  Each engine costs entries (one per weight set, plus a second
+  for the batch-1 case: `2 <= input_ids.size()[0]` is the 0/1 specialization, so
+  `batch=1` and `batch=8` are different graphs), i.e. ~4 per engine across the
+  two frames.  Before the runner grew the budget this silently bit a process
+  that builds several engines: `benchmark.py`'s default run creates six, and its
+  last fp32 row measured 17021 ms eager where the same config alone measured
+  10678 ms compiled (Emerald), which is also why the old Graviton
+  `256->256, fp32` cell did not reproduce.  `ModelRunner.__init__` now raises
+  `torch._dynamo.config.recompile_limit` to `2 * (engines compiled so far) + 4`,
+  so a benchmark or notebook holding many engines keeps every one compiled; if
+  you add another compiled frame, count its entries too.  The other half of the
+  budget is memory: Dynamo's frame caches *retain* the engines they compiled
+  (guards hold the module, freezing holds a packed copy of its weights), so a
+  process that builds several engines accumulates one engine's weights plus
+  artifact per engine — `benchmark.py` / `benchmark_vllm.py` call
+  `torch._dynamo.reset()` after dropping each engine, which is what keeps the
+  all-scenario run inside an 11 GB laptop (before that it was OOM-killed on the
+  fp32 scenario).
 - **Box choice / threads** (`benchmarks/gemm.py`, bf16 addmm at the engine's
   shapes).  The 4-core Xeons' AMX only pays on the large prefill GEMMs, and SMT
   *hurts* it there: Emerald does 5455 GFLOP/s on `[2048x1024]x[1024x4096]` at 4
@@ -510,13 +564,15 @@ on this box with the same kind of workload.
   `hf-tiny-v2/...` tiny checkpoint is inconsistent (config `image_token_id=4`
   vs tokenizer `51289`, and its vision 2D position embeddings overflow at the
   processor's 768px), so `tests/test_florence2.py` builds inputs by hand.
-- **`compile_mm_encoder`** (on by default) `torch.compile`s the vision tower +
-  projector (~1.2x there, ~1.13x end-to-end after the vendored eager tower).
+- **`compile_mm_encoder`** (default True) `torch.compile`s Florence-2's vision
+  tower + projector (~1.2x there, ~1.13x end-to-end after the vendored eager
+  tower).  It is a `Config` field consumed by `ModelRunner`, which compiles the
+  tower on its own graph on every device — static shapes, one graph per image
+  shape — and always when the flag is set, including on CPU where the attention
+  backend is SDPA and nothing else compiles (see the CPU GEMM packing gotcha).
   Inductor's BF16 fusion shifts outputs, so greedy tokens can diverge from HF;
   pass `compile_mm_encoder=False` for exact parity or to avoid the per-shape
-  compile latency (it compiles once per batch size on first use). `dynamic=True`
-  compiles slowly and gives no speedup; fp32 compile is near-exact but slower
-  than plain BF16 eager.
+  compile latency (it compiles once per image shape on first use).
 - **Attention backend.** `attn_backend="auto"` uses the vendored vLLM kernel
   when it compiles (the default), else SDPA. The kernel only handles
   `head_dim ∈ {32,48,64,80,96,112,128,160,192,224,256,512}`; other shapes (e.g.
@@ -528,7 +584,7 @@ on this box with the same kind of workload.
   than the SDPA/"eager" fallbacks (75x at batch=8/ctx=256 on the 8-core laptop,
   ~10-21x at batch=32/ctx=1024, where the fallback's per-sequence loop
   amortizes) and **+15% to +65% end-to-end** over `attn_backend="sdpa"`; versus
-  HF the engine's margin is the one in the benchmark matrix above (0.97-3.79x
+  HF the engine's margin is the one in the benchmark matrix above (1.1-5.0x
   depending on the point and the beam width).
   The CPU SDPA fallback is itself slower than HF (0.75-0.94x) because it attends
   one sequence at a time (CUDA uses the batched path), so `"auto"` resolving to
@@ -570,7 +626,10 @@ on this box with the same kind of workload.
   CUDA graph switches off with it — on the L4, `batch=8, beams=1, bf16` then
   measured 347 tok/s where the flash path gives 1817.  Check
   `flash_attn.module()` before trusting CUDA numbers, exactly as
-  `cpu_attn.module()` gates the CPU ones.
+  `cpu_attn.module()` gates the CPU ones.  (The L4's `ours`-side runs must
+  therefore go ONLINE: `get_kernel` fails under `HF_HUB_OFFLINE=1` even with
+  the kernel snapshots cached in `~/.cache/huggingface/kernels`, so unset that
+  variable for the ours engine and keep it set for the vLLM side.)
   The backend uses `flash_attn_with_kvcache` (page-major cache
   read through the block table) for self- and cross-attention: the dedicated
   decode kernel is ~3x cheaper per call than `flash_attn_varlen_func`, which
@@ -596,9 +655,9 @@ on this box with the same kind of workload.
   `VLLM_PLUGINS` (`bart` vs `bart,beam_search`) and the scheduler from the requested
   configs, so a greedy (`--batches`) run never loads it.  Run one process per engine
   and merge the two JSONs with `--compare`.  What to expect: in bf16 vLLM's
-  single-token decode is 3-9% leaner than ours (greedy 0.85-0.97x, widest with
-  batch), our block sharing wins beam back (1.01-1.18x at `beams=4`), and fp32 is a
-  ~3.4x loss because fp32 has no FlashAttention-2 path, so it also loses the decode
+  single-token decode is 1-9% leaner than ours (greedy 0.91-0.98x, widest with
+  batch), our block sharing wins beam back (0.99-1.15x at `beams=4`), and fp32 is a
+  ~3.5x loss because fp32 has no FlashAttention-2 path, so it also loses the decode
   CUDA graph and goes launch-bound (a batch=8 decode runs at the batch=1 rate).
   vLLM's beam path appends a trailing EOS, so it decodes N+1 tokens against our
   exactly-N; the reported speedup is `vLLM ms / ours ms`.
@@ -616,12 +675,12 @@ on this box with the same kind of workload.
   pool from `VLLM_CPU_KVCACHE_SPACE` (the script defaults it to 8 GiB), not from
   `gpu_memory_utilization`.  Beam search on CPU has no vLLM reference - compare it
   against HF with `benchmarks/benchmark.py` instead.  What to expect on CPU (Graviton
-  5, aarch64, 8 cores, bf16): ours leads every greedy row at 1.03-4.8x.  The wide
+  5, aarch64, 8 cores, bf16): ours leads every greedy row at 1.05-4.88x.  The wide
   end is `512->128`, where vLLM's CPU path barely batches (68 -> 120 tok/s from
-  `batch=1` to 32, against 129 -> 571 for ours); the narrow end is `128->512`
-  (1.03-1.27x), where a single-token decode dominates and both engines do the same
-  bandwidth-bound GEMM work.  fp32 is ~1.1x for the same reason.  Ours' own
-  `beams=4` rows on that box are 386 / 273 / 362 tok/s at `128->512` / `512->128` /
+  `batch=1` to 32, against 130 -> 586 for ours); the narrow end is `128->512`
+  (1.05-1.27x), where a single-token decode dominates and both engines do the same
+  bandwidth-bound GEMM work.  fp32 is 1.13-1.15x for the same reason.  Ours' own
+  `beams=4` rows on that box are 386 / 279 / 366 tok/s at `128->512` / `512->128` /
   `256->256`.
 - **CUDA graph (on by default on CUDA + flash).** `engine/cudagraph.py`
   captures `model.decoder` once per batch-size bucket (`[1,2,4,8,16,…,
@@ -640,69 +699,69 @@ on this box with the same kind of workload.
   capacity just rewrites the cross rows in place, so the capture survives across
   `generate()` calls.  (Rebuilding the buffers for every new request set
   re-captured all buckets on every call: ~100 ms of the L4's 176-641 ms rows.)
-- **`torch.compile` (`compile_model=True`, default off) fuses the pointwise
-  sequences but does not pay off for BART.** How nano-vllm uses it: not a
-  whole-model compile, but `@torch.compile` on four tensor-only functions —
+- **`torch.compile` does not pay off for BART on CUDA.** How nano-vllm uses it:
+  not a whole-model compile, but `@torch.compile` on four tensor-only functions —
   `RMSNorm.rms_forward` / `add_rms_forward`, `SiluAndMul.forward`,
   `RotaryEmbedding.forward` and `Sampler.forward` — each of which Dynamo turns
   into one fused kernel (0 graph breaks). Measured on the L4 by patching the
   decorators out (n=64, out=64, eager): 119876 → 26116 kernel launches (**−78%**),
-  2334 → 1743 ms CUDA, and it is worth **1.22x** on top of either mode (eager
-  892 → 1092 tok/s, with their CUDA graph 1760 → 2144). Our flag ports the
-  same idea at BART's granularity: `models/bart.py` compiles `_add_layer_norm`
-  (residual add + layer norm) and `_activation_linear` (gelu + fc1), the only
-  pointwise sequences a layer has. Wrapping the whole `decoder` instead
-  *fragments* — Dynamo breaks on every flash `fwd_kvcache` call (~24 tiny regions
-  per step) and recompiled every step while guarding the per-step metadata memo.
-  The helpers themselves are clean (2 recompiles, 0 graph breaks, 3 triton
-  kernels, ~7% fewer launches) yet worth **~0 GPU time**: `native_layer_norm` +
-  add and gelu are already single fused aten kernels, and decode is bound by
-  `flash_fwd_splitkv_kernel` (~1/3) + GEMMs. Eager 3911 → 3195 tok/s at n=64
-  (Dynamo's per-call wrapper across ~48 calls/step), with the graph 3925 → 3902.
-  Off by default — BART has no RMSNorm / gated MLP / rotary to fuse (ours saves
-  7% of launches, 16161 → 14985, for ~0 GPU time). **Revisit it when a T5 model
-  lands:** T5 is `T5LayerNorm` (RMS) + a relative-position bias + a gated FFN
-  (`T5DenseGatedActDense`, T5 v1.1), i.e. the same hand-written multi-kernel
-  elementwise chains (6-8 kernels each) that inductor collapses into one — the
-  reason nano-vllm gets 1.22x. Wire `_add_layer_norm`/`_activation_linear`
-  equivalents (or new helpers) for the T5 layers and re-measure; keep the
-  plumbing until then. Two changes
-  made while getting there are kept: `flash_attn.module()` is a resolved-once
-  global rather than `functools.lru_cache` (Dynamo inlines an `lru_cache` body and
-  would trace the Hub download), and the flash self-attention path reads the
-  Context directly instead of the per-step memo.
-- **`torch.compile` + graph freezing on CPU.** The Inductor weight-prepack
-  recipe (`torch._inductor.config.cpp.weight_prepack = True`,
-  `config.freezing = True`, then `torch.compile(model)`) does work, but only on
-  models that are pure torch: on a plain `Linear+GELU+Linear` it emits
-  `mkldnn::_linear_pointwise` and gives 1.48x (bf16) / 2.28x (fp32) on the Xeon
-  and 1.67x / 1.97x on Graviton.  Two traps sit in front of it: freezing only
-  happens when `not torch.is_grad_enabled()`, so the forward must be under
-  `torch.no_grad()` (`torch/_inductor/compile_fx.py`), and `recompile_limit`
-  (default 8) is below the 12 decoder layers, which silently drops back to
-  eager.  It does not pay off on this engine: the attention is a pybind op that
-  also reads the module-level `Context`, so Dynamo graph-breaks there — its own
-  remedy is "wrap the custom kernel into an opaque custom op" — and the ~84
-  subgraphs per step cost more than the packing buys (`256->256, batch=8`: eager
-  6700 ms, compile without freezing 7490, compile + freezing 6950, manual
-  prepack 5150).  `torch._dynamo.allow_in_graph` is not enough either: Dynamo
-  still calls the wrapped function on fake tensors, which the kernel cannot run.
-  Registering the attention as a `torch.library.custom_op` with
-  `register_fake` *does* work — the whole decoder then compiles into one graph
-  and lands within 2-14% of the manual prepack (5250 ms Xeon, 5030 ms Graviton,
-  tokens identical) — but `decoder_cross_attention` takes the attention module
-  as an argument, which cannot be a custom-op input, so it needs re-plumbing to
-  pass the staged tensors.  CPU post-op fusion is not worth the plumbing either:
-  `linear+gelu` (`_linear_pointwise(..., "gelu", [-1], "none")`, exact like
-  `F.gelu`) saves 0.002-0.005 ms per `fc1`, under 1% of a step — which is why
-  `compile_model` (Inductor fusing `_add_layer_norm`/`_activation_linear`)
-  measures ~7% *slower* on CPU.  Florence-2 is the exception that proves the
-  rule: `compile_mm_encoder` compiles the (pure-torch) DaViT tower fine, the
-  packed forward is `torch.compiler.disable`d so Inductor never sees the opaque
-  blocked weight (it fails on its `stride=[1, 0]` otherwise), which keeps the
-  linear out of the graph — yet `compile + prepack` is still the fastest
-  `get_image_features` (356 ms vs 369 compiled-unpacked vs 394 eager at 577
-  tokens).
+  2334 → 1743 ms CUDA, worth **1.22x** on top of either mode. Ported at BART's
+  granularity it was worth nothing: the helpers compiled clean (2 recompiles, 0
+  graph breaks, ~7% fewer launches) but `native_layer_norm`+add and gelu are
+  already single fused aten kernels, and decode is bound by
+  `flash_fwd_splitkv_kernel` (~1/3 of CUDA time) + GEMMs — eager 3911 → 3195
+  tok/s from Dynamo's own per-call wrapper overhead; whole-decoder tracing
+  fragments on every flash `fwd_kvcache` call (~24 regions/step). The per-helper
+  wiring (`bart.enable_compile`, compiled `_add_layer_norm`/`_activation_linear`
+  variants) is removed; both helpers are plain eager again. Revisit on CUDA only
+  when a T5 model lands. Two changes from that work are kept:
+  `flash_attn.module()` is a resolved-once global rather than
+  `functools.lru_cache` (Dynamo inlines an `lru_cache` body and would trace the
+  Hub download), and the flash self-attention path reads the Context directly
+  instead of the per-step memo.
+- **CPU: frozen `torch.compile` IS the packing path (always on).** The decode
+  (decoder + lm head via the model's `forward`) and BART-encode graphs trace as one
+  graph each because the vLLM CPU attention branches are opaque
+  `torch.library.custom_op`s (`fastencdec::cpu_vllm_self_attention`,
+  `::cpu_vllm_cross_attention`, in `layers/attention.py`, `register_fake`
+  impls, `mutates_args` covering the self caches) — Dynamo never traces the
+  pybind module, the Context reads, or the cross staging, so it is **one graph,
+  zero breaks** and Inductor freezing (patched on around every compiled call via
+  `torch._inductor.config.patch(freezing=True)`) packs all GEMMs into
+  `_linear_pointwise` (decode artifact: 72 calls, 0 `aten.addmm`; even
+  `linear+gelu` fuses into the epilogue). History that validates the design:
+  compile+freezing on the *unplumbed* decoder broke on every pybind call — the
+  remaining census after hoisting the ISA probes (`TORCH_COMPILE_FREEZING.md§4.2`)
+  was ~53, all pybind, 0.91x eager (6467 vs 5860 ms) — which is what drove the
+  custom-op re-plumb; `allow_in_graph` is not enough (Dynamo calls the function
+  on fake tensors); and `layers/cpu_attn.py` resolves its capability flags once
+  into module globals and caches the built module in a plain global — do not put
+  the per-call dispatch back on `torch.cpu._is_avx512_supported` or `lru_cache`
+  calls (Dynamo traces into each once per call site). The old manual
+  `packed_linear` prepack (now deleted) sat ~5-9% behind the compiled rows.
+  fp32 compiles the same way and verifies token-exact vs HF. The per-shape
+  hazard is real (static artifacts duplicate frozen weights — see the CPU GEMM
+  packing gotcha), so the graphs are dynamic; CPU post-op fusion is left to
+  Inductor: `fallback` hand-fusions like `_linear_pointwise(..., "gelu", [-1])`
+  save only 0.002-0.005 ms per `fc1`, which is why per-helper fusion measured
+  ~7% *slower* on CPU. Florence-2's DaViT tower is pure torch, so it compiles
+  on CPU too — as its own static graph (dynamic convs mis-stride, see the
+  packing gotcha), with the text encoder dynamic; the old `packed forward`
+  `torch.compiler.disable` workaround is gone with the manual prepack.
+- **The Inductor FX graph cache replays without running the trace.**
+  `/tmp/torchinductor_*` caches compiled artifacts across processes; a cached
+  graph can be **replayed without ever executing the Python of a fresh Dynamo
+  trace**.  Any trace-time side effect is therefore invisible on a cache hit —
+  the concrete failure: the cross-attention layer registry used to register
+  lazily inside the traced `decoder_cross_attention`, a cached replay called
+  `fastencdec::cpu_vllm_cross_attention.default(..., 0, ...)` with a baked
+  handle while the registry was still empty (`IndexError: list index out of
+  range`).  Rule: no module/global/attribute mutation inside traced code;
+  state must be established in `__init__` or at engine load
+  (`register_cross_layer` is called from `BartDecoderCrossAttention.__init__`,
+  and the lesson generalizes to anything Dynamo-visible).  When debugging a
+  cached-replay failure, `rm -rf /tmp/torchinductor_<user>` first — a cache
+  hit hides the trace path entirely.
 - **Fused q/k/v projections.** Each self-attention holds one `qkv_proj`
   (`[D -> 3D]`) where HF has `q_proj`/`k_proj`/`v_proj`, and cross-attention
   holds `kv_proj` + `q_proj` (K and V are both projected from the encoder
@@ -749,8 +808,10 @@ on this box with the same kind of workload.
   carry over): `T5LayerNorm` is RMS-without-mean, T5 v1.1 has a gated FFN
   (`T5DenseGatedActDense`) and T5 uses a relative-position bias instead of
   learned positional embeddings. Those per-layer pointwise ops are the
-  multi-kernel kind `torch.compile` collapses, so re-measure `compile_model`
-  there (see the gotcha) — BART has nothing to fuse, T5 does.
+  multi-kernel kind the frozen compile graphs collapse, so T5's per-step CPU
+  gains would exceed BART's (BART had ~0 fusion value; T5 has real pointwise
+  chains to fuse) — the always-on compile path would do the fusing
+  automatically.
 
 ## 9. Style
 
@@ -764,8 +825,8 @@ on this box with the same kind of workload.
 - After changes: run `python -m compileall fastencdec`,
   `tests/test_parity.py`, `tests/test_attn_backend.py`,
   `tests/test_florence2.py`, `tests/test_beam.py`,
-  `tests/test_packed_linear.py`, `uvx ruff check` /
-  `uvx ruff format --check`, and `benchmarks/benchmark.py --scenarios '256->256'`.
+  `uvx ruff check` / `uvx ruff format --check`, and
+  `benchmarks/benchmark.py --scenarios '256->256'`.
 - Every commit must update the "Benchmark baseline" table above with the real
   numbers from that run (no stale or estimated values).  The full three-point
   matrix in the README is refreshed when the tables or the engine change

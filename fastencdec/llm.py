@@ -3,7 +3,6 @@ from transformers import AutoConfig, AutoTokenizer, GenerationConfig
 
 from .config import Config
 from .engine.llm_engine import LLMEngine
-from .layers import packed_linear
 from .models.bart import BartForConditionalGeneration
 from .models.florence2 import Florence2ForConditionalGeneration
 from .outputs import CompletionOutput, RequestOutput
@@ -31,10 +30,9 @@ class LLM:
         max_num_seqs: int = 32,
         dtype: torch.dtype = torch.float32,
         attn_backend: str = "auto",
-        compile_mm_encoder: bool = True,
         device: str = "cpu",
         use_cudagraph: bool = True,
-        compile_model: bool = False,
+        compile_mm_encoder: bool = True,
     ):
         hf_config = AutoConfig.from_pretrained(model_path)
         self.multimodal = hf_config.model_type == "florence2"
@@ -50,8 +48,6 @@ class LLM:
             self.model = Florence2ForConditionalGeneration(hf_config)
             load_hf_weights(self.model, model_path, hf_model_cls=HFFlorence2)
             self.model.to(dtype).to(device)
-            if compile_mm_encoder:
-                self.model.compile_mm_encoder()
             text_config = hf_config.text_config
         else:
             self.tokenizer = AutoTokenizer.from_pretrained(model_path)
@@ -62,9 +58,6 @@ class LLM:
 
         self.decoder_start_token_id = text_config.decoder_start_token_id
         self.eos_token_id = text_config.eos_token_id
-
-        if torch.device(device).type == "cpu":
-            packed_linear.apply(self.model, max_num_seqs)
 
         self.generation_config = _load_generation_config(model_path)
         self.default_sampling_params = SamplingParams.from_generation_config(
@@ -78,7 +71,7 @@ class LLM:
             attn_backend=attn_backend,
             device=device,
             use_cudagraph=use_cudagraph,
-            compile_model=compile_model,
+            compile_mm_encoder=compile_mm_encoder,
         )
         self.engine = LLMEngine(self.model, config, eos_token_id=self.eos_token_id)
 

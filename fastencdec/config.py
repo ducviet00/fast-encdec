@@ -25,7 +25,7 @@ class Config:
     attn_backend: str = "auto"
     device: str = "cpu"
     use_cudagraph: bool = True
-    compile_model: bool = False
+    compile_mm_encoder: bool = True
 
     def __post_init__(self) -> None:
         if self.block_size is None:

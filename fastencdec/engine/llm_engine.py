@@ -39,7 +39,7 @@ class LLMEngine:
             device=config.device,
             max_num_seqs=config.max_num_seqs,
             use_cudagraph=config.use_cudagraph,
-            compile_model=config.compile_model,
+            compile_mm_encoder=config.compile_mm_encoder,
         )
         self.scheduler = Scheduler(config)
         self.sampler = Sampler()
