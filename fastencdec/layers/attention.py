@@ -342,16 +342,10 @@ def decoder_self_attention(query, key, value, k_cache, v_cache, scale, block_siz
         return _cpu_vllm_self_attention(
             query, key, value, k_cache, v_cache, scale, block_size
         )
-    data = _self_derived(ctx, backend, num_heads, head_dim, query.dtype, block_size)
-    _store(
-        key,
-        value,
-        k_cache,
-        v_cache,
-        ctx.slot_mapping,
-        block_size,
-        backend,
-        data.get("isa"),
+    # SDPA fallback: read the cached K/V through the block table.
+    data = _self_derived(ctx, "sdpa", num_heads, head_dim, query.dtype, block_size)
+    store_kvcache(
+        key, value, k_cache, v_cache, ctx.slot_mapping, block_size, page_major=False
     )
     return _sdpa_paged(query, k_cache, v_cache, data["key_slot_ids"], ctx, scale)
 
@@ -446,7 +440,7 @@ def decoder_cross_attention(query, layer, scale, block_size):
     ctx = get_context()
     num_heads, head_dim = query.shape[1], query.shape[2]
     backend = _paged_backend(query.device, query.dtype, head_dim, block_size)
-    if backend == "vllm" and ctx.cross_block_tables is None:
+    if backend == "vllm":
         # Opaque custom op: staging reads the layer's request-keyed state, so it runs
         # outside the compiled graph (see _cpu_vllm_cross_attention).
         handle = getattr(layer, "cpu_cross_handle", None)
@@ -457,40 +451,26 @@ def decoder_cross_attention(query, layer, scale, block_size):
                 "register_cross_layer() on it"
             )
         return _cpu_vllm_cross_attention(query, scale, handle, block_size)
+    if backend == "sdpa":
+        return _cross_sdpa(query, layer, ctx, scale)
     if ctx.cross_block_tables is not None:
-        # CUDA-graph path uses preallocated static cross_cache and block tables.
+        # CUDA-graph path: preallocated static cross cache and block tables.
         k_cache, v_cache = layer.cross_cache
         block_table, cache_seqlens = ctx.cross_block_tables, ctx.cross_cache_seqlens
-    elif backend == "sdpa":
-        return _cross_sdpa(query, layer, ctx, scale)
     else:
-        k_cache, v_cache, block_table, cache_seqlens, metadata = _cross_staged(
-            layer, ctx, backend, block_size, num_heads, head_dim, query.dtype
+        k_cache, v_cache, block_table, cache_seqlens, _ = _cross_staged(
+            layer, ctx, "flash", block_size, num_heads, head_dim, query.dtype
         )
-    if backend == "flash":
-        out = flash_attn.require().flash_attn_with_kvcache(
-            query.unsqueeze(1),
-            k_cache,
-            v_cache,
-            cache_seqlens=cache_seqlens,
-            block_table=block_table,
-            causal=False,
-            softmax_scale=scale,
-        )
-        return out.squeeze(1)
-    return cpu_attn.module().attention_forward(
-        query,
+    out = flash_attn.require().flash_attn_with_kvcache(
+        query.unsqueeze(1),
         k_cache,
         v_cache,
-        torch.arange(query.shape[0] + 1, dtype=torch.int32, device=query.device),
-        cache_seqlens,
-        scale,
-        False,
-        -1,
-        block_table,
-        metadata,
-        None,
+        cache_seqlens=cache_seqlens,
+        block_table=block_table,
+        causal=False,
+        softmax_scale=scale,
     )
+    return out.squeeze(1)
 
 
 def _sdpa(query, key, value, causal, scale):
