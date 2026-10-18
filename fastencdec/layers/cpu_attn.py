@@ -143,3 +143,92 @@ def require():
             "install a C++ toolchain + ninja, or use attn_backend='auto'/'sdpa'."
         )
     return built
+
+
+def _isa(dtype, block_size: int, head_dim: int) -> str:
+    """Return the kernel ISA for this configuration, raising if unsupported."""
+    isa = select_isa(dtype, block_size, head_dim)
+    if isa is None:
+        raise RuntimeError(
+            f"the vLLM CPU attention kernel does not support dtype={dtype}, "
+            f"block_size={block_size}, head_dim={head_dim}"
+        )
+    return isa
+
+
+def _paged_attention(
+    query, k_cache, v_cache, block_table, cache_seqlens, scale, isa, dynamic_causal=None
+):
+    """Run the paged kernel over an already-populated K/V cache."""
+    mod = require()
+    cache_seqlens = cache_seqlens.to(torch.int32)
+    query_start_loc = torch.arange(
+        query.shape[0] + 1, dtype=torch.int32, device=query.device
+    )
+    metadata = mod.build_metadata(
+        query.shape[0],
+        query.shape[1],
+        query.shape[1],
+        query.shape[2],
+        cache_seqlens,
+        query.dtype,
+        query_start_loc,
+        False,
+        -1,
+        isa,
+        True,
+        dynamic_causal,
+    )
+    return mod.attention_forward(
+        query,
+        k_cache,
+        v_cache,
+        query_start_loc,
+        cache_seqlens,
+        scale,
+        False,
+        -1,
+        block_table,
+        metadata,
+        dynamic_causal,
+    )
+
+
+def reshape_and_cache(key, value, k_cache, v_cache, slot_mapping) -> None:
+    """Scatter new key/value [T, H, D] into the paged cache at slot_mapping."""
+    require().reshape_and_cache(
+        key,
+        value,
+        k_cache,
+        v_cache,
+        slot_mapping,
+        _isa(key.dtype, k_cache.shape[2], key.shape[-1]),
+    )
+
+
+def self_attention(
+    query, key, value, k_cache, v_cache, slot_mapping, block_table, context_lens, scale
+):
+    """Write new K/V into the paged cache and run causal self-attention."""
+    isa = _isa(query.dtype, k_cache.shape[2], query.shape[-1])
+    require().reshape_and_cache(key, value, k_cache, v_cache, slot_mapping, isa)
+    # After the write every prefill row has length 1 and every decode row > 1.
+    dynamic_causal = (context_lens == 1).to(torch.int32)
+    return _paged_attention(
+        query,
+        k_cache,
+        v_cache,
+        block_table,
+        context_lens,
+        scale,
+        isa,
+        dynamic_causal,
+    )
+
+
+def cross_attention(query, k_cache, v_cache, block_table, cache_seqlens, scale):
+    """Run non-causal cross-attention over a staged, paged encoder K/V cache."""
+    isa = _isa(query.dtype, k_cache.shape[2], query.shape[-1])
+    return _paged_attention(
+        query, k_cache, v_cache, block_table, cache_seqlens, scale, isa
+    )

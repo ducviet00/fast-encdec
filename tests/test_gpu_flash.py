@@ -65,7 +65,6 @@ def paged_parity(device):
     want = torch.stack(want)
 
     set_context(
-        is_prefill=False,
         context_lens=torch.tensor(lengths, dtype=torch.int32, device=device),
         block_tables=torch.arange(B, dtype=torch.int32, device=device).unsqueeze(1),
         slot_mapping=torch.tensor(

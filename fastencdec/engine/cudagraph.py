@@ -158,7 +158,6 @@ class DecodeGraphRunner:
         """Bind the global Context to the first bs rows of the static graph buffers."""
         b = self.bufs
         set_context(
-            is_prefill=False,
             context_lens=b["context_lens"][:bs],
             block_tables=b["block_tables"][:bs],
             slot_mapping=b["slot_mapping"][:bs],

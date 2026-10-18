@@ -9,7 +9,6 @@ from ..layers.attention import (
     decoder_cross_attention,
     decoder_self_attention,
     encoder_self_attention,
-    register_cross_layer,
 )
 
 ACT2FN = {"gelu": F.gelu}
@@ -156,9 +155,11 @@ class BartDecoderCrossAttention(_BartAttentionBase):
         self.out_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
         # request_id -> (key, value) [num_heads, enc_len, head_dim]
         self.encoder_kv_cache: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+        self.layer_idx = layer_idx
         self.cross_cache = None
+        self.cross_staged = None
+        self.cross_staged_key = None
         self.block_size = 16
-        register_cross_layer(self)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Project decoder queries and attend over cached encoder K/V."""

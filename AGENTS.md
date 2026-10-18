@@ -160,7 +160,11 @@ what keeps decode from being launch/sync-bound (see the L4 beam rows).
 `decoder_self_attention` (paged growing cache) and `decoder_cross_attention`
 (fixed per-request encoder K/V).  Each op reads `utils/context.py` and picks its
 own kernel; the runner and the model never name a backend
-(`attention.set_backend` only overrides the choice for tests).
+(`attention.set_backend` only overrides the choice for tests).  For the vLLM
+CPU path the runner stages each layer's dense encoder K/V into a paged cache
+before the forward (`attention.stage_cross` -> `Context.cross_staged`); the
+opaque cross-attention op reads that per-step state at call time, so it stays
+out of the compiled graph.
 
 ## 5. Core invariants (read before changing anything)
 
@@ -189,8 +193,8 @@ own kernel; the runner and the model never name a backend
    **assumes a sequence is prefilled exactly once, when its cache is empty**. Do
    not add chunked prefill or preemption/recompute without updating the mask
    logic. The vLLM kernel takes it as a per-sequence `dynamic_causal` (1 =
-   prefill), derived in the op from `context_lens == 1` (`is_prefill` is only the
-   homogeneous fast path, so mixed prefill/decode batches still work). The flash
+   prefill), computed in `cpu_attn.self_attention` from `context_lens == 1`, so
+   mixed prefill/decode batches still work. The flash
    path passes `causal=True` to its paged decode kernel: the bottom-right-aligned
    mask gives the same result.
 5. **Cross-attention is dense, not paged.** Each `BartDecoderCrossAttention`
@@ -198,11 +202,14 @@ own kernel; the runner and the model never name a backend
    `[num_heads, enc_len, head_dim]`, filled once in `_encode`, shared by all
    beams of a request (`Context.request_ids`) and freed in
    `ModelRunner.clear_request`. It does not count against `num_blocks`. SDPA
-   reads it directly; the vLLM and flash kernels lazily stage it into a paged
-   cache -- page-major for flash, head-major for vLLM -- memoized on the layer as
+   reads it directly. The vLLM and flash kernels stage it into a paged cache --
+   head-major for vLLM, page-major for flash -- memoized on the layer as
    `layer.cross_staged`, keyed by `(backend, tuple(request_ids))`, so it is
    rebuilt only when the active request set changes and beams never duplicate
-   K/V.
+   K/V. On the CPU vLLM path `ModelRunner.run` stages it into
+   `Context.cross_staged` (a list indexed by decoder layer) before the forward;
+   the opaque cross op reads that at call time, so the tensors never enter the
+   compiled graph.
 6. **Beam search = sequences + block sharing.** Every beam is an ordinary
    `Sequence` with the request's `request_id`. `BlockManager.fork` shares the
    parent's blocks (refcount++); `BlockManager.ensure_capacity` copy-on-writes
@@ -752,14 +759,16 @@ on this box with the same kind of workload.
   `/tmp/torchinductor_*` caches compiled artifacts across processes; a cached
   graph can be **replayed without ever executing the Python of a fresh Dynamo
   trace**.  Any trace-time side effect is therefore invisible on a cache hit —
-  the concrete failure: the cross-attention layer registry used to register
-  lazily inside the traced `decoder_cross_attention`, a cached replay called
-  `fastencdec::cpu_vllm_cross_attention.default(..., 0, ...)` with a baked
-  handle while the registry was still empty (`IndexError: list index out of
-  range`).  Rule: no module/global/attribute mutation inside traced code;
-  state must be established in `__init__` or at engine load
-  (`register_cross_layer` is called from `BartDecoderCrossAttention.__init__`,
-  and the lesson generalizes to anything Dynamo-visible).  When debugging a
+  the concrete failure: cross-attention staging used to register layers lazily
+  inside the traced `decoder_cross_attention`, and a cached replay baked the
+  handle while the registry was still empty (`IndexError`).  Rule: no
+  module/global/attribute mutation inside traced code.  The same applies to
+  *reading* per-step state there: with `freezing=True` Inductor folds a
+  module-attribute tensor into a `_frozen_param` constant, so a staged block
+  table read from `layer.cross_staged` kept the first step's symbolic stride
+  and failed with `NameError: name 's65' is not defined`.  Per-step state the
+  graph must not see (the staged cross K/V) is built by `ModelRunner.run` and
+  read inside the opaque op through `Context.cross_staged`.  When debugging a
   cached-replay failure, `rm -rf /tmp/torchinductor_<user>` first — a cache
   hit hides the trace path entirely.
 - **Fused q/k/v projections.** Each self-attention holds one `qkv_proj`

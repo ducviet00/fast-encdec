@@ -38,6 +38,9 @@ class ModelRunner:
         self.cache_layers = [layer.self_attn for layer in self.decoder_layers]
         self.num_heads = self.cache_layers[0].num_heads
         self.head_dim = self.cache_layers[0].head_dim
+        self.attn_backend = attention.backend(
+            self.device, dtype, self.head_dim, self.block_size
+        )
         # Frozen torch.compile is the whole GEMM story on CPU: the paged attention
         # ops are opaque custom ops, so Dynamo traces the decoder + lm head as one
         # graph, and Inductor freezing packs every GEMM (decoder, lm head, and the
@@ -46,8 +49,7 @@ class ModelRunner:
         self.compile_decoder = (
             self.device.type == "cpu"
             and dtype in (torch.float32, torch.bfloat16)
-            and attention.backend(self.device, dtype, self.head_dim, self.block_size)
-            == "vllm"
+            and self.attn_backend == "vllm"
         )
         self.decoder = model.decoder
         self.decode_step = None
@@ -151,6 +153,7 @@ class ModelRunner:
             attn = layer.encoder_attn
             attn.encoder_kv_cache.pop(request_id, None)
             attn.cross_staged = None
+            attn.cross_staged_key = None
 
     def _prepare(self, seqs):
         """Allocate KV blocks and build input_ids, positions, and Context tensors for the step."""
@@ -167,10 +170,8 @@ class ModelRunner:
 
         input_ids, positions, new_slots = [], [], []
         context_lens, seq_block_tables = [], []
-        is_prefill = True
         for seq in seqs:
             num_new = len(seq.token_ids) - seq.num_cached_tokens
-            is_prefill &= seq.num_cached_tokens == 0
             self.block_manager.ensure_capacity(seq, num_new, self._copy_block)
             start = seq.num_cached_tokens
             for pos in range(start, start + num_new):
@@ -189,7 +190,6 @@ class ModelRunner:
             self.device, non_blocking=True
         )
         fields = {
-            "is_prefill": is_prefill,
             "context_lens": to_dev(context_lens, torch.int32),
             "block_tables": to_dev(padded, torch.int32),
             "slot_mapping": to_dev(new_slots, torch.int64),
@@ -213,6 +213,12 @@ class ModelRunner:
                 hidden = self.graph.replay(len(seqs), input_ids, positions, fields)
                 return self.model.compute_logits(hidden)
 
+        if self.attn_backend == "vllm":
+            # Stage the paged encoder K/V outside the compiled graph; the opaque
+            # cross-attention op reads it from the Context at call time.
+            fields["cross_staged"] = attention.stage_cross(
+                self.decoder_layers, fields["request_ids"]
+            )
         set_context(**fields)
         with self._inductor_ctx():
             # model.forward is decoder + lm head, so freezing packs both.

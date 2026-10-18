@@ -25,12 +25,11 @@ Run:  PYTHONPATH=. python benchmarks/attn_backend.py                # both
 import argparse
 import sys
 import time
-from types import SimpleNamespace
 
 import torch
 
 from fastencdec.config import default_block_size
-from fastencdec.layers import attention
+from fastencdec.layers import attention, cpu_attn
 from fastencdec.utils.context import set_context
 
 HEADS, HEAD_DIM = 16, 64  # bart-large-cnn
@@ -64,19 +63,19 @@ def _call(variant, fn):
 
 # --------------------------------------------------------------- kernel section
 def _self_case(num_seqs, ctx_len, block_size, dtype):
-    """Context + tensors for one paged self-attention call (one new token each)."""
+    """Tensors for one paged self-attention call (one new token per sequence)."""
     pages = (ctx_len + block_size - 1) // block_size
     blocks = torch.arange(num_seqs * pages, dtype=torch.int32).reshape(num_seqs, pages)
     slots = (
         blocks[:, (ctx_len - 1) // block_size].long() * block_size
         + (ctx_len - 1) % block_size
     )
+    lens = torch.full((num_seqs,), ctx_len, dtype=torch.int32)
     shape = attention.self_cache_shape(
         num_seqs * pages, block_size, HEADS, HEAD_DIM, torch.device("cpu"), dtype
     )
     set_context(
-        is_prefill=False,
-        context_lens=torch.full((num_seqs,), ctx_len, dtype=torch.int32),
+        context_lens=lens,
         block_tables=blocks,
         slot_mapping=slots,
         request_ids=None,
@@ -89,57 +88,56 @@ def _self_case(num_seqs, ctx_len, block_size, dtype):
         torch.randn(num_seqs, HEADS, HEAD_DIM, dtype=dtype),
         torch.zeros(shape, dtype=dtype),
         torch.zeros(shape, dtype=dtype),
+        slots,
+        blocks,
+        lens,
     )
 
 
-def _cross_case(num_seqs, enc_len, dtype):
-    """Context + layer stand-in for one cross-attention call."""
-    layer = SimpleNamespace(
-        encoder_kv_cache={
-            i: (
-                torch.randn(HEADS, enc_len, HEAD_DIM, dtype=dtype),
-                torch.randn(HEADS, enc_len, HEAD_DIM, dtype=dtype),
-            )
-            for i in range(num_seqs)
-        },
-        cross_staged=None,
-        num_heads=HEADS,
-        head_dim=HEAD_DIM,
+def _cross_case(num_seqs, enc_len, block_size, dtype):
+    """Dense query + per-request encoder K/V, plus the vLLM staged paged cache."""
+    kv_cache = {
+        i: (
+            torch.randn(HEADS, enc_len, HEAD_DIM, dtype=dtype),
+            torch.randn(HEADS, enc_len, HEAD_DIM, dtype=dtype),
+        )
+        for i in range(num_seqs)
+    }
+    request_ids = list(range(num_seqs))
+    staged = attention.stage_cross_kv(kv_cache, request_ids, block_size, "vllm")
+    return (
+        torch.randn(num_seqs, HEADS, HEAD_DIM, dtype=dtype),
+        kv_cache,
+        request_ids,
+        staged,
     )
-    set_context(
-        is_prefill=False,
-        context_lens=torch.ones(num_seqs, dtype=torch.int32),
-        block_tables=None,
-        slot_mapping=None,
-        request_ids=list(range(num_seqs)),
-        cross_cache_seqlens=None,
-        cross_block_tables=None,
-    )
-    return torch.randn(num_seqs, HEADS, HEAD_DIM, dtype=dtype), layer
 
 
 def _time_self(variant, num_seqs, ctx_len, block_size, dtype, scale, iters):
-    q, k, v, k_cache, v_cache = _self_case(num_seqs, ctx_len, block_size, dtype)
-    return _timed(
-        lambda: _call(
-            variant,
-            lambda: attention.decoder_self_attention(
-                q, k, v, k_cache, v_cache, scale, block_size
-            ),
-        ),
-        iters,
+    q, k, v, k_cache, v_cache, slots, blocks, lens = _self_case(
+        num_seqs, ctx_len, block_size, dtype
     )
+    if variant == "vllm":
+        run = lambda: cpu_attn.self_attention(
+            q, k, v, k_cache, v_cache, slots, blocks, lens, scale
+        )
+    else:
+        run = lambda: attention.decoder_self_attention(
+            q, k, v, k_cache, v_cache, scale, block_size
+        )
+    return _timed(lambda: _call(variant, run), iters)
 
 
 def _time_cross(variant, num_seqs, enc_len, block_size, dtype, scale, iters):
-    q, layer = _cross_case(num_seqs, enc_len, dtype)
-    return _timed(
-        lambda: _call(
-            variant,
-            lambda: attention.decoder_cross_attention(q, layer, scale, block_size),
-        ),
-        iters,
-    )
+    q, kv_cache, request_ids, staged = _cross_case(num_seqs, enc_len, block_size, dtype)
+    if variant == "vllm":
+        k_cache, v_cache, block_table, cache_seqlens = staged
+        run = lambda: cpu_attn.cross_attention(
+            q, k_cache, v_cache, block_table, cache_seqlens, scale
+        )
+    else:
+        run = lambda: attention.cross_sdpa_batched(q, kv_cache, request_ids, scale)
+    return _timed(lambda: _call(variant, run), iters)
 
 
 def kernel_section(dtype, block_size, iters):

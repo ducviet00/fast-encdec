@@ -91,6 +91,57 @@ def first_step_logits(model, backend, requests, block_size, dtype):
     return engine.runner.run(engine.scheduler.schedule())
 
 
+def mixed_batch_logits(model, backend, requests, block_size, dtype):
+    """Step an engine whose request set changes as requests finish."""
+    from fastencdec.layers.logits_processor import LogitsProcessor
+
+    config = Config(
+        num_blocks=256,
+        block_size=block_size,
+        max_num_seqs=2,
+        dtype=dtype,
+        attn_backend=backend,
+    )
+    engine = LLMEngine(model, config, eos_token_id=EOS)
+    params = SamplingParams(max_tokens=5, temperature=0.0)
+    engine._logits_processor = LogitsProcessor(
+        params,
+        vocab_size=model.lm_head.out_features,
+        device=torch.device("cpu"),
+        max_length=1 + params.max_tokens,
+        begin_index=1,
+        is_beam=False,
+    )
+    for i, (encoder_ids, decoder_ids, pixel_values) in enumerate(requests):
+        engine.scheduler.add(
+            Sequence(i, decoder_ids, encoder_ids, params, pixel_values)
+        )
+    logits = []
+    while not engine.is_finished():
+        seqs = engine.scheduler.schedule()
+        step_logits = engine.runner.run(seqs)
+        logits.append(step_logits)
+        engine._postprocess(seqs, step_logits)
+    return logits
+
+
+def mixed_batch(model, requests, block_size, dtype):
+    """The staged cross cache must follow a changing request set."""
+    extra = requests + [
+        (torch.randint(3, VOCAB, (21,)).tolist(), [1], None),
+        (torch.randint(3, VOCAB, (11,)).tolist(), [1], None),
+    ]
+    ref = mixed_batch_logits(model, "sdpa", extra, block_size, dtype)
+    got = mixed_batch_logits(model, "vllm", extra, block_size, dtype)
+    diff = max((a - b).abs().max().item() for a, b in zip(ref, got))
+    ok = len(ref) == len(got) and diff <= 1e-3
+    print(
+        f"[{'OK' if ok else 'MISMATCH'}] mixed batch: {len(ref)} steps, "
+        f"max|diff|={diff:.2e}"
+    )
+    return 0 if ok else 1
+
+
 def main():
     if cpu_attn.select_isa(torch.float32, 32, 32) is None:
         print("SKIP: no kernel for this machine")
@@ -129,6 +180,7 @@ def main():
                 f"[{status}] dtype={dtype} isa={isa} block_size={block_size} "
                 f"logits max|diff|={diff:.2e} (tol {tol})"
             )
+    failures += mixed_batch(model, requests, 32, torch.float32)
     if failures:
         raise SystemExit(f"{failures} mismatches")
 
