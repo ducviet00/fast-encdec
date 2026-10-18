@@ -29,7 +29,7 @@ import time
 import torch
 
 from fastencdec.config import default_block_size
-from fastencdec.layers import attention
+from fastencdec.layers import attention, cpu_ops
 from fastencdec.utils.context import set_context
 
 HEADS, HEAD_DIM = 16, 64  # bart-large-cnn
@@ -113,7 +113,7 @@ def _cross_case(num_seqs, enc_len, dtype):
         }
     )
     # The opaque CPU-kernel op resolves the layer through this handle.
-    attention.register_cross_layer(layer)
+    cpu_ops.register_cross_layer(layer)
     set_context(
         is_prefill=False,
         context_lens=torch.ones(num_seqs, dtype=torch.int32),

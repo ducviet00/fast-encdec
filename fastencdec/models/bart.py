@@ -9,8 +9,8 @@ from ..layers.attention import (
     decoder_cross_attention,
     decoder_self_attention,
     encoder_self_attention,
-    register_cross_layer,
 )
+from ..layers.cpu_ops import register_cross_layer
 
 ACT2FN = {"gelu": F.gelu}
 
