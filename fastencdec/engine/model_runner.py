@@ -42,51 +42,10 @@ class ModelRunner:
         self.attn_backend = attention.backend(
             self.device, dtype, self.head_dim, self.block_size
         )
-        # Frozen torch.compile is the whole GEMM story on CPU: the paged attention
-        # ops are opaque custom ops, so Dynamo traces the decoder + lm head as one
-        # graph, and Inductor freezing packs every GEMM (decoder, lm head, and the
-        # encoder's) into oneDNN blocked kernels. Needs the vendored kernel: the
-        # SDPA fallback reads the per-step Context, which tracing would bake in.
-        self.compile_decoder = (
-            compile
-            and self.device.type == "cpu"
-            and dtype in (torch.float32, torch.bfloat16)
-            and self.attn_backend == "vllm"
-        )
         self.decoder = model.decoder
-        self.decode_step = None
-        self.encode_step = None
-        self.mm_step = None
-        if self.compile_decoder:
-            # Symbolic batch / encoder length keeps memory bounded (freezing
-            # duplicates the packed weights per shape). Florence-2's tower is
-            # compiled on its own (static, see below) so the text encoder -
-            # whose length varies with the task prompt - stays dynamic.
-            global _COMPILED_RUNNERS
-            _COMPILED_RUNNERS += 1
-            # Dynamo falls back to eager once a frame has more than
-            # recompile_limit cache entries, and every engine adds entries
-            # (weights, batch-1 specialization). Grow the cap with the number of
-            # engines so a process holding several does not lose the packing.
-            torch._dynamo.config.recompile_limit = max(
-                torch._dynamo.config.recompile_limit, 2 * _COMPILED_RUNNERS + 4
-            )
-            # Four parallel workers compile fast without the GB-scale memory
-            # spike of the default (thread-count) worker pool on small boxes.
-            torch._inductor.config.compile_threads = min(
-                4, torch._inductor.config.compile_threads
-            )
-            self.decode_step = torch.compile(self.model, dynamic=True)
-            self.encode_step = torch.compile(self.model.encode, dynamic=True)
-        if hasattr(self.model, "get_image_features") and compile_mm_encoder:
-            # Inductor's dynamic-conv lowering mis-strides DaViT's windowed
-            # feature maps, so the tower keeps static shapes (one graph per
-            # image shape, which is fixed for a real workload).
-            self.mm_step = torch.compile(self.model.get_image_features, dynamic=False)
+        self._setup_compile(compile, compile_mm_encoder)
         self.use_cudagraph = use_cudagraph and (
-            self.device.type == "cuda"
-            and attention.backend(self.device, dtype, self.head_dim, self.block_size)
-            == "flash"
+            self.device.type == "cuda" and self.attn_backend == "flash"
         )
         # One extra cache row serves as scratch for padded CUDA-graph rows.
         rows = block_manager.num_blocks + int(self.use_cudagraph)
@@ -103,6 +62,45 @@ class ModelRunner:
             DecodeGraphRunner(self, max_num_seqs) if self.use_cudagraph else None
         )
 
+    def _setup_compile(self, compile: bool, compile_mm_encoder: bool) -> None:
+        """Build the frozen CPU graphs (and the vision tower) when enabled.
+
+        The paged attention ops are opaque custom ops, so Inductor traces the
+        decoder + lm head as one graph and freezing packs every GEMM. The SDPA
+        fallback reads the per-step Context and must not be compiled, hence the
+        ``vllm`` gate. See ``TORCH_COMPILE_FREEZING.md``.
+        """
+        self.compile_decoder = (
+            compile
+            and self.device.type == "cpu"
+            and self.dtype in (torch.float32, torch.bfloat16)
+            and self.attn_backend == "vllm"
+        )
+        self.decode_step = None
+        self.encode_fn = self.model.encode
+        self.mm_step = None
+        if self.compile_decoder:
+            global _COMPILED_RUNNERS
+            _COMPILED_RUNNERS += 1
+            # Every engine adds Dynamo cache entries (its weights and the batch-1
+            # specialization); grow the per-frame budget with the engine count.
+            torch._dynamo.config.recompile_limit = max(
+                torch._dynamo.config.recompile_limit, 2 * _COMPILED_RUNNERS + 4
+            )
+            # Four workers compile fast without the GB-scale memory spike of the
+            # default thread-count pool on small boxes.
+            torch._inductor.config.compile_threads = min(
+                4, torch._inductor.config.compile_threads
+            )
+            # Symbolic shapes keep one artifact per frame: freezing duplicates the
+            # packed weights per static shape. The Florence-2 tower is separate.
+            self.decode_step = torch.compile(self.model, dynamic=True)
+            self.encode_fn = torch.compile(self.model.encode, dynamic=True)
+        if hasattr(self.model, "get_image_features") and compile_mm_encoder:
+            # Dynamic convs mis-stride DaViT's windowed maps, so the tower keeps
+            # static shapes (one graph per image shape, fixed in practice).
+            self.mm_step = torch.compile(self.model.get_image_features, dynamic=False)
+
     def _copy_block(self, src: int, dst: int) -> None:
         """Copy KV cache contents from block src to dst across all decoder layers."""
         for layer in self.cache_layers:
@@ -118,7 +116,7 @@ class ModelRunner:
                 None if seq.pixel_values is None else tuple(seq.pixel_values.shape)
             )
             groups[(len(seq.encoder_token_ids), px_shape)].append(seq)
-        encode = self.encode_step or self.model.encode
+        encode = self.encode_fn
         for group in groups.values():
             ids = torch.tensor(
                 [s.encoder_token_ids for s in group],
