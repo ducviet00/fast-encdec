@@ -20,8 +20,8 @@ uv sync --extra cpu      # or --extra cu130 for CUDA 13
 ## Quick Start
 
 See `examples/` for runnable scripts. The API mirrors vLLM's; `LLM` also takes
-`device`, `dtype`, `num_blocks`, `block_size`, `attn_backend`, `use_cudagraph`
-and `compile_mm_encoder`:
+`device`, `dtype`, `num_blocks`, `block_size`, `attn_backend`, `use_cudagraph`,
+`compile` (frozen `torch.compile` on CPU, default on) and `compile_mm_encoder`:
 
 ```python
 from fastencdec import LLM, SamplingParams

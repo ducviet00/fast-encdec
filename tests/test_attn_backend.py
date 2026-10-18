@@ -117,6 +117,29 @@ def backend_switch(model, requests, block_size, dtype):
     return 0 if ok else 1
 
 
+def compile_off(model, requests, block_size, dtype):
+    """compile=False must keep the CPU decoder eager and match the compiled path."""
+    config = Config(
+        num_blocks=256,
+        block_size=block_size,
+        max_num_seqs=8,
+        dtype=dtype,
+        attn_backend="vllm",
+        compile=False,
+    )
+    engine = LLMEngine(model, config, eos_token_id=EOS)
+    params = SamplingParams(max_tokens=6, temperature=0.0)
+    eager = [engine.results[i] for i in engine.generate(requests, params)]
+    compiled = decode(model, "vllm", requests, params, block_size, dtype)
+    ok = (
+        not engine.runner.compile_decoder
+        and engine.runner.decode_step is None
+        and eager == compiled
+    )
+    print(f"[{'OK' if ok else 'MISMATCH'}] compile=False stays eager: {eager}")
+    return 0 if ok else 1
+
+
 def main():
     if cpu_attn.select_isa(torch.float32, 32, 32) is None:
         print("SKIP: no kernel for this machine")
@@ -156,6 +179,7 @@ def main():
                 f"logits max|diff|={diff:.2e} (tol {tol})"
             )
     failures += backend_switch(model, requests, 32, torch.float32)
+    failures += compile_off(model, requests, 32, torch.float32)
     if failures:
         raise SystemExit(f"{failures} mismatches")
 

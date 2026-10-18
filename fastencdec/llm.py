@@ -32,6 +32,7 @@ class LLM:
         attn_backend: str = "auto",
         device: str = "cpu",
         use_cudagraph: bool = True,
+        compile: bool = True,
         compile_mm_encoder: bool = True,
     ):
         hf_config = AutoConfig.from_pretrained(model_path)
@@ -71,6 +72,7 @@ class LLM:
             attn_backend=attn_backend,
             device=device,
             use_cudagraph=use_cudagraph,
+            compile=compile,
             compile_mm_encoder=compile_mm_encoder,
         )
         self.engine = LLMEngine(self.model, config, eos_token_id=self.eos_token_id)
