@@ -14,16 +14,6 @@ from ..layers.attention import (
 ACT2FN = {"gelu": F.gelu}
 
 
-def _add_layer_norm(norm, residual, x):
-    """Apply residual addition followed by layer normalization."""
-    return norm(residual + x)
-
-
-def _activation_linear(linear, activation, x):
-    """Apply a linear projection followed by an activation function."""
-    return activation(linear(x))
-
-
 class BartLearnedPositionalEmbedding(nn.Embedding):
     """Learned positional embedding that applies BART's +2 position offset."""
 
@@ -189,11 +179,11 @@ class BartEncoderLayer(nn.Module):
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Run one BART encoder layer (self-attention + FFN with post-norm residuals)."""
-        hidden_states = _add_layer_norm(
-            self.self_attn_layer_norm, hidden_states, self.self_attn(hidden_states)
+        hidden_states = self.self_attn_layer_norm(
+            hidden_states + self.self_attn(hidden_states)
         )
-        ffn = self.fc2(_activation_linear(self.fc1, self.activation_fn, hidden_states))
-        return _add_layer_norm(self.final_layer_norm, hidden_states, ffn)
+        ffn = self.fc2(self.activation_fn(self.fc1(hidden_states)))
+        return self.final_layer_norm(hidden_states + ffn)
 
 
 class BartDecoderLayer(nn.Module):
@@ -221,16 +211,14 @@ class BartDecoderLayer(nn.Module):
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Run one BART decoder layer (self-attention + cross-attention + FFN)."""
-        hidden_states = _add_layer_norm(
-            self.self_attn_layer_norm, hidden_states, self.self_attn(hidden_states)
+        hidden_states = self.self_attn_layer_norm(
+            hidden_states + self.self_attn(hidden_states)
         )
-        hidden_states = _add_layer_norm(
-            self.encoder_attn_layer_norm,
-            hidden_states,
-            self.encoder_attn(hidden_states),
+        hidden_states = self.encoder_attn_layer_norm(
+            hidden_states + self.encoder_attn(hidden_states)
         )
-        ffn = self.fc2(_activation_linear(self.fc1, self.activation_fn, hidden_states))
-        return _add_layer_norm(self.final_layer_norm, hidden_states, ffn)
+        ffn = self.fc2(self.activation_fn(self.fc1(hidden_states)))
+        return self.final_layer_norm(hidden_states + ffn)
 
 
 class BartEncoder(nn.Module):
