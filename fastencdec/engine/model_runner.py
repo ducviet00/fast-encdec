@@ -24,6 +24,7 @@ class ModelRunner:
         device="cpu",
         max_num_seqs=32,
         use_cudagraph=True,
+        compile=True,
         compile_mm_encoder=True,
     ):
         self.device = torch.device(device)
@@ -47,7 +48,8 @@ class ModelRunner:
         # encoder's) into oneDNN blocked kernels. Needs the vendored kernel: the
         # SDPA fallback reads the per-step Context, which tracing would bake in.
         self.compile_decoder = (
-            self.device.type == "cpu"
+            compile
+            and self.device.type == "cpu"
             and dtype in (torch.float32, torch.bfloat16)
             and self.attn_backend == "vllm"
         )
