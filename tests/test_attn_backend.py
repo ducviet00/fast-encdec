@@ -23,7 +23,7 @@ import torch
 from fastencdec.config import Config
 from fastencdec.engine.llm_engine import LLMEngine
 from fastencdec.engine.sequence import Sequence
-from fastencdec.layers import cpu_attn
+from fastencdec.layers import attention, cpu_attn
 from fastencdec.models.bart import BartForConditionalGeneration
 from fastencdec.sampling_params import SamplingParams
 
@@ -142,6 +142,32 @@ def mixed_batch(model, requests, block_size, dtype):
     return 0 if ok else 1
 
 
+def backend_switch(model, requests, block_size, dtype):
+    """A compiled engine must fall back to eager when the backend is overridden."""
+    config = Config(
+        num_blocks=256,
+        block_size=block_size,
+        max_num_seqs=8,
+        dtype=dtype,
+        attn_backend="vllm",
+    )
+    engine = LLMEngine(model, config, eos_token_id=EOS)
+    if not engine.runner.compile_decoder:
+        print("SKIP: compiled path unavailable")
+        return 0
+    params = SamplingParams(max_tokens=6, temperature=0.0)
+    first = [engine.results[i] for i in engine.generate(requests, params)]
+    # What benchmarks/attn_backend.py does to compare backends on one engine.
+    attention.set_backend("sdpa")
+    try:
+        got = [engine.results[i] for i in engine.generate(requests, params)]
+    finally:
+        attention.set_backend("auto")
+    ok = first == got
+    print(f"[{'OK' if ok else 'MISMATCH'}] backend switch after compile: {got}")
+    return 0 if ok else 1
+
+
 def main():
     if cpu_attn.select_isa(torch.float32, 32, 32) is None:
         print("SKIP: no kernel for this machine")
@@ -181,6 +207,7 @@ def main():
                 f"logits max|diff|={diff:.2e} (tol {tol})"
             )
     failures += mixed_batch(model, requests, 32, torch.float32)
+    failures += backend_switch(model, requests, 32, torch.float32)
     if failures:
         raise SystemExit(f"{failures} mismatches")
 
