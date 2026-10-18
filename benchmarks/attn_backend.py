@@ -25,7 +25,6 @@ Run:  PYTHONPATH=. python benchmarks/attn_backend.py                # both
 import argparse
 import sys
 import time
-from types import SimpleNamespace
 
 import torch
 
@@ -92,20 +91,29 @@ def _self_case(num_seqs, ctx_len, block_size, dtype):
     )
 
 
+class _CrossLayer:
+    """Cross-attention layer stand-in; weak-referenceable for the op registry."""
+
+    def __init__(self, encoder_kv_cache):
+        self.encoder_kv_cache = encoder_kv_cache
+        self.cross_staged = None
+        self.num_heads = HEADS
+        self.head_dim = HEAD_DIM
+
+
 def _cross_case(num_seqs, enc_len, dtype):
     """Context + layer stand-in for one cross-attention call."""
-    layer = SimpleNamespace(
-        encoder_kv_cache={
+    layer = _CrossLayer(
+        {
             i: (
                 torch.randn(HEADS, enc_len, HEAD_DIM, dtype=dtype),
                 torch.randn(HEADS, enc_len, HEAD_DIM, dtype=dtype),
             )
             for i in range(num_seqs)
-        },
-        cross_staged=None,
-        num_heads=HEADS,
-        head_dim=HEAD_DIM,
+        }
     )
+    # The opaque CPU-kernel op resolves the layer through this handle.
+    attention.register_cross_layer(layer)
     set_context(
         is_prefill=False,
         context_lens=torch.ones(num_seqs, dtype=torch.int32),

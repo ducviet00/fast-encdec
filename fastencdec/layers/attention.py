@@ -444,9 +444,14 @@ def decoder_cross_attention(query, layer, scale, block_size):
     if backend == "vllm" and ctx.cross_block_tables is None:
         # Opaque custom op: staging reads the layer's request-keyed state, so it runs
         # outside the compiled graph (see _cpu_vllm_cross_attention).
-        return _cpu_vllm_cross_attention(
-            query, scale, layer.cpu_cross_handle, block_size
-        )
+        handle = getattr(layer, "cpu_cross_handle", None)
+        if handle is None:
+            raise RuntimeError(
+                "cross-attention layer is not registered for the vLLM CPU kernel; "
+                "construct it as BartDecoderCrossAttention or call "
+                "register_cross_layer() on it"
+            )
+        return _cpu_vllm_cross_attention(query, scale, handle, block_size)
     if ctx.cross_block_tables is not None:
         # CUDA-graph path uses preallocated static cross_cache and block tables.
         k_cache, v_cache = layer.cross_cache
