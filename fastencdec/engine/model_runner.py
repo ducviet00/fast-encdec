@@ -176,6 +176,15 @@ class ModelRunner:
         context_lens, seq_block_tables = [], []
         for seq in seqs:
             num_new = len(seq.token_ids) - seq.num_cached_tokens
+            if num_new != 1:
+                # The attention ops assume one query token per sequence per step
+                # (the kernel's query_start_loc is arange(num_seqs + 1)), so a
+                # longer decoder prompt cannot be prefilled in one step.  LLMEngine
+                # rejects it up front; this catches a hand-built Sequence too.
+                raise ValueError(
+                    "each step must feed exactly one token per sequence, but "
+                    f"request {seq.request_id} feeds {num_new}"
+                )
             self.block_manager.ensure_capacity(seq, num_new, self._copy_block)
             start = seq.num_cached_tokens
             for pos in range(start, start + num_new):

@@ -175,8 +175,9 @@ out of the compiled graph.
    `_prepare`, `num_cached_tokens == len(token_ids)`; a sampled token is then
    appended, so between steps there is exactly one uncached token. Prefill (a
    fresh sequence) feeds its single decoder prompt token: **every step feeds
-   exactly one token per sequence**, which the attention ops assume (and
-   `generate` rejects a longer decoder prompt).
+   exactly one token per sequence**, which the attention ops assume (`generate`
+   rejects a longer decoder prompt, and `ModelRunner._prepare` raises if a
+   hand-built `Sequence` would feed more than one).
 2. **Positions** are absolute indices into `token_ids` (0-based).
    `BartLearnedPositionalEmbedding` adds the `+2` BART offset internally.
 3. **Paged self-attn cache.** `layers/attention.py` picks the layout the active

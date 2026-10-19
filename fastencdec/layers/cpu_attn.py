@@ -213,6 +213,8 @@ def self_attention(
     isa = _isa(query.dtype, k_cache.shape[2], query.shape[-1])
     require().reshape_and_cache(key, value, k_cache, v_cache, slot_mapping, isa)
     # After the write every prefill row has length 1 and every decode row > 1.
+    # A fresh sequence only has length 1 if its decoder prompt is a single
+    # token -- the runner enforces that (see ModelRunner._prepare).
     dynamic_causal = (context_lens == 1).to(torch.int32)
     return _paged_attention(
         query,
