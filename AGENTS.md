@@ -500,7 +500,8 @@ on this box with the same kind of workload.
   graphs**: `model.forward` (decoder + lm head, one graph — lm-head GEMMs pack
   too) via opaque attention custom ops, and `model.encode` for the encoder
   (vision tower included for Florence-2).  (`Config.compile=False` /
-  `LLM(compile=False)` keeps the decoder eager, e.g. for backend comparisons.)
+  `LLM(compile=False)` is a full opt-out: the decoder, the encoder and the
+  vision tower all stay eager, e.g. for backend comparisons.)
   Inductor's freezing pass packs all
   of them into `_linear_pointwise` (oneDNN blocked weights; ACL on aarch64),
   the same op the old manual prepack fed; the artifact also fuses pointwise
@@ -577,8 +578,9 @@ on this box with the same kind of workload.
   tower + projector (~1.2x there, ~1.13x end-to-end after the vendored eager
   tower).  It is a `Config` field consumed by `ModelRunner`, which compiles the
   tower on its own graph on every device — static shapes, one graph per image
-  shape — and always when the flag is set, including on CPU where the attention
-  backend is SDPA and nothing else compiles (see the CPU GEMM packing gotcha).
+  shape — and always when the flag is set *and* `compile` is on, including on
+  CPU where the attention backend is SDPA and nothing else compiles (see the
+  CPU GEMM packing gotcha).  `compile=False` wins over it.
   Inductor's BF16 fusion shifts outputs, so greedy tokens can diverge from HF;
   pass `compile_mm_encoder=False` for exact parity or to avoid the per-shape
   compile latency (it compiles once per image shape on first use).

@@ -69,6 +69,10 @@ class ModelRunner:
         decoder + lm head as one graph and freezing packs every GEMM. The SDPA
         fallback reads the per-step Context and must not be compiled, hence the
         ``vllm`` gate. See ``TORCH_COMPILE_FREEZING.md``.
+
+        ``compile=False`` is a full opt-out: it leaves the decoder, the encoder
+        and the vision tower eager. ``compile_mm_encoder`` only narrows the
+        tower further (it is meaningless without ``compile``).
         """
         self.compile_decoder = (
             compile
@@ -96,7 +100,7 @@ class ModelRunner:
             # packed weights per static shape. The Florence-2 tower is separate.
             self.decode_step = torch.compile(self.model, dynamic=True)
             self.encode_fn = torch.compile(self.model.encode, dynamic=True)
-        if hasattr(self.model, "get_image_features") and compile_mm_encoder:
+        if compile and hasattr(self.model, "get_image_features") and compile_mm_encoder:
             # Dynamic convs mis-stride DaViT's windowed maps, so the tower keeps
             # static shapes (one graph per image shape, fixed in practice).
             self.mm_step = torch.compile(self.model.get_image_features, dynamic=False)
