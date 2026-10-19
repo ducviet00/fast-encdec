@@ -137,7 +137,8 @@ ModelRunner.run(seqs)
     fresh = [seq for seq in seqs if seq.num_cached_tokens == 0]
     _encode(fresh)                # batched encoder (grouped by length/image shape) -> dense cross-attn K/V
     _prepare(seqs)                # input_ids/positions/slot_mapping; ensure blocks/CoW
-    set_context(...)              # Context: is_prefill, context_lens, block_tables, slot_mapping, request_ids
+    set_context(...)              # Context: context_lens, block_tables, slot_mapping,
+                                  #   request_ids, cross_staged (vLLM CPU path only)
     decoder forward               # ops dispatch to vLLM-CPU / flash-attn2-CUDA / SDPA
                                   # (or, with use_cudagraph, replay a captured decode graph)
     compute_logits                # one row per sequence (one new token each)
