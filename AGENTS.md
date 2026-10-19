@@ -335,10 +335,10 @@ hand-edit or guess.**
 
 | config | ours ms | ours tok/s | hf ms | hf tok/s | speedup |
 |---|---:|---:|---:|---:|---:|
-| batch=1, beams=1, bf16 | 3438 | 74.5 | 6071 | 42.2 | 1.77x |
-| batch=8, beams=1, bf16 | 5021 | 407.9 | 9102 | 225.0 | 1.81x |
-| batch=8, beams=4, bf16 | 7881 | 259.9 | 31943 | 64.1 | 4.05x |
-| batch=8, beams=1, fp32 | 8774 | 233.4 | 25067 | 81.7 | 2.86x |
+| batch=1, beams=1, bf16 | 3585 | 71.4 | 5637 | 45.4 | 1.57x |
+| batch=8, beams=1, bf16 | 5200 | 393.9 | 9027 | 226.9 | 1.74x |
+| batch=8, beams=4, bf16 | 8050 | 254.4 | 31663 | 64.7 | 3.93x |
+| batch=8, beams=1, fp32 | 8756 | 233.9 | 24979 | 82.0 | 2.85x |
 
 Mean of two runs with a cold Inductor cache (`/tmp/torchinductor_*` and
 `~/.cache/torch_extensions` removed first).  This recording is the frozen
@@ -349,7 +349,7 @@ vision-tower graph, with Inductor freezing packing every GEMM; the old manual
 compiles too and verifies token-exact vs HF
 (`verify_parity.py --dtype float32`).  Absolute times shift between recordings
 (~5% with this laptop's clock, worst in the latency-bound `batch=1` row — the
-two runs read 3448/3428 ms there), so only the within-run speedup is meaningful;
+two runs read 3572/3599 ms there), so only the within-run speedup is meaningful;
 the `beams=4` win over HF (4x) is the stable feature of the table.
 
 Built with the vendored kernel — if `csrc/` fails to build (no `ninja`, see the
