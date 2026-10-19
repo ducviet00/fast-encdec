@@ -18,6 +18,11 @@ def set_backend(name: str) -> None:
     _PREFER = name
 
 
+def preferred() -> str:
+    """Return the backend preference set by ``set_backend`` ('auto' unless overridden)."""
+    return _PREFER
+
+
 def _paged_backend(device, dtype, head_dim, block_size) -> str:
     """Resolve the active paged attention backend for (device, dtype, head_dim, block_size)."""
     if _PREFER == "flash" and device.type != "cuda":

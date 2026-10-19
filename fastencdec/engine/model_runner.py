@@ -220,6 +220,15 @@ class ModelRunner:
                 self.decoder_layers, fields["request_ids"]
             )
         set_context(**fields)
+        if self.decode_step is not None and attention.preferred() not in (
+            "auto",
+            "vllm",
+        ):
+            # The backend was overridden after this runner compiled (a benchmark
+            # comparing backends, or a second engine setting a new preference).
+            # The SDPA path reads the per-step Context, which must stay out of
+            # the graph, so run this step eagerly instead of re-tracing.
+            return self.model(input_ids, positions)
         with self._inductor_ctx():
             # model.forward is decoder + lm head, so freezing packs both.
             if self.decode_step is None:
