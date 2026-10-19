@@ -156,6 +156,8 @@ def kernel_section(dtype, block_size, iters):
     print(
         "note: on CPU the sdpa/eager columns are our per-sequence fallback loop\n"
         "      (CUDA uses the batched one), so they include that Python overhead;\n"
+        "      the vllm column calls the kernel entry point directly, so it does\n"
+        "      not pay the op's backend resolution and Context read;\n"
         "      the e2e section compares against HF's batched sdpa/eager instead."
     )
     cases = [
