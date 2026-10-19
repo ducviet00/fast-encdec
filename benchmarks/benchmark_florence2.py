@@ -279,6 +279,9 @@ def main():
                 }
             )
             del llm, hf
+            # Compiled engines stay alive in Dynamo's caches; drop them so the
+            # next config does not accumulate packed weight copies.
+            torch._dynamo.reset()
 
     if args.json:
         with open(args.json, "w") as f:
