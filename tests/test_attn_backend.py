@@ -15,6 +15,7 @@ Run with:  PYTHONPATH=. python tests/test_attn_backend.py
 
 import os
 import sys
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -160,11 +161,19 @@ def backend_switch(model, requests, block_size, dtype):
     # What benchmarks/attn_backend.py does to compare backends on one engine.
     attention.set_backend("sdpa")
     try:
-        got = [engine.results[i] for i in engine.generate(requests, params)]
+        with mock.patch.object(
+            attention, "stage_cross", wraps=attention.stage_cross
+        ) as staged:
+            got = [engine.results[i] for i in engine.generate(requests, params)]
     finally:
         attention.set_backend("auto")
-    ok = first == got
-    print(f"[{'OK' if ok else 'MISMATCH'}] backend switch after compile: {got}")
+    # The SDPA path reads the dense encoder K/V directly, so the runner must
+    # not stage a paged copy of it for a backend that will not read it.
+    ok = first == got and not staged.called
+    print(
+        f"[{'OK' if ok else 'MISMATCH'}] backend switch after compile: {got} "
+        f"(staged={staged.call_count})"
+    )
     return 0 if ok else 1
 
 
