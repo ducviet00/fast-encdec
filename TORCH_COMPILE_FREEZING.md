@@ -312,7 +312,22 @@ single-holed and the FX-cache rules — only its last two bullets (the
 `exclude=` parameter, "compile is bf16-only") are superseded: `packed_linear`
 was deleted entirely and fp32 compiles now too.
 
+A third round (the "clean tensor API" refactor) moved the op bodies out of
+`layers/attention.py` into `layers/cpu_ops.py` and replaced the layer registry
+with per-step state the runner stages; §6.1's description of *those* two
+mechanisms is historical, and the note at the top of the section says so.
+
 ### 6.1 The landed state (compile_model=True, bf16 CPU) — second round
+
+> **Historical.** The cross-attention *layer registry* this section describes
+> (`register_cross_layer`, the weakref table, the int handle) has since been
+> removed, and the op bodies no longer live in `layers/attention.py`. The
+> current design: the ops are in `fastencdec/layers/cpu_ops.py`, the cross op
+> takes `(query, layer_idx, scale)`, and the staged encoder K/V it reads comes
+> from `Context.cross_staged`, which `ModelRunner.run` builds with
+> `attention.stage_cross` *before* the forward — outside the graph.  The
+> "register at `__init__` time" rule below still holds; the runner staging
+> satisfies it in a stronger way (no state is read from traced code at all).
 
 The remaining 53 pybind breaks were removed by wrapping the whole vLLM CPU
 attention branch in two opaque `torch.library.custom_op`s

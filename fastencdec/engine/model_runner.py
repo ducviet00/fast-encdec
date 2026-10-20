@@ -69,6 +69,10 @@ class ModelRunner:
         decoder + lm head as one graph and freezing packs every GEMM. The SDPA
         fallback reads the per-step Context and must not be compiled, hence the
         ``vllm`` gate. See ``TORCH_COMPILE_FREEZING.md``.
+
+        ``compile=False`` is a full opt-out: it leaves the decoder, the encoder
+        and the vision tower eager. ``compile_mm_encoder`` only narrows the
+        tower further (it is meaningless without ``compile``).
         """
         self.compile_decoder = (
             compile
@@ -96,7 +100,7 @@ class ModelRunner:
             # packed weights per static shape. The Florence-2 tower is separate.
             self.decode_step = torch.compile(self.model, dynamic=True)
             self.encode_fn = torch.compile(self.model.encode, dynamic=True)
-        if hasattr(self.model, "get_image_features") and compile_mm_encoder:
+        if compile and hasattr(self.model, "get_image_features") and compile_mm_encoder:
             # Dynamic convs mis-stride DaViT's windowed maps, so the tower keeps
             # static shapes (one graph per image shape, fixed in practice).
             self.mm_step = torch.compile(self.model.get_image_features, dynamic=False)
@@ -172,6 +176,15 @@ class ModelRunner:
         context_lens, seq_block_tables = [], []
         for seq in seqs:
             num_new = len(seq.token_ids) - seq.num_cached_tokens
+            if num_new != 1:
+                # The attention ops assume one query token per sequence per step
+                # (the kernel's query_start_loc is arange(num_seqs + 1)), so a
+                # longer decoder prompt cannot be prefilled in one step.  LLMEngine
+                # rejects it up front; this catches a hand-built Sequence too.
+                raise ValueError(
+                    "each step must feed exactly one token per sequence, but "
+                    f"request {seq.request_id} feeds {num_new}"
+                )
             self.block_manager.ensure_capacity(seq, num_new, self._copy_block)
             start = seq.num_cached_tokens
             for pos in range(start, start + num_new):
@@ -213,21 +226,27 @@ class ModelRunner:
                 hidden = self.graph.replay(len(seqs), input_ids, positions, fields)
                 return self.model.compute_logits(hidden)
 
-        if self.attn_backend == "vllm":
+        # The ops resolve their backend from the global preference, which a
+        # benchmark can change after this runner was built.  Ask the attention
+        # layer what the ops will do *now*, so the staging and the eager
+        # fallback below agree with them.
+        backend = attention.backend(
+            self.device, self.dtype, self.head_dim, self.block_size
+        )
+        if backend == "vllm":
             # Stage the paged encoder K/V outside the compiled graph; the opaque
             # cross-attention op reads it from the Context at call time.
             fields["cross_staged"] = attention.stage_cross(
                 self.decoder_layers, fields["request_ids"]
             )
         set_context(**fields)
-        if self.decode_step is not None and attention.preferred() not in (
-            "auto",
-            "vllm",
-        ):
+        if self.decode_step is not None and backend != "vllm":
             # The backend was overridden after this runner compiled (a benchmark
             # comparing backends, or a second engine setting a new preference).
-            # The SDPA path reads the per-step Context, which must stay out of
-            # the graph, so run this step eagerly instead of re-tracing.
+            # The compiled graph holds the vLLM op, so it no longer does what
+            # the ops would do now; the SDPA path reads the per-step Context,
+            # which must stay out of the graph, so run this step eagerly
+            # instead of re-tracing.
             return self.model(input_ids, positions)
         with self._inductor_ctx():
             # model.forward is decoder + lm head, so freezing packs both.

@@ -68,9 +68,9 @@ class BartEncoderSelfAttention(_BartAttentionBase):
         self,
         embed_dim: int,
         num_heads: int,
+        layer_idx: int,
         bias: bool = True,
         config=None,
-        layer_idx: int | None = None,
     ):
         super().__init__(embed_dim, num_heads)
         self.qkv_proj = nn.Linear(embed_dim, 3 * embed_dim, bias=bias)
@@ -100,9 +100,9 @@ class BartDecoderSelfAttention(_BartAttentionBase):
         self,
         embed_dim: int,
         num_heads: int,
+        layer_idx: int,
         bias: bool = True,
         config=None,
-        layer_idx: int | None = None,
     ):
         super().__init__(embed_dim, num_heads)
         self.qkv_proj = nn.Linear(embed_dim, 3 * embed_dim, bias=bias)
@@ -135,9 +135,9 @@ class BartDecoderCrossAttention(_BartAttentionBase):
         self,
         embed_dim: int,
         num_heads: int,
+        layer_idx: int,
         bias: bool = True,
         config=None,
-        layer_idx: int | None = None,
     ):
         super().__init__(embed_dim, num_heads)
         self.kv_proj = nn.Linear(embed_dim, 2 * embed_dim, bias=bias)
@@ -162,14 +162,14 @@ class BartDecoderCrossAttention(_BartAttentionBase):
 
 
 class BartEncoderLayer(nn.Module):
-    def __init__(self, config, layer_idx: int | None = None):
+    def __init__(self, config, layer_idx: int):
         super().__init__()
         self.embed_dim = config.d_model
         self.self_attn = BartEncoderSelfAttention(
             self.embed_dim,
             config.encoder_attention_heads,
+            layer_idx,
             config=config,
-            layer_idx=layer_idx,
         )
         self.self_attn_layer_norm = nn.LayerNorm(self.embed_dim)
         self.activation_fn = ACT2FN.get(config.activation_function, F.gelu)
@@ -187,22 +187,22 @@ class BartEncoderLayer(nn.Module):
 
 
 class BartDecoderLayer(nn.Module):
-    def __init__(self, config, layer_idx: int | None = None):
+    def __init__(self, config, layer_idx: int):
         super().__init__()
         self.embed_dim = config.d_model
         self.self_attn = BartDecoderSelfAttention(
             self.embed_dim,
             config.decoder_attention_heads,
+            layer_idx,
             config=config,
-            layer_idx=layer_idx,
         )
         self.self_attn_layer_norm = nn.LayerNorm(self.embed_dim)
         self.activation_fn = ACT2FN.get(config.activation_function, F.gelu)
         self.encoder_attn = BartDecoderCrossAttention(
             self.embed_dim,
             config.decoder_attention_heads,
+            layer_idx,
             config=config,
-            layer_idx=layer_idx,
         )
         self.encoder_attn_layer_norm = nn.LayerNorm(self.embed_dim)
         self.fc1 = nn.Linear(self.embed_dim, config.decoder_ffn_dim)

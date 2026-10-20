@@ -137,7 +137,8 @@ ModelRunner.run(seqs)
     fresh = [seq for seq in seqs if seq.num_cached_tokens == 0]
     _encode(fresh)                # batched encoder (grouped by length/image shape) -> dense cross-attn K/V
     _prepare(seqs)                # input_ids/positions/slot_mapping; ensure blocks/CoW
-    set_context(...)              # Context: is_prefill, context_lens, block_tables, slot_mapping, request_ids
+    set_context(...)              # Context: context_lens, block_tables, slot_mapping,
+                                  #   request_ids, cross_staged (vLLM CPU path only)
     decoder forward               # ops dispatch to vLLM-CPU / flash-attn2-CUDA / SDPA
                                   # (or, with use_cudagraph, replay a captured decode graph)
     compute_logits                # one row per sequence (one new token each)
@@ -174,8 +175,9 @@ out of the compiled graph.
    `_prepare`, `num_cached_tokens == len(token_ids)`; a sampled token is then
    appended, so between steps there is exactly one uncached token. Prefill (a
    fresh sequence) feeds its single decoder prompt token: **every step feeds
-   exactly one token per sequence**, which the attention ops assume (and
-   `generate` rejects a longer decoder prompt).
+   exactly one token per sequence**, which the attention ops assume (`generate`
+   rejects a longer decoder prompt, and `ModelRunner._prepare` raises if a
+   hand-built `Sequence` would feed more than one).
 2. **Positions** are absolute indices into `token_ids` (0-based).
    `BartLearnedPositionalEmbedding` adds the `+2` BART offset internally.
 3. **Paged self-attn cache.** `layers/attention.py` picks the layout the active
@@ -333,10 +335,10 @@ hand-edit or guess.**
 
 | config | ours ms | ours tok/s | hf ms | hf tok/s | speedup |
 |---|---:|---:|---:|---:|---:|
-| batch=1, beams=1, bf16 | 3438 | 74.5 | 6071 | 42.2 | 1.77x |
-| batch=8, beams=1, bf16 | 5021 | 407.9 | 9102 | 225.0 | 1.81x |
-| batch=8, beams=4, bf16 | 7881 | 259.9 | 31943 | 64.1 | 4.05x |
-| batch=8, beams=1, fp32 | 8774 | 233.4 | 25067 | 81.7 | 2.86x |
+| batch=1, beams=1, bf16 | 3585 | 71.4 | 5637 | 45.4 | 1.57x |
+| batch=8, beams=1, bf16 | 5200 | 393.9 | 9027 | 226.9 | 1.74x |
+| batch=8, beams=4, bf16 | 8050 | 254.4 | 31663 | 64.7 | 3.93x |
+| batch=8, beams=1, fp32 | 8756 | 233.9 | 24979 | 82.0 | 2.85x |
 
 Mean of two runs with a cold Inductor cache (`/tmp/torchinductor_*` and
 `~/.cache/torch_extensions` removed first).  This recording is the frozen
@@ -347,7 +349,7 @@ vision-tower graph, with Inductor freezing packing every GEMM; the old manual
 compiles too and verifies token-exact vs HF
 (`verify_parity.py --dtype float32`).  Absolute times shift between recordings
 (~5% with this laptop's clock, worst in the latency-bound `batch=1` row — the
-two runs read 3448/3428 ms there), so only the within-run speedup is meaningful;
+two runs read 3572/3599 ms there), so only the within-run speedup is meaningful;
 the `beams=4` win over HF (4x) is the stable feature of the table.
 
 Built with the vendored kernel — if `csrc/` fails to build (no `ninja`, see the
@@ -500,7 +502,8 @@ on this box with the same kind of workload.
   graphs**: `model.forward` (decoder + lm head, one graph — lm-head GEMMs pack
   too) via opaque attention custom ops, and `model.encode` for the encoder
   (vision tower included for Florence-2).  (`Config.compile=False` /
-  `LLM(compile=False)` keeps the decoder eager, e.g. for backend comparisons.)
+  `LLM(compile=False)` is a full opt-out: the decoder, the encoder and the
+  vision tower all stay eager, e.g. for backend comparisons.)
   Inductor's freezing pass packs all
   of them into `_linear_pointwise` (oneDNN blocked weights; ACL on aarch64),
   the same op the old manual prepack fed; the artifact also fuses pointwise
@@ -577,8 +580,9 @@ on this box with the same kind of workload.
   tower + projector (~1.2x there, ~1.13x end-to-end after the vendored eager
   tower).  It is a `Config` field consumed by `ModelRunner`, which compiles the
   tower on its own graph on every device — static shapes, one graph per image
-  shape — and always when the flag is set, including on CPU where the attention
-  backend is SDPA and nothing else compiles (see the CPU GEMM packing gotcha).
+  shape — and always when the flag is set *and* `compile` is on, including on
+  CPU where the attention backend is SDPA and nothing else compiles (see the
+  CPU GEMM packing gotcha).  `compile=False` wins over it.
   Inductor's BF16 fusion shifts outputs, so greedy tokens can diverge from HF;
   pass `compile_mm_encoder=False` for exact parity or to avoid the per-shape
   compile latency (it compiles once per image shape on first use).

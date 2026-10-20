@@ -47,6 +47,15 @@ def main():
     load_hf_weights(ours, MODEL, hf_model_cls=HFFlorence2)
     ours = ours.eval()
 
+    # compile=False is a full opt-out: the vision tower must stay eager too.
+    eager_runner = LLMEngine(
+        ours, Config(num_blocks=64, block_size=16, max_num_seqs=8, compile=False)
+    ).runner
+    tower_eager = eager_runner.mm_step is None and eager_runner.decode_step is None
+    print(
+        f"[{'OK' if tower_eager else 'MISMATCH'}] compile=False keeps the tower eager"
+    )
+
     # Image features and encoder hidden states must match exactly.
     pixel_values = torch.randn(1, 3, 32, 32)
     with torch.no_grad():

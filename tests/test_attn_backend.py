@@ -15,6 +15,7 @@ Run with:  PYTHONPATH=. python tests/test_attn_backend.py
 
 import os
 import sys
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -160,11 +161,19 @@ def backend_switch(model, requests, block_size, dtype):
     # What benchmarks/attn_backend.py does to compare backends on one engine.
     attention.set_backend("sdpa")
     try:
-        got = [engine.results[i] for i in engine.generate(requests, params)]
+        with mock.patch.object(
+            attention, "stage_cross", wraps=attention.stage_cross
+        ) as staged:
+            got = [engine.results[i] for i in engine.generate(requests, params)]
     finally:
         attention.set_backend("auto")
-    ok = first == got
-    print(f"[{'OK' if ok else 'MISMATCH'}] backend switch after compile: {got}")
+    # The SDPA path reads the dense encoder K/V directly, so the runner must
+    # not stage a paged copy of it for a backend that will not read it.
+    ok = first == got and not staged.called
+    print(
+        f"[{'OK' if ok else 'MISMATCH'}] backend switch after compile: {got} "
+        f"(staged={staged.call_count})"
+    )
     return 0 if ok else 1
 
 
@@ -189,6 +198,29 @@ def compile_off(model, requests, block_size, dtype):
     )
     print(f"[{'OK' if ok else 'MISMATCH'}] compile=False stays eager: {eager}")
     return 0 if ok else 1
+
+
+def long_prompt_rejected(model, requests, block_size, dtype):
+    """A decoder prompt longer than one token must be rejected, not mis-prefilled."""
+    config = Config(
+        num_blocks=256,
+        block_size=block_size,
+        max_num_seqs=8,
+        dtype=dtype,
+        attn_backend="vllm",
+    )
+    engine = LLMEngine(model, config, eos_token_id=EOS)
+    params = SamplingParams(max_tokens=2, temperature=0.0)
+    encoder_ids = requests[0][0]
+    engine.scheduler.add(Sequence(0, [1, 1], encoder_ids, params, None))
+    try:
+        engine.runner.run(engine.scheduler.schedule())
+    except ValueError as exc:
+        ok = "exactly one token" in str(exc)
+        print(f"[{'OK' if ok else 'MISMATCH'}] long decoder prompt rejected: {exc}")
+        return 0 if ok else 1
+    print("[MISMATCH] long decoder prompt accepted")
+    return 1
 
 
 def main():
@@ -232,6 +264,7 @@ def main():
     failures += mixed_batch(model, requests, 32, torch.float32)
     failures += backend_switch(model, requests, 32, torch.float32)
     failures += compile_off(model, requests, 32, torch.float32)
+    failures += long_prompt_rejected(model, requests, 32, torch.float32)
     if failures:
         raise SystemExit(f"{failures} mismatches")
 
