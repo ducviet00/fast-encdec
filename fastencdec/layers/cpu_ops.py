@@ -38,7 +38,7 @@ def self_attention(
 
 
 @self_attention.register_fake
-def _(
+def _self_attention_fake(
     query: torch.Tensor,
     key: torch.Tensor,
     value: torch.Tensor,
@@ -66,5 +66,7 @@ def cross_attention(
 
 
 @cross_attention.register_fake
-def _(query: torch.Tensor, layer_idx: int, scale: float) -> torch.Tensor:
+def _cross_attention_fake(
+    query: torch.Tensor, layer_idx: int, scale: float
+) -> torch.Tensor:
     return torch.empty_like(query)

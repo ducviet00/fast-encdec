@@ -263,10 +263,11 @@ def _stage(layer, request_ids, backend, block_size):
 
 def stage_cross(layers, request_ids):
     """Stage every decoder layer's encoder K/V for the vLLM CPU kernel."""
-    return [
-        _stage(layer.encoder_attn, request_ids, "vllm", layer.encoder_attn.block_size)
-        for layer in layers
-    ]
+    staged = []
+    for layer in layers:
+        attn = layer.encoder_attn
+        staged.append(_stage(attn, request_ids, "vllm", attn.block_size))
+    return staged
 
 
 def decoder_cross_attention(query, layer, scale, block_size):

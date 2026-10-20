@@ -159,14 +159,28 @@ class ModelRunner:
             attn.cross_staged = None
             attn.cross_staged_key = None
 
+    @staticmethod
+    def _num_new_tokens(seq) -> int:
+        """Return how many tokens this step feeds for seq (always exactly one)."""
+        num_new = len(seq.token_ids) - seq.num_cached_tokens
+        if num_new != 1:
+            # The attention ops assume one query token per sequence per step
+            # (the kernel's query_start_loc is arange(num_seqs + 1)), so a
+            # longer decoder prompt cannot be prefilled in one step.  LLMEngine
+            # rejects it up front; this catches a hand-built Sequence too.
+            raise ValueError(
+                "each step must feed exactly one token per sequence, but "
+                f"request {seq.request_id} feeds {num_new}"
+            )
+        return num_new
+
     def _prepare(self, seqs):
         """Allocate KV blocks and build input_ids, positions, and Context tensors for the step."""
         bs = self.block_size
-        # Check block budget upfront so a full cache raises before mutating state.
+        # Check the token count and block budget upfront so a full cache or a
+        # malformed sequence raises before any state is mutated.
         required = sum(
-            self.block_manager.required_new_blocks(
-                seq, len(seq.token_ids) - seq.num_cached_tokens
-            )
+            self.block_manager.required_new_blocks(seq, self._num_new_tokens(seq))
             for seq in seqs
         )
         if required > self.block_manager.num_free_blocks:
@@ -175,16 +189,7 @@ class ModelRunner:
         input_ids, positions, new_slots = [], [], []
         context_lens, seq_block_tables = [], []
         for seq in seqs:
-            num_new = len(seq.token_ids) - seq.num_cached_tokens
-            if num_new != 1:
-                # The attention ops assume one query token per sequence per step
-                # (the kernel's query_start_loc is arange(num_seqs + 1)), so a
-                # longer decoder prompt cannot be prefilled in one step.  LLMEngine
-                # rejects it up front; this catches a hand-built Sequence too.
-                raise ValueError(
-                    "each step must feed exactly one token per sequence, but "
-                    f"request {seq.request_id} feeds {num_new}"
-                )
+            num_new = self._num_new_tokens(seq)
             self.block_manager.ensure_capacity(seq, num_new, self._copy_block)
             start = seq.num_cached_tokens
             for pos in range(start, start + num_new):
@@ -240,18 +245,15 @@ class ModelRunner:
                 self.decoder_layers, fields["request_ids"]
             )
         set_context(**fields)
-        if self.decode_step is not None and backend != "vllm":
-            # The backend was overridden after this runner compiled (a benchmark
-            # comparing backends, or a second engine setting a new preference).
-            # The compiled graph holds the vLLM op, so it no longer does what
-            # the ops would do now; the SDPA path reads the per-step Context,
-            # which must stay out of the graph, so run this step eagerly
-            # instead of re-tracing.
+        # The compiled graph holds the vLLM op, so it is only valid while the ops
+        # still resolve to vLLM.  A backend override after this runner compiled
+        # (a benchmark comparing backends, or a second engine setting a new
+        # preference) must run this step eagerly: the SDPA path also reads the
+        # per-step Context, which must stay out of the graph.
+        if self.decode_step is None or backend != "vllm":
             return self.model(input_ids, positions)
         with self._inductor_ctx():
             # model.forward is decoder + lm head, so freezing packs both.
-            if self.decode_step is None:
-                return self.model(input_ids, positions)
             return self.decode_step(input_ids, positions)
 
     def _inductor_ctx(self):
