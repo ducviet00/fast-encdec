@@ -1,4 +1,4 @@
-"""Attention-implementation benchmark: vendored vLLM CPU kernel vs SDPA vs eager.
+"""Attention-implementation benchmark: vendored vLLM CPU kernel vs Mojo vs SDPA.
 
 Two sections:
 
@@ -11,8 +11,10 @@ Two sections:
   (``attn_implementation="sdpa"`` / ``"eager"``), on a standard workload and a
   decode-heavy (attention-dominated) one.
 
-The three implementations are:
+The implementations are:
   vllm  -- the vendored vLLM CPU kernel (`csrc/`), the engine's default;
+  mojo  -- the Mojo port (`mojo/src/attention.mojo`), skipped when its shared
+           library is not built;
   sdpa  -- PyTorch's `scaled_dot_product_attention` (its own kernel choice);
   eager -- PyTorch SDPA pinned to `SDPBackend.MATH`, i.e. the naive
            matmul/softmax/matmul attention, and HF's `eager` implementation.
@@ -29,13 +31,13 @@ import time
 import torch
 
 from fastencdec.config import default_block_size
-from fastencdec.layers import attention, cpu_attn
+from fastencdec.layers import attention, cpu_attn, mojo_attn
 from fastencdec.utils.context import set_context
 
 HEADS, HEAD_DIM = 16, 64  # bart-large-cnn
 MODEL = "facebook/bart-large-cnn"
 DECODE = {"length_penalty": 2.0, "no_repeat_ngram_size": 3}
-VARIANTS = ("vllm", "sdpa", "eager")
+VARIANTS = ("vllm", "mojo", "sdpa", "eager")
 
 
 def _timed(fn, iters: int, warmup: int = 5) -> float:
@@ -52,7 +54,7 @@ def _timed(fn, iters: int, warmup: int = 5) -> float:
 
 def _call(variant, fn):
     """Run ``fn`` under the variant's backend (``eager`` pins SDPA to math)."""
-    attention.set_backend("vllm" if variant == "vllm" else "sdpa")
+    attention.set_backend(variant if variant in ("vllm", "mojo") else "sdpa")
     if variant == "eager":
         from torch.nn.attention import SDPBackend, sdpa_kernel
 
@@ -104,7 +106,10 @@ def _cross_case(num_seqs, enc_len, block_size, dtype):
         for i in range(num_seqs)
     }
     request_ids = list(range(num_seqs))
-    staged = attention.stage_cross_kv(kv_cache, request_ids, block_size, "vllm")
+    staged = {
+        backend: attention.stage_cross_kv(kv_cache, request_ids, block_size, backend)
+        for backend in ("vllm", "mojo")
+    }
     return (
         torch.randn(num_seqs, HEADS, HEAD_DIM, dtype=dtype),
         kv_cache,
@@ -117,8 +122,9 @@ def _time_self(variant, num_seqs, ctx_len, block_size, dtype, scale, iters):
     q, k, v, k_cache, v_cache, slots, blocks, lens = _self_case(
         num_seqs, ctx_len, block_size, dtype
     )
-    if variant == "vllm":
-        run = lambda: cpu_attn.self_attention(
+    if variant in ("vllm", "mojo"):
+        attn = cpu_attn if variant == "vllm" else mojo_attn
+        run = lambda: attn.self_attention(
             q, k, v, k_cache, v_cache, slots, blocks, lens, scale
         )
     else:
@@ -130,9 +136,10 @@ def _time_self(variant, num_seqs, ctx_len, block_size, dtype, scale, iters):
 
 def _time_cross(variant, num_seqs, enc_len, block_size, dtype, scale, iters):
     q, kv_cache, request_ids, staged = _cross_case(num_seqs, enc_len, block_size, dtype)
-    if variant == "vllm":
-        k_cache, v_cache, block_table, cache_seqlens = staged
-        run = lambda: cpu_attn.cross_attention(
+    if variant in ("vllm", "mojo"):
+        attn = cpu_attn if variant == "vllm" else mojo_attn
+        k_cache, v_cache, block_table, cache_seqlens = staged[variant]
+        run = lambda: attn.cross_attention(
             q, k_cache, v_cache, block_table, cache_seqlens, scale
         )
     else:
@@ -146,9 +153,10 @@ def kernel_section(dtype, block_size, iters):
         f"\n== kernel: decoder attention ops in isolation ({dtype}, "
         f"heads={HEADS} head_dim={HEAD_DIM}, block_size={block_size}) =="
     )
+    variants = [v for v in VARIANTS if v != "mojo" or mojo_attn.module() is not None]
     header = (
         f"{'op':<26} "
-        + " ".join(f"{v:>10}" for v in VARIANTS)
+        + " ".join(f"{v:>10}" for v in variants)
         + f" {'vllm vs eager':>14}"
     )
     print(header)
@@ -158,7 +166,8 @@ def kernel_section(dtype, block_size, iters):
         "      (CUDA uses the batched one), so they include that Python overhead;\n"
         "      the vllm column calls the kernel entry point directly, so it does\n"
         "      not pay the op's backend resolution and Context read;\n"
-        "      the e2e section compares against HF's batched sdpa/eager instead."
+        "      the e2e section compares against HF's batched sdpa/eager instead,\n"
+        "      and measures Mojo end to end with `benchmark.py --backend mojo`."
     )
     cases = [
         ("self, batch=8 ctx=256", _time_self, (8, 256)),
@@ -170,11 +179,11 @@ def kernel_section(dtype, block_size, iters):
     for label, fn, (num_seqs, length) in cases:
         times = {
             variant: fn(variant, num_seqs, length, block_size, dtype, scale, iters)
-            for variant in VARIANTS
+            for variant in variants
         }
         print(
             f"{label:<26} "
-            + " ".join(f"{times[v]:>9.1f}u" for v in VARIANTS)
+            + " ".join(f"{times[v]:>9.1f}u" for v in variants)
             + f" {times['eager'] / times['vllm']:>13.1f}x"
         )
     attention.set_backend("auto")
@@ -258,9 +267,13 @@ def e2e_section(args, dtype):
             f"\n== e2e: batch={args.batch} enc~{enc['input_ids'].shape[1]} out={out} "
             f"({dtype}, {kind}) =="
         )
+        # No mojo row here: this engine was built with `auto` and compiled for
+        # the vLLM ops, so overriding the backend runs the step eagerly, which
+        # is not the comparison. `benchmark.py --backend mojo` builds a Mojo
+        # engine and measures it compiled.
         rows = [
             (f"ours/{v}", _time_ours(llm, prompts, v, out, args.repeats) / 1e3)
-            for v in VARIANTS
+            for v in ("vllm", "sdpa", "eager")
         ]
         rows += [
             (f"HF/{impl}", _time_hf(model, enc, out, args.repeats) / 1e3)

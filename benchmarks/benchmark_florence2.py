@@ -169,6 +169,11 @@ def main():
         default=0,
         help="0 = device default (256 cuda, 32 x86 cpu, 16 aarch64)",
     )
+    ap.add_argument(
+        "--backend",
+        default="auto",
+        help="attention backend for the engine (auto, vllm, mojo, sdpa)",
+    )
     ap.add_argument("--max-tokens", type=int, default=256)
     ap.add_argument("--warmup", type=int, default=1)
     ap.add_argument("--repeats", type=int, default=1)
@@ -199,7 +204,7 @@ def main():
     print("# fast-encdec Florence-2 benchmark\n", flush=True)
     print(
         f"model={args.model}  device={device}  threads={torch.get_num_threads()}  "
-        f"image={image.size}  max_tokens={args.max_tokens}",
+        f"image={image.size}  max_tokens={args.max_tokens}  backend={args.backend}",
         flush=True,
     )
     print(
@@ -223,6 +228,7 @@ def main():
                 block_size=block_size,
                 dtype=dtype,
                 device=device,
+                attn_backend=args.backend,
             )
             hf = HFModel.from_pretrained(args.model, dtype=dtype).eval()
             if device.startswith("cuda"):

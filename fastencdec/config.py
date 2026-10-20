@@ -3,7 +3,7 @@ from dataclasses import dataclass
 
 import torch
 
-_BACKENDS = ("auto", "vllm", "flash", "sdpa")
+_BACKENDS = ("auto", "vllm", "mojo", "flash", "sdpa")
 
 
 def default_block_size(device) -> int:

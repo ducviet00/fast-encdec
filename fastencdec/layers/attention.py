@@ -2,16 +2,24 @@ import torch
 import torch.nn.functional as F
 
 from ..utils.context import get_context
-from . import cpu_attn, cpu_ops, flash_attn
+from . import cpu_attn, cpu_ops, flash_attn, mojo_attn, mojo_ops
 
-_BACKENDS = ("auto", "vllm", "flash", "sdpa")
+_BACKENDS = ("auto", "vllm", "flash", "sdpa", "mojo")
+# Backends whose ops are opaque custom ops: they read the per-step Context and
+# mutate the caches, so torch.compile must never trace them.
+_OPAQUE = ("vllm", "mojo")
 _PREFER = "auto"
 # Per-step gather index for the SDPA fallback, memoized by Context identity.
 _DERIVED: tuple = (None, None, None)
 
 
+def uses_custom_ops(backend: str) -> bool:
+    """Return True if the backend runs as opaque custom ops (torch.compile-safe)."""
+    return backend in _OPAQUE
+
+
 def set_backend(name: str) -> None:
-    """Override the attention backend ('auto', 'vllm', 'flash', or 'sdpa')."""
+    """Override the attention backend ('auto', 'vllm', 'mojo', 'flash', or 'sdpa')."""
     if name not in _BACKENDS:
         raise ValueError(f"attn_backend must be one of {_BACKENDS}, got {name!r}")
     global _PREFER
@@ -22,8 +30,8 @@ def _paged_backend(device, dtype, head_dim, block_size) -> str:
     """Resolve the active paged attention backend for (device, dtype, head_dim, block_size)."""
     if _PREFER == "flash" and device.type != "cuda":
         raise RuntimeError("FlashAttention-2 requires a CUDA device")
-    if _PREFER == "vllm" and device.type != "cpu":
-        raise RuntimeError("the vendored vLLM attention kernel is CPU-only")
+    if _PREFER in _OPAQUE and device.type != "cpu":
+        raise RuntimeError("the CPU attention kernels are CPU-only")
     if _PREFER == "sdpa":
         return "sdpa"
     if device.type == "cuda":
@@ -38,6 +46,13 @@ def _paged_backend(device, dtype, head_dim, block_size) -> str:
             flash_attn.require()
             return "flash"
         return "flash" if flash_attn.module() is not None else "sdpa"
+    if device.type == "cpu" and _PREFER == "mojo":
+        if mojo_attn.supported(dtype, block_size, head_dim):
+            return "mojo"
+        raise RuntimeError(
+            f"the Mojo attention kernel does not support head_dim={head_dim} "
+            f"block_size={block_size} dtype={dtype}"
+        )
     if device.type == "cpu" and _PREFER in ("auto", "vllm"):
         isa = cpu_attn.select_isa(dtype, block_size, head_dim)
         if isa is not None and (_PREFER == "vllm" or cpu_attn.module() is not None):
@@ -83,6 +98,8 @@ def _store(key, value, k_cache, v_cache, slot_mapping, block_size, backend):
     """Scatter new key/value into the paged cache using the fastest path for backend."""
     if backend == "vllm":
         cpu_attn.reshape_and_cache(key, value, k_cache, v_cache, slot_mapping)
+    elif backend == "mojo":
+        mojo_attn.reshape_and_cache(key, value, k_cache, v_cache, slot_mapping)
     else:
         store_kvcache(
             key,
@@ -177,10 +194,11 @@ def decoder_self_attention(query, key, value, k_cache, v_cache, scale, block_siz
         )
         return out.squeeze(1)
 
-    if backend == "vllm":
+    if backend in _OPAQUE:
         # Opaque custom op: the kernel path reads Context and mutates the caches,
         # so torch.compile never traces it.
-        return cpu_ops.self_attention(query, key, value, k_cache, v_cache, scale)
+        ops = cpu_ops if backend == "vllm" else mojo_ops
+        return ops.self_attention(query, key, value, k_cache, v_cache, scale)
     slots = _sdpa_slots(ctx, block_size)
     _store(key, value, k_cache, v_cache, ctx.slot_mapping, block_size, backend)
     return _sdpa_paged(query, k_cache, v_cache, slots, ctx, scale)
@@ -261,12 +279,12 @@ def _stage(layer, request_ids, backend, block_size):
     return layer.cross_staged
 
 
-def stage_cross(layers, request_ids):
-    """Stage every decoder layer's encoder K/V for the vLLM CPU kernel."""
+def stage_cross(layers, request_ids, backend="vllm"):
+    """Stage every decoder layer's encoder K/V for a paged CPU kernel."""
     staged = []
     for layer in layers:
         attn = layer.encoder_attn
-        staged.append(_stage(attn, request_ids, "vllm", attn.block_size))
+        staged.append(_stage(attn, request_ids, backend, attn.block_size))
     return staged
 
 
@@ -274,10 +292,11 @@ def decoder_cross_attention(query, layer, scale, block_size):
     """Run decoder cross-attention against the layer's cached per-request encoder K/V."""
     ctx = get_context()
     backend = _paged_backend(query.device, query.dtype, query.shape[2], block_size)
-    if backend == "vllm":
+    if backend in _OPAQUE:
         # Opaque custom op: the staged tensors come from the per-step Context, so
         # neither they nor the kernel calls enter the compiled graph.
-        return cpu_ops.cross_attention(query, layer.layer_idx, scale)
+        ops = cpu_ops if backend == "vllm" else mojo_ops
+        return ops.cross_attention(query, layer.layer_idx, scale)
     if backend == "sdpa":
         return cross_sdpa_batched(query, layer.encoder_kv_cache, ctx.request_ids, scale)
     if ctx.cross_block_tables is not None:
