@@ -185,12 +185,19 @@ vdpbf16ps` (72 here) or `grep -c bfdot` (5664 on Graviton).
 | inline (1 worker) | 0.36 |
 | `DeviceContext.cpu()` + `synchronize()` (floor of a dispatch) | 1.9 |
 | same dispatch with the pool **asleep** (1 ms gap), median | 103-140 |
+| attention call in-engine, ours / C++ backend (0.8 ms gap) | 180 / 167 |
 
 Consequences: `_workers()` caps at the **physical** core count (sysfs topology,
 cached) because a parent `OMP_NUM_THREADS` larger than the core count
 oversubscribes MAX's fork-join (4.3× slower at b1/ctx256 on a 4-core SMT box).
-Keeping the pool hot (`MODULAR_THREAD_BUSY_WAIT_US` ≥ inter-call gap) makes the
-totals *worse*: the spinners steal GEMM cycles from torch's threads.
+Keeping the pool hot (`MODULAR_THREAD_BUSY_WAIT_US` ≥ inter-call gap) is worse,
+and even MAX's **default 200 µs spin is a loss here**: `mojo_attn._load()` now
+`setdefault`s it to 0 (the runtime reads it at `initialize_runtime()`, i.e. at
+the first kernel call, so setting it there is in time). Measured with a
+GEMM/attention interleave at the engine's cadence: per call, attention
+99.9 → **90.6 µs** (equal to the C++ backend) and the GEMM-phase interference
+56.0 → **39.0 µs** (C++: 20.4); end to end 344 → **359 tok/s (+4.5%)**, and the
+non-attention part of the step returned to parity (+90 ms → +9 ms).
 
 ## 8. Engine integration
 
@@ -218,7 +225,9 @@ totals *worse*: the spinners steal GEMM cycles from torch's threads.
    dispatch is flat in worker count, so there is no worker-count lever — and a
    hand-rolled pthread pool prototype measured **9.4 µs warm / 103 µs cold**
    against MAX's 6.3 / 140, i.e. no better. The wake cost is the platform's;
-   vLLM's OpenMP threads pay it too (its in-engine call is 166 µs vs our 196).
+   vLLM's OpenMP threads pay it too. After the spin fix the engine is at
+   180 µs (ours) vs 167 µs (C++), i.e. +13 µs/call ≈ 1.4% of a step; the
+   remaining GEMM-phase difference is ~0.
 4. **Do not re-try**: software prefetch of the next page's K/V (3 strides,
    neutral-to-worse — the pages are 4 KB sequential streams), `GROUP` 2/8,
    6/8 workers (`GROUP` beyond 4 registers-spills; >physical threads oversubscribes

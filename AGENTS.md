@@ -688,7 +688,11 @@ on this box with the same kind of workload.
   `_workers()` is capped at the *physical* core count (sysfs topology, cached)
   with a `FASTENCDEC_MOJO_WORKERS` override, because a parent `OMP_NUM_THREADS`
   larger than the core count otherwise makes the fork-join oversubscribed (4.3x
-  slower at batch 1 / ctx 256 on that box).  Traps when touching it: (1) `q`/`k`/`v` are chunks of the fused
+  slower at batch 1 / ctx 256 on that box).  `mojo_attn` also sets
+  `MODULAR_THREAD_BUSY_WAIT_US=0`: MAX's default 200 us worker spin never pays
+  off at a decode step's 0.8-1.5 ms call spacing and keeps 8 threads busy for
+  ~25% of the gap while torch's GEMMs need the cores — worth +4.5% end to end at
+  8x128 and it removes the GEMM-phase penalty (+90 ms -> +9 ms over 128 steps).  Traps when touching it: (1) `q`/`k`/`v` are chunks of the fused
   `qkv_proj` output, so the kernel takes token strides explicitly
   (`3 * d_model`, not `num_heads * head_dim`); assuming contiguity silently
   gives every sequence sequence 0's output.  (2) A 32-wide value cannot live in

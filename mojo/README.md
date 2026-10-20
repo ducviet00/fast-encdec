@@ -162,14 +162,15 @@ spread is largest (+-10-25% on Graviton).
 `benchmarks/benchmark_florence2.py`, dev Ryzen 7840H, 8 threads, one engine per
 process, Mojo and the vendored C++ backend measured in the same session:
 
-BART-large-CNN, batch x 256 generated tokens:
+BART-large-CNN, batch x 256 generated tokens (`MODULAR_THREAD_BUSY_WAIT_US=0`,
+the shipped default):
 
 | config | Mojo ms | Mojo tok/s | C++ ms | C++ tok/s | Mojo / C++ | Mojo vs HF |
 |---|---:|---:|---:|---:|---:|---:|
-| batch=1, beams=1, bf16 | 3922 | 65.3 | 3600 | 71.1 | 1.09 | 1.28x |
-| batch=8, beams=1, bf16 | 5550 | 369.0 | 5259 | 389.4 | 1.06 | 1.60x |
-| batch=8, beams=4, bf16 | 8452 | 242.3 | 7990 | 256.3 | 1.06 | 3.70x |
-| batch=8, beams=1, fp32 | 9827 | 208.4 | 8702 | 235.3 | 1.13 | 2.54x |
+| batch=1, beams=1, bf16 | 3871 | 66.1 | 3558 | 71.9 | 1.09 | 1.33x |
+| batch=8, beams=1, bf16 | 5510 | 371.7 | 5292 | 387.0 | 1.04 | 1.60x |
+| batch=8, beams=4, bf16 | 8617 | 237.7 | 7924 | 258.5 | 1.09 | 3.67x |
+| batch=8, beams=1, fp32 | 9156 | 223.7 | 8885 | 230.5 | 1.03 | 2.73x |
 
 Florence-2-base on a real 640x480 photo, four tasks (caption / detection /
 referring-expression segmentation / caption-to-phrase grounding), EOS-stopped so
@@ -177,22 +178,25 @@ the output lengths are the tasks' own (13/22/256/22):
 
 | config | Mojo ms | Mojo tok/s | C++ ms | C++ tok/s | Mojo / C++ | Mojo vs HF |
 |---|---:|---:|---:|---:|---:|---:|
-| batch=1, beams=1, bf16 | 432 | 30.1 | 410 | 31.7 | 1.05 | 1.39x |
-| batch=8, beams=1, bf16 | 4689 | 133.5 | 4531 | 138.2 | 1.03 | 1.87x |
-| batch=8, beams=4, bf16 | 5214 | 120.1 | 5018 | 124.8 | 1.04 | 4.65x |
-| batch=8, beams=1, fp32 | 10654 | 58.8 | 10197 | 61.4 | 1.04 | 2.09x |
+| batch=1, beams=1, bf16 | 435 | 29.9 | 409 | 31.8 | 1.06 | 1.36x |
+| batch=8, beams=1, bf16 | 4567 | 137.1 | 4452 | 140.6 | 1.03 | 1.91x |
+| batch=8, beams=4, bf16 | 5111 | 122.5 | 5023 | 124.6 | 1.02 | 4.75x |
+| batch=8, beams=1, fp32 | 11001 | 56.9 | 10027 | 62.4 | 1.10 | 1.99x |
 
-Both end-to-end tables are 3-13% behind the C++ backend on this laptop: a decode
-step here is dominated by the fused GEMMs plus MAX's fork-join waking 8 threads
-per attention call (the same ~140 us per-call tax per step that OpenMP charges
-the C++ path), not by the attention kernel — which is why the same backend wins
-on the 4-core Xeon and on Graviton (see the kernel table above).
+So end to end the backend is **2-6% behind the C++ one on Florence-2** and
+**3-9% on BART** (fp32 is the widest: 3% on BART, 10% on Florence, because the
+fp32 kernel has no dot-product path and is bandwidth-bound). After the
+`MODULAR_THREAD_BUSY_WAIT_US=0` fix the *attention* calls are at parity per call
+(180 vs 167 µs) and the GEMM phase is no longer penalised, so what is left is the
+per-call fork-join handoff (MAX ~6 µs vs OpenMP ~2.5 µs, plus ~140 µs of cold
+wake that both engines pay) — not the kernel. See the section below for the
+decomposition and the levers that were measured.
 
 ## Where the time goes (and what not to redo)
 
 Measured on the Ryzen box with the engine's call pattern, not the microbenchmark:
 
-- **In-engine an attention call costs ~196 µs (ours) vs ~166 µs (vLLM), while the
+- **In-engine an attention call costs ~180 µs (ours) vs ~167 µs (vLLM), while the
   same call warm costs 30-40 µs.** With ~1.5 ms between calls a decode step the
   worker pool has gone to sleep, and the wake dominates: dispatching 128 no-op
   items costs 0.36 µs inline, 6.3 µs with a warm 8-thread pool, and a *median*
@@ -206,6 +210,16 @@ Measured on the Ryzen box with the engine's call pattern, not the microbenchmark
   4-worker cap gains ~2.6% end to end at batch 8 / short context but costs ~37%
   on the warm `cross b8/256` number (work is 1/workers bound there), so the
   worker count stays at `torch.get_num_threads()`.
+- **MAX's default 200 us spin is itself a loss for this workload**, and
+  `mojo_attn` now sets `MODULAR_THREAD_BUSY_WAIT_US=0` at load time. With calls
+  0.8-1.5 ms apart the spin never pays for itself: it keeps 8 threads busy for
+  ~25% of the gap while torch's GEMM threads need the cores. Measured with a
+  GEMM/attention interleave at the engine's cadence: per call, attention
+  99.9 -> **90.6 us** (identical to the C++ backend's 90.6) and the GEMM-phase
+  interference 56.0 -> **39.0 us** (C++: 20.4); end to end on 8x128,
+  **344 -> 359 tok/s (+4.5%)**, and the non-attention part of the step went from
+  +90 ms to +9 ms. (This corrects an earlier note here: it is not only that a
+  longer spin hurts, the default is already too long.)
 - So at `cross b8/256` the warm kernel work is already at parity and the ~3 µs
   residual is MAX's handoff (6.3 µs) against OpenMP's (~2.5 µs) — the remaining
   lever is the kernel body, not the host: bf16 P@V with quantized probabilities
