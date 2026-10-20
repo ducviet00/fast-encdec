@@ -692,7 +692,11 @@ on this box with the same kind of workload.
   `MODULAR_THREAD_BUSY_WAIT_US=0`: MAX's default 200 us worker spin never pays
   off at a decode step's 0.8-1.5 ms call spacing and keeps 8 threads busy for
   ~25% of the gap while torch's GEMMs need the cores — worth +4.5% end to end at
-  8x128 and it removes the GEMM-phase penalty (+90 ms -> +9 ms over 128 steps).  Traps when touching it: (1) `q`/`k`/`v` are chunks of the fused
+  8x128 and it removes the GEMM-phase penalty (+90 ms -> +9 ms over 128 steps).
+  The backend also runs a call **inline** (one worker, no fork-join) when
+  `num_tasks * pages <= 64`: 26.8 us vs 156.7 us per cold call at b1/ctx128,
+  level above that. With both, the engine's per-call attention is within ~4 us of
+  the C++ backend's and its GEMM-phase interference is at parity.  Traps when touching it: (1) `q`/`k`/`v` are chunks of the fused
   `qkv_proj` output, so the kernel takes token strides explicitly
   (`3 * d_model`, not `num_heads * head_dim`); assuming contiguity silently
   gives every sequence sequence 0's output.  (2) A 32-wide value cannot live in

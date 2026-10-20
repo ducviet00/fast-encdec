@@ -53,7 +53,7 @@ def self_case(batch, ctx, dtype, workers):
     vc = torch.randn(shape, dtype=dtype)
     scale = DIM**-0.5
     if workers:  # 0 keeps the kernel's own physical-core rule
-        mojo_attn._workers = lambda n: max(1, min(workers, n))
+        mojo_attn._OVERRIDE = str(workers)
     return {
         "vllm": lambda: cpu_attn.self_attention(
             q, k, v, kc, vc, slots, blocks, lens, scale
@@ -77,7 +77,7 @@ def cross_case(batch, ctx, dtype, workers):
     q = torch.randn(batch, HEADS, DIM, dtype=dtype)
     scale = DIM**-0.5
     if workers:  # 0 keeps the kernel's own physical-core rule
-        mojo_attn._workers = lambda n: max(1, min(workers, n))
+        mojo_attn._OVERRIDE = str(workers)
     return {
         "vllm": lambda: cpu_attn.cross_attention(q, *staged["vllm"], scale),
         "mojo": lambda: mojo_attn.cross_attention(q, *staged["mojo"], scale),
@@ -100,7 +100,7 @@ def main():
     host = os.uname().nodename
     pinned = args.workers
     if pinned:
-        mojo_attn._workers = lambda n: max(1, min(pinned, n))
+        mojo_attn._OVERRIDE = str(pinned)
     workers = mojo_attn._workers(1024)
     print(
         f"{host} {platform.machine()} cpus={os.cpu_count()} "

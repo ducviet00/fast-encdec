@@ -210,13 +210,24 @@ Measured on the Ryzen box with the engine's call pattern, not the microbenchmark
   4-worker cap gains ~2.6% end to end at batch 8 / short context but costs ~37%
   on the warm `cross b8/256` number (work is 1/workers bound there), so the
   worker count stays at `torch.get_num_threads()`.
+- **Tiny calls now run inline.** `_workers()` returns 1 when
+  `num_tasks * pages <= 64` (batch 1 up to ctx 128, longer encoders stay pooled):
+  a fork-join costs ~6 us warm and ~140 us cold while the work there is 1-3 us.
+  Measured cold, batch 1 / ctx 128: **26.8 us per call inline against 156.7 us
+  with 8 workers (5.8x)**; at 128+ KV positions per task the two are level, so
+  nothing else changes. `FASTENCDEC_MOJO_WORKERS` still overrides.
+- **The Python wrapper was trimmed** (~3.6 -> ~3.1 us/call): the extension
+  callable is bound once, the env override is read once at import (`_workers`
+  0.52 -> 0.16 us), one `stride()` per tensor instead of indexed calls, and no
+  `float()` round-trip. `torch.empty_like` (0.53 us) and the 9 `data_ptr()`
+  calls (0.53 us) are the floor of this interface.
 - **MAX's default 200 us spin is itself a loss for this workload**, and
   `mojo_attn` now sets `MODULAR_THREAD_BUSY_WAIT_US=0` at load time. With calls
   0.8-1.5 ms apart the spin never pays for itself: it keeps 8 threads busy for
   ~25% of the gap while torch's GEMM threads need the cores. Measured with a
   GEMM/attention interleave at the engine's cadence: per call, attention
   99.9 -> **90.6 us** (identical to the C++ backend's 90.6) and the GEMM-phase
-  interference 56.0 -> **39.0 us** (C++: 20.4); end to end on 8x128,
+  interference 56.0 -> **31.2 us** (C++: 30.1, i.e. parity); end to end on 8x128,
   **344 -> 359 tok/s (+4.5%)**, and the non-attention part of the step went from
   +90 ms to +9 ms. (This corrects an earlier note here: it is not only that a
   longer spin hurts, the default is already too long.)

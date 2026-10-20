@@ -180,15 +180,19 @@ vdpbf16ps` (72 here) or `grep -c bfdot` (5664 on Graviton).
 | full Python wrapper (`mojo_attn._call`) | 2.8-3.6 |
 | `torch.empty_like(query)` | 0.54 |
 | 9 × `data_ptr()` | 0.51 |
-| `require()` / `_workers()` / dtype lookup | 0.09 / 0.17 / 0.08 |
+| `_attention()` (extension callable, bound once) | 0.03 |
+| `_workers()` (env override cached at import) | 0.16 |
+| dtype lookup | 0.08 |
 | `max.algorithm.parallelize`, warm, 8 workers (flat 2-8) | 6.3 |
 | inline (1 worker) | 0.36 |
 | `DeviceContext.cpu()` + `synchronize()` (floor of a dispatch) | 1.9 |
 | same dispatch with the pool **asleep** (1 ms gap), median | 103-140 |
 | attention call in-engine, ours / C++ backend (0.8 ms gap) | 180 / 167 |
 
-Consequences: `_workers()` caps at the **physical** core count (sysfs topology,
-cached) because a parent `OMP_NUM_THREADS` larger than the core count
+Consequences: `_workers()` returns 1 (inline, 0.36 µs dispatch) when
+`num_tasks * pages <= 64` — measured cold at b1/ctx128, 26.8 µs inline vs 156.7
+with 8 workers, while at >=128 KV positions per task the two are level. It caps
+at the **physical** core count (sysfs topology, cached) because a parent `OMP_NUM_THREADS` larger than the core count
 oversubscribes MAX's fork-join (4.3× slower at b1/ctx256 on a 4-core SMT box).
 Keeping the pool hot (`MODULAR_THREAD_BUSY_WAIT_US` ≥ inter-call gap) is worse,
 and even MAX's **default 200 µs spin is a loss here**: `mojo_attn._load()` now

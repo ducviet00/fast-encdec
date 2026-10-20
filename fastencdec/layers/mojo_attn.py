@@ -74,7 +74,22 @@ def require():
     return built
 
 
+_ATTENTION = None
+
+
+def _attention():
+    """The extension's single entry point, resolved once (saves a lookup per call)."""
+    global _ATTENTION
+    if _ATTENTION is None:
+        _ATTENTION = require().attention
+    return _ATTENTION
+
+
 _PHYSICAL = None
+# Read once: an os.environ.get on the hot path costs ~0.35 us per call, i.e. >1% of
+# a short-context attention call. Harnesses that sweep the worker count should
+# patch ``_OVERRIDE`` (or ``_workers``) directly, not the environment.
+_OVERRIDE = os.environ.get("FASTENCDEC_MOJO_WORKERS")
 
 
 def _physical_cores() -> int:
@@ -95,21 +110,26 @@ def _physical_cores() -> int:
     return _PHYSICAL
 
 
-def _workers(num_tasks: int) -> int:
-    """Workers for one call: torch's pool, capped at the physical cores.
+def _workers(num_tasks: int, pages: int = 1) -> int:
+    """Workers for one call: inline for tiny work, else torch's pool capped at cores.
 
-    ``parallelize``'s fork-join costs ~4 us at 4 workers and ~6 us at 8, and a
-    second worker per physical core loses more than it gains on these
-    bandwidth-bound shapes (8 workers on an SMT Xeon: 1.5x slower at ctx=1024,
-    and unstable at batch 8). ``torch.get_num_threads()`` is already the
-    physical-core count when torch sized its own pool, so the cap only bites
-    when a parent sets a larger ``OMP_NUM_THREADS``.
-    ``FASTENCDEC_MOJO_WORKERS`` overrides both.
+    A call pays ~6 us of fork-join warm and ~140 us cold (the pool is asleep
+    between decode steps), while the work is ``num_tasks * pages`` KV positions.
+    Below ~64-128 positions per call that fixed cost dominates: measured cold at
+    batch 1 / ctx 128, one worker (inline, 0.36 us dispatch) is 2.1x faster than
+    8 (124 vs 265 us), while at batch 1 / ctx 256 the two are level, so the rule
+    only inlines genuinely tiny calls. Above it the pool wins by ~num_workers, so keep it. The cap
+    at the *physical* core count matters on SMT boxes (8 workers on a 4-core
+    Xeon: 1.5x slower at ctx 1024 and unstable at batch 8), and a parent
+    ``OMP_NUM_THREADS`` larger than the core count would oversubscribe the
+    fork-join. ``FASTENCDEC_MOJO_WORKERS`` overrides everything.
     """
-    override = os.environ.get("FASTENCDEC_MOJO_WORKERS")
-    if override:
-        return max(1, min(int(override), num_tasks))
-    return max(1, min(torch.get_num_threads(), _physical_cores(), num_tasks))
+    if _OVERRIDE:
+        return max(1, min(int(_OVERRIDE), num_tasks))
+    workers = min(torch.get_num_threads(), _physical_cores(), num_tasks)
+    if workers > 1 and num_tasks * pages <= 64:
+        return 1
+    return workers
 
 
 def _call(
@@ -126,22 +146,25 @@ def _call(
     do_store: bool,
 ):
     """Run one kernel call; ``key``/``value``/``slots`` are ignored without a store."""
-    mod = require()
+    attention = _attention()
     zero = 0
     num_seqs, num_heads, head_dim = query.shape
-    if query.stride()[-1] != 1 or query.stride()[-2] != head_dim:
+    q_stride = query.stride()
+    if q_stride[-1] != 1 or q_stride[-2] != head_dim:
         query = query.contiguous()
+        q_stride = query.stride()
     # The fused q/k/v projection hands us chunks of one buffer: the head dim is
     # contiguous but the token stride is 3 * d_model, which the kernel takes
     # explicitly (a head-major layout check would silently copy).
-    if do_store and (
-        key.stride()[-1] != 1
-        or key.stride()[-2] != head_dim
-        or value.stride() != key.stride()
-    ):
-        key, value = key.contiguous(), value.contiguous()
+    kv_stride = 0
+    if do_store:
+        k_stride = key.stride()
+        if k_stride[-1] != 1 or k_stride[-2] != head_dim or value.stride() != k_stride:
+            key, value = key.contiguous(), value.contiguous()
+            k_stride = key.stride()
+        kv_stride = k_stride[0]
     num_tasks = num_seqs * num_heads
-    mod.attention(
+    attention(
         query.data_ptr(),
         key.data_ptr() if do_store else zero,
         value.data_ptr() if do_store else zero,
@@ -157,12 +180,12 @@ def _call(
         head_dim,
         k_cache.shape[2],
         block_table.shape[1],
-        query.stride(0),
-        key.stride(0) if do_store else 0,
+        q_stride[0],
+        kv_stride,
         out.stride(0),
         _DTYPE_CODES[query.dtype],
-        float(scale),
-        _workers(num_tasks),
+        scale,
+        _workers(num_tasks, block_table.shape[1]),
         do_store,
         True,
     )
@@ -209,11 +232,11 @@ def reshape_and_cache(key, value, k_cache, v_cache, slot_mapping) -> None:
     """Scatter key/value [T, H, D] into the paged cache at slot_mapping."""
     # The `q`/`dst`/`lens` slots of the shared entry point are unused here: the
     # kernel only stores when ``do_attend`` is False.
-    mod = require()
+    attention = _attention()
     num_tokens, num_heads, head_dim = key.shape
     if key.stride()[-1] != 1 or key.stride()[-2] != head_dim:
         key, value = key.contiguous(), value.contiguous()
-    mod.attention(
+    attention(
         key.data_ptr(),
         key.data_ptr(),
         value.data_ptr(),
