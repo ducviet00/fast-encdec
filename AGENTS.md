@@ -80,8 +80,11 @@ placeholders; the decoder is unchanged.
   cu130` for CUDA.  `uv lock --check` and `uv sync --extra cpu --dry-run`
   both pass.
 - Mojo backend (optional): a self-contained `pixi` env under `mojo/`
-  (`pixi run --manifest-path mojo/pixi.toml build`, ~1.4 GB — it installs `mojo` plus `max`, whose
-  `max.algorithm.parallelize` is the only thread pool Mojo 1.2 exposes).  The
+  (`pixi run --manifest-path mojo/pixi.toml build`, ~1.2 GB, `mojo` only — no
+  `max` package).  The kernel parallelizes with `GOMP_parallel` on **torch's own
+  OpenMP pool** and links `libgomp` (`-Xlinker -lgomp`), so the backend is
+  Linux-only and needs libgomp at `.so` load time (torch ships/loads one; the
+  pixi env's conda-forge copy is on the library's RUNPATH).  The
   built `mojo/build/fastencdec_mojo_attn.so` is loaded by
   `fastencdec/layers/mojo_attn.py`; `FASTENCDEC_MOJO_ATTN` overrides the path.
   The shared library is built for this box (`mojo build` targets the host), so
@@ -123,7 +126,7 @@ fastencdec/
 csrc/                  vendored vLLM CPU attention kernels (+ bindings.cpp)
 mojo/                  Mojo port of the paged-attention kernel (+ pixi env)
   AGENTS.md            the Mojo-side handover: ISA gating, Mojo gotchas, costs, per-box numbers
-  pixi.toml            Mojo + MAX nightly (MAX supplies `parallelize`)
+  pixi.toml            Mojo nightly, no MAX (kernel dispatches on libgomp)
   src/attention.mojo   the kernel: store, self/cross attention, dispatch
   src/fastencdec_mojo_attn.mojo  Python extension module (PyInit_...)
   tests/test_attention.mojo      standalone parity test (no torch, no Python)
@@ -363,10 +366,10 @@ hand-edit or guess.**
 
 | config | ours ms | ours tok/s | hf ms | hf tok/s | speedup |
 |---|---:|---:|---:|---:|---:|
-| batch=1, beams=1, bf16 | 3728 | 68.7 | 5913 | 43.3 | 1.59x |
-| batch=8, beams=1, bf16 | 5271 | 388.5 | 9022 | 227.0 | 1.71x |
-| batch=8, beams=4, bf16 | 8030 | 255.1 | 31767 | 64.5 | 3.96x |
-| batch=8, beams=1, fp32 | 8942 | 229.0 | 24943 | 82.1 | 2.79x |
+| batch=1, beams=1, bf16 | 3586 | 71.4 | 5554 | 46.4 | 1.55x |
+| batch=8, beams=1, bf16 | 5325 | 384.6 | 8863 | 231.1 | 1.67x |
+| batch=8, beams=4, bf16 | 8044 | 254.6 | 31632 | 64.8 | 3.93x |
+| batch=8, beams=1, fp32 | 8978 | 228.2 | 25289 | 80.9 | 2.82x |
 
 The Mojo backend's per-box numbers (Ryzen, Granite Rapids, Graviton 5) live in
 `mojo/README.md`; the table below is the default (`auto` = vendored C++) path.
@@ -651,10 +654,10 @@ on this box with the same kind of workload.
   exactly one query token per sequence, which makes the causal mask the cache
   tail.  Not ported: chunked prefill, sliding windows, ALiBi,
   softcap, attention sinks, FP8 KV cache, the `VEC16`/NEON/AMX/RVV/VSX paths, and
-  vLLM's work-item scheduler.  Parallelism is one task per (sequence, head) over
-  `max.algorithm.parallelize` (`num_workers = torch.get_num_threads()`): a task
-  owns one head's cache slice end to end, so there is no KV split, scratch
-  buffer or reduction.  Two optimizations carry the performance, both measured
+  vLLM's work-item scheduler.  Parallelism is one task per (sequence, head),
+  dispatched with `GOMP_parallel` **on torch's own OpenMP pool** (libgomp; no
+  second pool, no spin): a task owns one head's cache slice end to end, so there
+  is no KV split, scratch buffer or reduction.  Two optimizations carry the performance, both measured
   on this box: four pages are scored before one online-softmax step (per-page
   softmax bookkeeping is 4x the max/exp/rescale work at short contexts, and
   vLLM amortizes the same way over its L2-sized tile), and Q@K^T runs as
@@ -686,17 +689,21 @@ on this box with the same kind of workload.
   K/V, GROUP 2/8 and 6/8 workers were all neutral-to-worse there, and
   `block_size=128` is worth ~9% at ctx=1024 (a config knob, not a kernel one).
   `_workers()` is capped at the *physical* core count (sysfs topology, cached)
-  with a `FASTENCDEC_MOJO_WORKERS` override, because a parent `OMP_NUM_THREADS`
-  larger than the core count otherwise makes the fork-join oversubscribed (4.3x
-  slower at batch 1 / ctx 256 on that box).  `mojo_attn` also sets
-  `MODULAR_THREAD_BUSY_WAIT_US=0`: MAX's default 200 us worker spin never pays
-  off at a decode step's 0.8-1.5 ms call spacing and keeps 8 threads busy for
-  ~25% of the gap while torch's GEMMs need the cores — worth +4.5% end to end at
-  8x128 and it removes the GEMM-phase penalty (+90 ms -> +9 ms over 128 steps).
-  The backend also runs a call **inline** (one worker, no fork-join) when
-  `num_tasks * pages <= 64`: 26.8 us vs 156.7 us per cold call at b1/ctx128,
-  level above that. With both, the engine's per-call attention is within ~4 us of
-  the C++ backend's and its GEMM-phase interference is at parity.  Traps when touching it: (1) `q`/`k`/`v` are chunks of the fused
+  with a `FASTENCDEC_MOJO_WORKERS` override (torch already sizes its pool that
+  way; the cap only bites when a parent sets a larger `OMP_NUM_THREADS`).  The
+  dispatch is the win: `GOMP_parallel` costs 2.4 us warm and 2.7 us with a 1 ms
+  gap, against 6.3 us / 103-140 us for a private pool (MAX's `parallelize` or a
+  hand-rolled pthread one) that has to be woken at the engine's 0.8-1.5 ms call
+  spacing — and the spin workaround for that cost 4.5% end to end, so it is
+  gone with the `max` package.  Effect at b8/ctx256: the attention call is
+  29.8 us against the C++ backend's 90.7 (cold, 0.8 ms of GEMMs between calls),
+  and 8x128 end to end went 344 -> **392-396 tok/s** against the C++ backend's
+  364-377 — i.e. **faster end to end on this laptop** (b1x128: 74.5 vs 71.1).
+  A call runs **inline** (one worker, no region) only when
+  `num_tasks * pages <= 32` (24.5 vs 31.0 us at b1/ctx64): with libgomp the pool
+  wins from b1/ctx128 up (1.3x, and 8x at b8/ctx256), the opposite of the
+  private-pool rule, whose inline threshold existed only to dodge a 140 us wake.
+  Traps when touching it: (1) `q`/`k`/`v` are chunks of the fused
   `qkv_proj` output, so the kernel takes token strides explicitly
   (`3 * d_model`, not `num_heads * head_dim`); assuming contiguity silently
   gives every sequence sequence 0's output.  (2) A 32-wide value cannot live in
@@ -709,7 +716,9 @@ on this box with the same kind of workload.
   language traps, the `LANES`/intrinsic gating, measured fixed costs and the
   per-box tables); without the `.so` the backend is unavailable and `auto` is
   unaffected.  (5) `mojo build` targets the host CPU (`znver4` +
-  avx512bf16 here), so rebuild per machine.
+  avx512bf16 here), so rebuild per machine.  (6) `mojo run` cannot execute the
+  kernel (the JIT cannot resolve `GOMP_parallel`/`omp_get_thread_num`); use
+  `pixi run test`, which builds a binary with `-Xlinker -lgomp` and runs it.
 - **CPU page size (`block_size`).** `block_size=None` picks the smallest page the
   device's best kernel accepts (`fastencdec.config.default_block_size`): 256 on
   CUDA, **32 on x86**, 16 on aarch64.  `csrc`'s full-width AVX-512 kernel

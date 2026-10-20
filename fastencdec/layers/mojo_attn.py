@@ -25,14 +25,6 @@ _BUILT = None
 
 
 def _load():
-    # MAX's runtime spins each idle worker for 200 us before sleeping. In a decode
-    # step the attention calls are ~0.8-1.5 ms apart, so the spin never pays for
-    # itself and instead keeps 8 threads busy for ~25% of the gap while torch's
-    # GEMM threads need the cores: measured +4.5% end to end (359 vs 344 tok/s on
-    # bart-large-cnn 8x128), and it halves the attention call's interference with
-    # the GEMM phase. The runtime reads this at initialize_runtime(), i.e. at the
-    # first kernel call, so setting it here is in time.
-    os.environ.setdefault("MODULAR_THREAD_BUSY_WAIT_US", "0")
     path = os.environ.get("FASTENCDEC_MOJO_ATTN", _DEFAULT_PATH)
     if not os.path.exists(path):
         return None
@@ -127,7 +119,7 @@ def _workers(num_tasks: int, pages: int = 1) -> int:
     if _OVERRIDE:
         return max(1, min(int(_OVERRIDE), num_tasks))
     workers = min(torch.get_num_threads(), _physical_cores(), num_tasks)
-    if workers > 1 and num_tasks * pages <= 64:
+    if workers > 1 and num_tasks * pages <= 32:
         return 1
     return workers
 

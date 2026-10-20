@@ -32,9 +32,14 @@ last position, so the causal mask is exactly the cache tail.
 
 ```bash
 cd mojo
-pixi run build        # -> mojo/build/fastencdec_mojo_attn.so
-pixi run test         # standalone kernel test (no torch)
+pixi run build        # -> mojo/build/fastencdec_mojo_attn.so (links -lgomp)
+pixi run test         # builds the standalone kernel test with -lgomp and runs it
 ```
+
+The kernel dispatches on libgomp (`GOMP_parallel`), so the build needs
+`-Xlinker -lgomp` and the backend is Linux-only; the pixi env is `mojo` alone
+(no `max` package). `mojo run` cannot run the kernel — the JIT cannot resolve
+the OpenMP symbols — which is why `pixi run test` builds a binary first.
 
 The engine loads `mojo/build/fastencdec_mojo_attn.so` automatically; set
 `FASTENCDEC_MOJO_ATTN=/path/to/other.so` to override. Without the library the
@@ -50,14 +55,16 @@ PYTHONPATH=. .venv/bin/python benchmarks/benchmark.py --backend mojo --scenarios
 
 ## Design
 
-* **Parallelism: one task per (sequence, head).** The work is embarrassingly
-  parallel across heads because every head owns a disjoint slice of the paged
-  cache, so no reduction is needed. `max.algorithm.parallelize` runs the tasks
-  on MAX's runtime thread pool; the engine passes `torch.get_num_threads()`
-  workers. With `num_seqs * num_heads` tasks (128 for batch 8 / 16 heads) the
-  pool stays busy even at batch 1, and a thread only ever streams its own
-  head's pages, which keeps the access pattern prefetch-friendly. The kernel
-  is memory-bandwidth-bound, like the C++ one.
+* **Parallelism: one task per (sequence, head), on torch's own pool.** The work
+  is embarrassingly parallel across heads because every head owns a disjoint
+  slice of the paged cache, so no reduction is needed. 128 tasks at batch 8 /
+  16 heads, and a thread only ever streams its own head's pages, which keeps the
+  access pattern prefetch-friendly. The dispatch is `GOMP_parallel` (libgomp,
+  linked with `-Xlinker -lgomp`), i.e. **the OpenMP pool torch already keeps
+  warm** rather than a second pool of our own: 2.4 µs per region warm and 2.7 µs
+  with a 1 ms gap, against 6.3 µs / 103-140 µs for a private pool that has to be
+  woken (see "Where the time goes"). The kernel is memory-bandwidth-bound, like
+  the C++ one.
 * **Page layout: vLLM's, unchanged.** A page is
   `[num_blocks, num_kv_heads, block_size * head_dim]` with K stored
   *transposed* inside the page (`[head_dim, block_size]`, row-major) and V
@@ -115,46 +122,53 @@ the cache is widened to fp32 and Q is pre-scaled by `1/sqrt(head_dim)`).
 
 ## Performance
 
-Kernel call only (Ryzen 7 7840H, 8 threads, bf16, `head_dim` 64, page 32, best
-of 60 alternating rounds). Each column includes its own Python/pybind entry
-point, i.e. what the engine pays per layer. `ratio` is Mojo over vLLM, so < 1
-is faster:
+Kernel call only (Ryzen 7 7840H, 8 threads, bf16, `head_dim` 64, page 32,
+best-of-N over alternating rounds, `benchmarks/kernel_ab.py`). Each column
+includes its own Python/pybind entry point, i.e. what the engine pays per layer.
+`ratio` is Mojo over vLLM, so < 1 is faster (the range spans the two runs and
+the drift-controlled median; one number = all of them agree):
 
 | shape | vLLM `csrc/` | Mojo | ratio |
 |---|---:|---:|---:|
-| self, batch=1 ctx=256 | 15.1 µs | 12.8 µs | 0.84 |
-| self, batch=8 ctx=256 | 45.4 µs | 33.1 µs | 0.73 |
-| self, batch=8 ctx=1024 | 451 µs | 419 µs | 0.93 |
-| self, batch=32 ctx=1024 | 2933 µs | 2679 µs | 0.91 |
-| self, batch=1 ctx=4096 | 77.8 µs | 59.1 µs | 0.76 |
-| cross, batch=1 ctx=256 | 12.8 µs | 13.7 µs | 1.07 |
-| cross, batch=8 ctx=256 | 28.5 µs | 31.5 µs | 1.11 |
-| cross, batch=8 ctx=1024 | 422 µs | 413 µs | 0.92-0.98 |
-| cross, batch=32 ctx=1024 | 2789 µs | 2531 µs | 0.91 |
-| cross, batch=1 ctx=4096 | 84 µs | 77 µs | 0.91 |
+| self, batch=1 ctx=256 | 15.6 µs | 7.9 µs | 0.41-0.51 |
+| self, batch=8 ctx=256 | 37.4 µs | 20.0 µs | 0.52-0.53 |
+| self, batch=8 ctx=1024 | 445 µs | 383 µs | 0.82-0.86 |
+| self, batch=32 ctx=1024 | 2923 µs | 2410 µs | 0.82 |
+| self, batch=1 ctx=4096 | 87.0 µs | 43.2 µs | 0.48-0.50 |
+| cross, batch=1 ctx=256 | 12.8 µs | 7.4 µs | 0.57-0.58 |
+| cross, batch=8 ctx=256 | 28.5 µs | 19.0 µs | **0.66** |
+| cross, batch=8 ctx=1024 | 449 µs | 364 µs | 0.78-0.81 |
+| cross, batch=32 ctx=1024 | 2769 µs | 2342 µs | 0.85 |
+| cross, batch=1 ctx=4096 | 75.6 µs | 45.2 µs | 0.58-0.60 |
 
 Run-to-run spread on this laptop is +-10%, so treat the ratios as bands rather
-than exact values; the shortest-batch cross rows in particular move between 1.07
-and 1.30.  The engine runs one self and one cross call per decoder layer, so the
-per-layer aggregate is 0.87-0.97 of vLLM's — ahead at every shape except the
-batch-1/short-context cross call.
+than exact values. Since the kernel moved onto torch's OpenMP pool (§ "Where
+the time goes") the short-context rows gained the most — the dispatch used to
+cost 6.3 µs warm / 103-140 µs cold and now costs 2.4 / 2.7 — so the target row
+`cross b8/ctx256` went from 1.07-1.30 to **0.66**. The engine runs one self and
+one cross call per decoder layer, so the per-layer aggregate is 0.7-0.85 of
+vLLM's: ahead at every shape now, widest where the call is short.
 
-Final three-box run of the merged tree — `benchmarks/attn_backend.py --mode kernel`
-plus `benchmarks/kernel_ab.py` (alternating vLLM/Mojo rounds), two runs each,
-torch threads = the box's physical cores, Mojo workers = `_workers()` (the same
-number). Ratio `mojo/vllm`, so < 1 is faster:
+Three-box run — `benchmarks/attn_backend.py --mode kernel` plus
+`benchmarks/kernel_ab.py` (alternating vLLM/Mojo rounds), two runs each, torch
+threads = the box's physical cores, Mojo workers = `_workers()` (the same
+number). Ratio `mojo/vllm`, so < 1 is faster. **These two boxes were measured
+with the old private pool**, so their rows are conservative: the libgomp switch
+removes ~4 µs of dispatch per call, which is 3-15% of the short-context calls
+there (the laptop row above was re-measured and shows the size of the gain):
 
 | box (threads / workers) | self b8/256 | **cross b8/256** | self b8/1024 | cross b8/1024 | self b32/1024 |
 |---|---:|---:|---:|---:|---:|
-| Ryzen 7840H (8 / 8) | 0.76-0.88 | 1.02-1.18 | 0.84-0.92 | 0.92-0.96 | 0.86 |
+| Ryzen 7840H (8 / 8), libgomp | 0.52-0.53 | **0.66** | 0.82-0.86 | 0.78-0.81 | 0.82 |
 | Xeon 6975P-C (4 / 4) | 0.67-0.70 | **0.71-0.84** | 0.89-0.90 | 1.00-1.02 | 0.85-0.90 |
 | Graviton 5 (8 / 8) | 0.43-0.48 | **0.43-0.51** | 0.60-0.79 | 0.65-0.77 | 0.86-0.95 |
 
 At `b1` the two server boxes are 0.70-0.83 (`self`) and 0.99-1.14 (`cross`); at
-`b1/ctx4096` 0.86-1.09 and 0.77-0.99. The 1024-token rows are memory-roofline
-bound on both servers (231-298 GB/s measured on Graviton, 133 GB/s from L3 on
-the Xeon) and insensitive to the kernel, which is also where the run-to-run
-spread is largest (+-10-25% on Graviton).
+`b1/ctx4096` 0.86-1.09 and 0.77-0.99. On the laptop the same points are 0.41-0.51
+(`self b1/256`), 0.57-0.60 (`cross b1/256`) and 0.48-0.60 at ctx 4096. The
+1024-token rows are memory-roofline bound on both servers (231-298 GB/s measured
+on Graviton, 133 GB/s from L3 on the Xeon) and insensitive to the kernel, which
+is also where the run-to-run spread is largest (+-10-25% on Graviton).
 
 ## End to end (engine)
 
@@ -162,15 +176,14 @@ spread is largest (+-10-25% on Graviton).
 `benchmarks/benchmark_florence2.py`, dev Ryzen 7840H, 8 threads, one engine per
 process, Mojo and the vendored C++ backend measured in the same session:
 
-BART-large-CNN, batch x 256 generated tokens (`MODULAR_THREAD_BUSY_WAIT_US=0`,
-the shipped default):
+BART-large-CNN, batch x 256 generated tokens:
 
 | config | Mojo ms | Mojo tok/s | C++ ms | C++ tok/s | Mojo / C++ | Mojo vs HF |
 |---|---:|---:|---:|---:|---:|---:|
-| batch=1, beams=1, bf16 | 3871 | 66.1 | 3558 | 71.9 | 1.09 | 1.33x |
-| batch=8, beams=1, bf16 | 5510 | 371.7 | 5292 | 387.0 | 1.04 | 1.60x |
-| batch=8, beams=4, bf16 | 8617 | 237.7 | 7924 | 258.5 | 1.09 | 3.67x |
-| batch=8, beams=1, fp32 | 9156 | 223.7 | 8885 | 230.5 | 1.03 | 2.73x |
+| batch=1, beams=1, bf16 | 3324 | 77.0 | 3611 | 70.9 | **0.92** | 1.66x |
+| batch=8, beams=1, bf16 | 5060 | 404.7 | 5157 | 397.2 | 0.98 | 1.75x |
+| batch=8, beams=4, bf16 | 7661 | 267.3 | 8054 | 254.3 | 0.95 | 4.16x |
+| batch=8, beams=1, fp32 | 8527 | 240.2 | 8977 | 228.1 | 0.95 | 2.95x |
 
 Florence-2-base on a real 640x480 photo, four tasks (caption / detection /
 referring-expression segmentation / caption-to-phrase grounding), EOS-stopped so
@@ -178,80 +191,84 @@ the output lengths are the tasks' own (13/22/256/22):
 
 | config | Mojo ms | Mojo tok/s | C++ ms | C++ tok/s | Mojo / C++ | Mojo vs HF |
 |---|---:|---:|---:|---:|---:|---:|
-| batch=1, beams=1, bf16 | 435 | 29.9 | 409 | 31.8 | 1.06 | 1.36x |
-| batch=8, beams=1, bf16 | 4567 | 137.1 | 4452 | 140.6 | 1.03 | 1.91x |
-| batch=8, beams=4, bf16 | 5111 | 122.5 | 5023 | 124.6 | 1.02 | 4.75x |
-| batch=8, beams=1, fp32 | 11001 | 56.9 | 10027 | 62.4 | 1.10 | 1.99x |
+| batch=1, beams=1, bf16 | 398 | 32.7 | 427 | 30.5 | 0.93 | 1.51x |
+| batch=8, beams=1, bf16 | 4344 | 144.1 | 4454 | 140.6 | 0.98 | 2.02x |
+| batch=8, beams=4, bf16 | 4873 | 128.5 | 4953 | 126.4 | 0.98 | 4.99x |
+| batch=8, beams=1, fp32 | 10070 | 62.2 | 10170 | 61.6 | 0.99 | 2.28x |
 
-So end to end the backend is **2-6% behind the C++ one on Florence-2** and
-**3-9% on BART** (fp32 is the widest: 3% on BART, 10% on Florence, because the
-fp32 kernel has no dot-product path and is bandwidth-bound). After the
-`MODULAR_THREAD_BUSY_WAIT_US=0` fix the *attention* calls are at parity per call
-(180 vs 167 µs) and the GEMM phase is no longer penalised, so what is left is the
-per-call fork-join handoff (MAX ~6 µs vs OpenMP ~2.5 µs, plus ~140 µs of cold
-wake that both engines pay) — not the kernel. See the section below for the
-decomposition and the levers that were measured.
+So end to end the backend is now **ahead of the C++ one on every row**: 2-8% on
+BART (widest at batch 1), 1-7% on Florence-2. Before the move onto torch's
+OpenMP pool it was 3-9% behind on BART and 2-6% on Florence-2; the difference is
+the per-call dispatch (2.4 µs vs 6.3 warm, and no cold wake), which is most of a
+short attention call. Both engines beat HF by 1.5-5x on these points.
 
 ## Where the time goes (and what not to redo)
 
-Measured on the Ryzen box with the engine's call pattern, not the microbenchmark:
+Measured on the Ryzen box with the engine's call pattern, not the microbenchmark.
 
-- **In-engine an attention call costs ~180 µs (ours) vs ~167 µs (vLLM), while the
-  same call warm costs 30-40 µs.** With ~1.5 ms between calls a decode step the
-  worker pool has gone to sleep, and the wake dominates: dispatching 128 no-op
-  items costs 0.36 µs inline, 6.3 µs with a warm 8-thread pool, and a *median*
-  103-140 µs when the pool is asleep (measured for MAX's runtime and for a
-  hand-rolled pthread pool). That is a property of waking 8 threads on this box,
-  not of MAX: a lean spin-then-condvar pool prototype measured 9.4 µs warm
-  (worse than MAX's 6.3) and 103 µs cold (no better than MAX's 140).
-- Consequences: keeping the pool hot across the step
-  (`MODULAR_THREAD_BUSY_WAIT_US` >= the inter-call gap) makes the totals worse,
-  because the spinning threads then compete with torch's GEMM threads; a
-  4-worker cap gains ~2.6% end to end at batch 8 / short context but costs ~37%
-  on the warm `cross b8/256` number (work is 1/workers bound there), so the
-  worker count stays at `torch.get_num_threads()`.
-- **Tiny calls now run inline.** `_workers()` returns 1 when
-  `num_tasks * pages <= 64` (batch 1 up to ctx 128, longer encoders stay pooled):
-  a fork-join costs ~6 us warm and ~140 us cold while the work there is 1-3 us.
-  Measured cold, batch 1 / ctx 128: **26.8 us per call inline against 156.7 us
-  with 8 workers (5.8x)**; at 128+ KV positions per task the two are level, so
-  nothing else changes. `FASTENCDEC_MOJO_WORKERS` still overrides.
-- **The Python wrapper was trimmed** (~3.6 -> ~3.1 us/call): the extension
-  callable is bound once, the env override is read once at import (`_workers`
-  0.52 -> 0.16 us), one `stride()` per tensor instead of indexed calls, and no
-  `float()` round-trip. `torch.empty_like` (0.53 us) and the 9 `data_ptr()`
-  calls (0.53 us) are the floor of this interface.
-- **MAX's default 200 us spin is itself a loss for this workload**, and
-  `mojo_attn` now sets `MODULAR_THREAD_BUSY_WAIT_US=0` at load time. With calls
-  0.8-1.5 ms apart the spin never pays for itself: it keeps 8 threads busy for
-  ~25% of the gap while torch's GEMM threads need the cores. Measured with a
-  GEMM/attention interleave at the engine's cadence: per call, attention
-  99.9 -> **90.6 us** (identical to the C++ backend's 90.6) and the GEMM-phase
-  interference 56.0 -> **31.2 us** (C++: 30.1, i.e. parity); end to end on 8x128,
-  **344 -> 359 tok/s (+4.5%)**, and the non-attention part of the step went from
-  +90 ms to +9 ms. (This corrects an earlier note here: it is not only that a
-  longer spin hurts, the default is already too long.)
-- So at `cross b8/256` the warm kernel work is already at parity and the ~3 µs
-  residual is MAX's handoff (6.3 µs) against OpenMP's (~2.5 µs) — the remaining
-  lever is the kernel body, not the host: bf16 P@V with quantized probabilities
-  (what MAX and vLLM's AMX path do) would halve the P@V multiply count at the
-  cost of bit-exactness with `csrc/`.
-- **On a 4-physical-core Granite Rapids box the picture inverts**: the kernel is
-  bandwidth-bound (133 GB/s from L3 at this shape, 62-70 GB/s from DRAM, both
-  measured by pointing every sequence at one shared page set), the C++ kernel is
-  compute-bound at 81 GB/s, and the port beats it on every row at 4 threads —
-  self 0.67 / 0.94 / 0.86, cross 0.72 (b8/enc256) / 0.90 (b8/enc1024). There,
-  prefetching K/V (3 strides), `GROUP` 2/8 and 6/8 workers were all
-  neutral-to-worse; `_workers()` is capped at the physical core count (sysfs,
-  cached) because a larger `OMP_NUM_THREADS` from a parent otherwise oversubscribes
-  MAX's fork-join and costs up to 4.3x. `block_size=128` buys ~9% at ctx=1024
-  (config-level: `attn_backend.py --block-size 128`).
+**The dispatch is the whole story, and it is solved.** An attention call is a
+fine-grained parallel region with ~0.8-1.5 ms of torch GEMMs between calls, so a
+pool that sleeps pays a wake every time. Measured per dispatch:
+
+| dispatch | µs |
+|---|---:|
+| inline, 1 worker (no region) | 0.36 |
+| **`GOMP_parallel` on torch's pool, warm** | **2.4** |
+| **`GOMP_parallel`, 1 ms idle gap, no torch work** | **2.7** |
+| `max.algorithm.parallelize`, private pool, warm | 6.3 |
+| same, 1 ms gap (the engine's cadence) | 103-140 |
+| a hand-rolled spin-then-condvar pool, 1 ms gap | 103 |
+
+The last two rows are why the backend no longer uses MAX's runtime: a private
+pool either sleeps (103-140 µs wake, 24 times per step) or spins (which steals
+GEMM cycles — MAX's default 200 µs spin cost 4.5% end to end and was worse than
+useless). Running the kernel on the pool that *torch* keeps busy between calls
+removes the wake entirely, and it also removes the need for the `max` package:
+`mojo/pixi.toml` depends on `mojo` alone now.
+
+What that is worth, measured in one harness (8 matmuls ~ 0.8 ms between calls,
+i.e. the engine's cadence; per-call numbers include the call itself):
+
+| b8/ctx256 | attention call | GEMM-phase interference |
+|---|---:|---:|
+| C++ backend | 90.7 µs | +25.9 µs |
+| this backend | **29.8-49.6 µs** | +39.2 µs |
+
+And end to end on bart-large-cnn, 8x128 tokens, same session:
+
+| | tok/s |
+|---|---:|
+| this backend, before the dispatch change | 344 |
+| this backend now | **392-396** |
+| C++ backend | 364-377 |
+
+So the backend is now **faster than the C++ one end to end on this laptop**
+(+7.5% at 8x128, +4.8% at batch 1 x 128), and its attention call is ~3x cheaper
+than vLLM's at `cross b8/256`.
+
+Remaining host-side cost, all measured: `torch.empty_like` 0.53 µs, 9
+`data_ptr()` 0.53 µs, pybind with 23 args 0.68 µs, the Python wrapper ~3.1 µs
+(callable and worker override resolved once, one `stride()` per tensor). Tiny
+calls run **inline** (`_workers()` returns 1 when `num_tasks * pages <= 32`:
+24.5 µs vs 31.0 µs at batch 1 / ctx 64); from batch 1 / ctx 128 up the pool wins
+(1.3x), and 8x at batch 8 / ctx 256.
+
+**On a 4-physical-core Granite Rapids box the picture inverts.** The kernel is
+bandwidth-bound (133 GB/s from L3 at this shape, 62-70 GB/s from DRAM, both
+measured by pointing every sequence at one shared page set), the C++ kernel is
+compute-bound at 81 GB/s, and the port beats it on every row at 4 threads —
+self 0.67 / 0.94 / 0.86, cross 0.72 (b8/enc256) / 0.90 (b8/enc1024). There,
+prefetching K/V (3 strides), `GROUP` 2/8 and 6/8 workers were all
+neutral-to-worse; `_workers()` is capped at the physical core count (sysfs,
+cached) — torch already sizes its pool that way, so the cap only matters when
+a parent sets a larger `OMP_NUM_THREADS`. `block_size=128` buys ~9% at ctx=1024
+(config-level: `attn_backend.py --block-size 128`).
 
 ## Layout
 
 ```
 mojo/
-  pixi.toml                     Mojo + MAX (for `parallelize`) nightly env
+  pixi.toml                     Mojo nightly env (no MAX dependency)
   src/attention.mojo            the kernel (Job, store, attention, dispatch)
   src/fastencdec_mojo_attn.mojo Python extension module (PyInit_...)
   tests/test_attention.mojo     standalone parity test against a scalar reference

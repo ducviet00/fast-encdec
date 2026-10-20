@@ -13,16 +13,20 @@ attention kernel) restricted to what this engine actually calls:
 * fp32 arithmetic, the cache dtype (bf16/fp32) widened on load -- the same
   numerics class as the C++ ``VEC`` kernel, which also converts to fp32.
 
-Work is parallelized over (sequence, head) pairs: one task owns one head of one
-sequence end to end, so no cross-thread reduction or scratch buffer is needed.
+Work is parallelized over (sequence, head) pairs on the OpenMP pool torch
+already keeps warm (`GOMP_parallel`, linked with `-lgomp`), so one task owns one
+head of one sequence end to end: no cross-thread reduction, and no second thread
+pool to wake (a private pool measured 6.3 us warm and 103-140 us cold against
+2.4 / 2.7 us here).
 """
 
+from std.ffi import external_call
 from std.math import exp, iota
 from std.memory import MutPointer, stack_allocation
 from std.origin import MutUntrackedOrigin
 from std.sys import llvm_intrinsic, simd_width_of
 from std.sys.info import CompilationTarget
-from max.algorithm import parallelize
+
 
 # Compile-time ISA gating, the same shape as MAX's `_MatmulConfig._get_config()`
 # (which switches inner loops on `CompilationTarget.has_neon()/has_avx512f()`).
@@ -63,7 +67,7 @@ comptime NEG_INF = -3.4028234663852886e38
 """Stand-in for -inf: ``exp()`` underflows it to 0 and it never produces NaN."""
 
 
-struct Job(Copyable, Movable):
+struct Job(Copyable, ImplicitlyCopyable, Movable):
     """One attention call, as raw addresses (see ``run``)."""
 
     var q: Int
@@ -588,6 +592,53 @@ def _attention_head_dot[
     dst.unsafe_store[width=head_dim]((acc * inv).cast[dtype]())
 
 
+comptime TaskFn = def(Job, Int, Bool, Bool) thin -> None
+
+
+struct Dispatch(ImplicitlyCopyable, Movable):
+    """One parallel region's state, on the caller's stack while libgomp runs it.
+    """
+
+    var job: Job
+    var task_fn: TaskFn
+    var num_tasks: Int
+    var do_store: Bool
+    var do_attend: Bool
+
+    def __init__(
+        out self,
+        job: Job,
+        task_fn: TaskFn,
+        num_tasks: Int,
+        do_store: Bool,
+        do_attend: Bool,
+    ):
+        self.job = job
+        self.task_fn = task_fn
+        self.num_tasks = num_tasks
+        self.do_store = do_store
+        self.do_attend = do_attend
+
+
+@export
+def _gomp_worker(data: Int) abi("C"):
+    """libgomp region body: run this thread's contiguous slice of the work items.
+
+    Slices use the *effective* thread count (`omp_get_num_threads()`), not the
+    requested one: libgomp clamps the request to `OMP_NUM_THREADS`, which torch
+    sets via `set_num_threads`, and a slice computed from the request would then
+    leave work unexecuted.
+    """
+    var st = MutPointer[Dispatch, MutUntrackedOrigin](unsafe_from_address=data)
+    var state = st[]
+    var threads = Int(external_call["omp_get_num_threads", Int32]())
+    var tid = Int(external_call["omp_get_thread_num", Int32]())
+    var begin = tid * state.num_tasks // threads
+    var end = (tid + 1) * state.num_tasks // threads
+    for task in range(begin, end):
+        state.task_fn(state.job, task, state.do_store, state.do_attend)
+
+
 @inline(.always)
 def _task[
     dtype: DType, head_dim: Int, tile: Int, group: Int
@@ -618,11 +669,21 @@ def _dispatch[
     var items = job.num_seqs * job.num_heads
     if items == 0:
         return
-
-    def body(task: Int) {imm}:
-        _task[dtype, head_dim, tile, group](job, task, do_store, do_attend)
-
-    parallelize(body, items, min(num_workers, items))
+    var workers = min(num_workers, items)
+    if workers <= 1:
+        for task in range(items):
+            _task[dtype, head_dim, tile, group](job, task, do_store, do_attend)
+        return
+    # Run on the OpenMP pool torch already keeps warm (libgomp) instead of a
+    # second pool: measured 2.4 us per region warm and 2.7 us with a 1 ms gap,
+    # against 6.3 us / 103-140 us for a pool that has to be woken.
+    comptime task_fn = _task[dtype, head_dim, tile, group]
+    var state = stack_allocation[1, Dispatch]()
+    state[] = Dispatch(job, task_fn, items, do_store, do_attend)
+    comptime entry = _gomp_worker
+    external_call["GOMP_parallel", NoneType](
+        entry, Int(state), Int32(workers), Int32(0)
+    )
 
 
 def _run_dtype[

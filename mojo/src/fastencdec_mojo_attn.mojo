@@ -11,8 +11,6 @@ Build with:  pixi run -m ../pixi.toml build     (see ../pixi.toml)
 from std.os import abort
 from std.python import PythonObject
 from std.python.bindings import PythonModuleBuilder
-from std.runtime import initialize_runtime
-
 from attention import Job, run
 
 
@@ -56,7 +54,6 @@ def attention(
     ``dtype`` is 0 for float32 and 1 for bfloat16;
     ``head_dim`` must be 32, 64 or 128.
     """
-    initialize_runtime()
     var job = Job()
     job.q = Int(py=q)
     job.k = Int(py=k)

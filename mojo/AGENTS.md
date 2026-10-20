@@ -10,19 +10,20 @@ as `attn_backend="mojo"`. Read this before touching the kernel; the root
 One source file, compile-time per-ISA paths (AVX512-BF16 `vdpbf16ps` + fp32 P@V
 on x86; NEON `bfdot` QK **and** P@V on ARM), bit-identical to `csrc/` on x86,
 ≤1e-3 on ARM (bf16 probabilities). Beats `csrc/` at `cross b8/ctx256` by 1.4× on
-the 4-core Xeon and 2.0× on Graviton 5, parity-or-better elsewhere except the
-laptop's short-context cross call (host-side overhead, see §9).
+the 4-core Xeon and 2.0× on Graviton 5, parity-or-better elsewhere. It runs on
+torch's own OpenMP pool (`GOMP_parallel`), which makes the engine **faster than
+the vendored C++ backend end to end** on the laptop: 392-396 vs 364-377 tok/s at
+8x128 (§9.3), 29.8 vs 90.7 µs per attention call at b8/ctx256 (§7).
 
 ## 2. Layout
 
 ```
 mojo/
-  pixi.toml                 Mojo + MAX nightly; platforms = linux-64, linux-aarch64, osx-arm64
+  pixi.toml                 Mojo nightly, no MAX; platforms = linux-64, linux-aarch64
   src/attention.mojo        the kernel (Job, store, generic + dot attention, dispatch)
   src/fastencdec_mojo_attn.mojo  Python extension: PyInit_..., one `attention(...)` entry
   tests/test_attention.mojo standalone parity test vs a scalar fp32 reference
   tests/bench_qk.mojo       isolated QK micro-benchmark (fp32 vs dpbf16ps)
-  tests/bench_max_attention.mojo  MAX's own CPU attention as a reference point
   README.md                 user-facing: design, per-box tables, "what not to redo"
 ```
 
@@ -35,9 +36,19 @@ call wrapper), `mojo_ops.py` (opaque custom ops), dispatch in
 
 ```bash
 cd mojo
-pixi run build        # mojo build src/fastencdec_mojo_attn.mojo --emit shared-lib -o build/...
-pixi run test         # mojo run -I src tests/test_attention.mojo   -> 11 OK lines
+pixi run build        # mojo build src/... --emit shared-lib -o build/... -Xlinker -lgomp
+pixi run test         # mojo build -I src tests/test_attention.mojo -o build/test_attention \
+                      #     -Xlinker -lgomp && build/test_attention        -> 11 OK lines
 ```
+
+`-Xlinker -lgomp` is a hard build dependency: the kernel dispatches on libgomp
+(§4), so the `.so` records `DT_NEEDED libgomp.so.1` and the standalone test
+binary links it too. Two consequences:
+`mojo run` **cannot** run the kernel (the JIT cannot resolve `GOMP_parallel` /
+`omp_get_thread_num` and fails with `Symbols not found`), which is why the `test`
+task builds a binary and runs it; and the backend is Linux-only, so `pixi.toml`
+lists `linux-64`/`linux-aarch64` only. The env depends on `mojo` alone — no
+`max` package, no MAX thread pool, no `MODULAR_THREAD_BUSY_WAIT_US`.
 
 From the repo root (needs the `.so` above):
 
@@ -56,10 +67,11 @@ overrides the `.so` path; `FASTENCDEC_MOJO_WORKERS` overrides the worker count.
 Contract (enforced by the engine): **exactly one query token per sequence**,
 attending to every cached position. That makes the causal mask the cache tail.
 
-- Work item = one `(sequence, head)` pair, parallelized with
-  `max.algorithm.parallelize`, `num_workers = min(torch threads, physical cores,
-  tasks)`. Each task owns one head's cache slice end to end → no KV split, no
-  scratch pad, no cross-thread reduction.
+- Work item = one `(sequence, head)` pair, dispatched with `GOMP_parallel` on
+  **torch's own OpenMP pool**, `num_workers = min(torch threads, physical cores,
+  tasks)`; one worker (inline, no region) when `num_tasks * pages <= 32`. Each
+  task owns one head's cache slice end to end → no KV split, no scratch pad, no
+  cross-thread reduction.
 - KV is scored in **tiles** of `tile` positions (`32` when `block_size % 32 == 0`,
   else `16`) and `GROUP = 4` tiles per online-softmax step.
 - A **page** holds `block_size / tile` tiles. The group loop resolves
@@ -161,12 +173,27 @@ vdpbf16ps` (72 here) or `grep -c bfdot` (5664 on Graviton).
   `MutUntrackedOrigin`; `Int(ptr)` gives the address.
 - FFI: `external_call["symbol", RetType](args...)`; `@export def f() abi("C")`;
   a thin function value can be taken (`comptime entry = worker_entry`) and passed
-  to C — that is enough for `pthread_create`/`pthread_join`, verified.
+  to C — that is enough for `pthread_create`/`pthread_join` and for the whole
+  libgomp dispatch (`GOMP_parallel(entry, Int(state), Int32(n), Int32(0))`).
+- **`fn` is a reserved word**: a field, parameter or `comptime` binding named
+  `fn` is a parse error (`var fn: ...` → "expected name for 'var' declaration";
+  `comptime fn = f` → "'comptime' cannot be used with 'fn'"). Name them
+  `task_fn` / `entry`.
+- A struct that holds a **thin function value** (`comptime TaskFn = def(Job, Int,
+  Bool, Bool) thin -> None`) is assignable and callable through the field —
+  including when the struct is reached through a raw pointer — but it must
+  conform to `ImplicitlyCopyable` (as must the `Job` it carries), otherwise
+  `state[] = Dispatch(...)` fails with "cannot be implicitly copied".
+- **libgomp slices must use `omp_get_num_threads()`**, not the requested worker
+  count: `GOMP_parallel` clamps the request to `OMP_NUM_THREADS`, which torch
+  sets via `set_num_threads`, and a slice computed from the request leaves work
+  unexecuted when the clamp bites. The region is synchronous, so the call
+  state can live on the caller's stack.
 - Python extension: `PythonModuleBuilder`, `def_function`, args are
   `PythonObject`, convert with `Int(py=...)` / `Float64(py=...)`. 23 int args
-  cost 0.68 µs total, so marshalling is not worth micro-optimising. Call
-  `std.runtime.initialize_runtime()` at the top of every exported entry point
-  (a `.so` has no Mojo `main`). A shared library must not define `main`.
+  cost 0.68 µs total, so marshalling is not worth micro-optimising.
+  `std.runtime.initialize_runtime()` (MAX's runtime) is **gone**: nothing uses a
+  Mojo thread pool now. A shared library must not define `main`.
 - `mojo format src tests` exists and is expected to be clean; `mojo build
   --emit asm|llvm`, `--print-effective-target`, `--target-triple/--target-cpu`.
 - Prefer `stack_allocation` or torch tensors over `List` for buffers a kernel
@@ -183,25 +210,22 @@ vdpbf16ps` (72 here) or `grep -c bfdot` (5664 on Graviton).
 | `_attention()` (extension callable, bound once) | 0.03 |
 | `_workers()` (env override cached at import) | 0.16 |
 | dtype lookup | 0.08 |
-| `max.algorithm.parallelize`, warm, 8 workers (flat 2-8) | 6.3 |
-| inline (1 worker) | 0.36 |
-| `DeviceContext.cpu()` + `synchronize()` (floor of a dispatch) | 1.9 |
-| same dispatch with the pool **asleep** (1 ms gap), median | 103-140 |
-| attention call in-engine, ours / C++ backend (0.8 ms gap) | 180 / 167 |
+| **`GOMP_parallel`, 8 workers, warm** | **2.4** |
+| **`GOMP_parallel`, 8 workers, 1 ms idle gap** | **2.7** |
+| inline (1 worker, no region) | 0.36 |
+| `max.algorithm.parallelize`, warm (removed) | 6.3 |
+| same, 1 ms gap (removed) | 103-140 |
+| attention call in-engine, ours / C++ backend (0.8 ms gap) | **29.8** / 90.7 |
 
-Consequences: `_workers()` returns 1 (inline, 0.36 µs dispatch) when
-`num_tasks * pages <= 64` — measured cold at b1/ctx128, 26.8 µs inline vs 156.7
-with 8 workers, while at >=128 KV positions per task the two are level. It caps
-at the **physical** core count (sysfs topology, cached) because a parent `OMP_NUM_THREADS` larger than the core count
-oversubscribes MAX's fork-join (4.3× slower at b1/ctx256 on a 4-core SMT box).
-Keeping the pool hot (`MODULAR_THREAD_BUSY_WAIT_US` ≥ inter-call gap) is worse,
-and even MAX's **default 200 µs spin is a loss here**: `mojo_attn._load()` now
-`setdefault`s it to 0 (the runtime reads it at `initialize_runtime()`, i.e. at
-the first kernel call, so setting it there is in time). Measured with a
-GEMM/attention interleave at the engine's cadence: per call, attention
-99.9 → **90.6 µs** (equal to the C++ backend) and the GEMM-phase interference
-56.0 → **39.0 µs** (C++: 20.4); end to end 344 → **359 tok/s (+4.5%)**, and the
-non-attention part of the step returned to parity (+90 ms → +9 ms).
+Consequences: the dispatch is no longer the story, so `_workers()` inlines only
+`num_tasks * pages <= 32` (24.5 vs 31.0 µs at b1/ctx64) — from b1/ctx128 up the
+pool wins (1.3x at b1/ctx128, 8x at b8/ctx256). The cap at the **physical** core
+count stays (8 workers on a 4-core Xeon: 1.5x slower at ctx 1024 and unstable at
+batch 8), though torch now already sizes its pool that way, so it only bites when
+a parent sets a larger `OMP_NUM_THREADS`. The old MAX-pool workarounds are gone
+with the pool: no spin knob, no `initialize_runtime()`. Interleaved with GEMMs at
+the engine's cadence the totals are now 88.8 µs per call (ours) vs 116.6 (C++),
+i.e. attention 29.8-49.6 + interference +39.2 against 90.7 + 25.9.
 
 ## 8. Engine integration
 
@@ -224,15 +248,18 @@ non-attention part of the step returned to parity (+90 ms → +9 ms).
 2. **GROUP = 4** amortizes the softmax bookkeeping; per-page softmax cost was
    4× more max/exp/rescale work at short contexts. Measured neutral 2/4/8 on
    both servers afterwards.
-3. **Per-call fixed cost dominates short contexts** (~12.6 µs of a 75 µs call on
-   the 4-core Xeon at b8/ctx256; ~6 µs of a 33 µs call on the Ryzen). MAX's
-   dispatch is flat in worker count, so there is no worker-count lever — and a
-   hand-rolled pthread pool prototype measured **9.4 µs warm / 103 µs cold**
-   against MAX's 6.3 / 140, i.e. no better. The wake cost is the platform's;
-   vLLM's OpenMP threads pay it too. After the spin fix the engine is at
-   180 µs (ours) vs 167 µs (C++), i.e. +13 µs/call ≈ 1.4% of a step; the
-   remaining GEMM-phase difference is ~0.
-4. **Do not re-try**: software prefetch of the next page's K/V (3 strides,
+3. **Per-call fixed cost dominated short contexts — solved by running on torch's
+   pool.** With a private pool it was ~12.6 µs of a 75 µs call on the 4-core Xeon
+   at b8/ctx256 and ~6 µs of a 33 µs call on the Ryzen, and every attempt to
+   shrink it failed: MAX's `parallelize` 6.3 warm / 103-140 cold, a hand-rolled
+   pthread pool 9.4 / 103, a 200 µs worker spin that cost 4.5% end to end.
+   `GOMP_parallel` on the libgomp pool torch keeps busy between calls is 2.4 µs
+   warm / 2.7 µs cold, and it removed the problem instead of shaving it: the
+   in-engine call at b8/ctx256 went 180-196 → **29.8 µs** against the C++
+   backend's 90.7-167, and 8x128 end to end 344 → **392-396 tok/s** (C++:
+   364-377). The backend is now faster end to end on the laptop.
+4. **Do not re-try**: a private thread pool in any form, including a spin
+   (`GOMP_parallel` is the answer, §9.3); software prefetch of the next page's K/V (3 strides,
    neutral-to-worse — the pages are 4 KB sequential streams), `GROUP` 2/8,
    6/8 workers (`GROUP` beyond 4 registers-spills; >physical threads oversubscribes
    the fork-join), AMX.
@@ -246,8 +273,8 @@ non-attention part of the step returned to parity (+90 ms → +9 ms).
    Graviton 298 GB/s at 8.4 MB, 231 at 33.5 MB, 199 at 134 MB. Measured by
    pointing every sequence at one shared page set (1 MB unique vs 8.4 MB): the
    shared set is 1.6× faster at ctx 256 and 4× at ctx 1024.
-7. **MAX's own CPU attention** (`max.kernels.nn.attention.cpu.mha`) is the wrong
-   yardstick: not paged, no block table, and its bf16 path is **5-9× slower than
+7. **MAX's own CPU attention** (`max.kernels.nn.attention.cpu.mha`, measured with
+   a script that went away with the `max` dependency) is the wrong yardstick: not paged, no block table, and its bf16 path is **5-9× slower than
    fp32** on AVX-512 (355 vs 39 µs at b8/ctx256) because AVX-512 has no native
    bf16 add/mul/fma — a bf16-native kernel scalarizes. Widening to fp32 and using
    bf16 only for the dot instruction is what makes this port fast.
@@ -255,7 +282,10 @@ non-attention part of the step returned to parity (+90 ms → +9 ms).
 ## 10. Final three-box numbers (ratio `mojo/vllm`, <1 = faster)
 
 `benchmarks/attn_backend.py --mode kernel` + `benchmarks/kernel_ab.py`, two runs
-each, threads = physical cores, workers = `_workers()`:
+each, threads = physical cores, workers = `_workers()`. Measured with the old
+private pool; the libgomp switch removes ~4 µs of dispatch per call (a few % of
+the short-context rows, nothing at 1024), so treat these as slightly
+conservative for the current tree:
 
 | box (threads/workers) | self b8/256 | cross b8/256 | self b8/1024 | cross b8/1024 | self b32/1024 |
 |---|---:|---:|---:|---:|---:|
@@ -313,7 +343,9 @@ default of 16 is also the C++ kernel's best point (67 vs 76 µs at block 32).
   the 1.4 GB Mojo/MAX env.
 - Both servers need `pixi` (`~/.pixi/bin/pixi`), `gcc/g++/ninja` (for the `csrc`
   JIT), and `pixi run build` after every sync. `mojo/pixi.toml` lists
-  `linux-64`, `linux-aarch64`, `osx-arm64`; nothing else to change per box.
+  `linux-64`, `linux-aarch64` only (libgomp dispatch) and the env is `mojo`
+  alone, ~1.2 GB. `pixi run test` needs no `gcc`: it links the conda-forge
+  libgomp that ships with the env, and the `.so` records an RPATH into it.
 - `benchmarks/kernel_ab.py --threads N --workers N` pins the knobs; `0` means
   "torch default / the kernel's physical-core rule". These boxes drift ±10% and
   Graviton's 1024-token rows ±25%, so always run it twice and report the band.
@@ -329,8 +361,9 @@ default of 16 is also the C++ kernel's best point (67 vs 76 µs at block 32).
 3. **GQA/MQA**: one KV page shared by `q_heads_per_kv` heads would let one task
    amortise the K/V loads over several query heads — and only then does AMX
    (16-row tiles) become interesting. Not needed for BART/Florence-2.
-4. **Own thread pool**: blocked by "no mutable globals" unless the state lives
-   behind a Python-held address; the prototype showed no win (§9.3), so don't.
+4. ~~Own thread pool~~ **Done, differently**: not a pool of our own (no win,
+   §9.3) but `GOMP_parallel` on torch's pool. A hand-rolled pool cannot beat it
+   because the win is *reusing* the pool that is already awake.
 5. **`partial_simd_load`** for tails instead of `iota`+`select` (cosmetic).
 6. **T5** (root `AGENTS.md`): same paged path, but its per-layer pointwise chains
    are what the frozen compile graphs fuse, so the CPU gains would be larger.
