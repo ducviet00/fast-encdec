@@ -79,15 +79,15 @@ placeholders; the decoder is unchanged.
   cpu` (the project `.venv`, torch from the PyTorch CPU index) or `--extra
   cu130` for CUDA.  `uv lock --check` and `uv sync --extra cpu --dry-run`
   both pass.
-- Mojo backend (optional): a **separate repository**, `cpu-attention.mojo`
-  (sibling checkout at `../cpu-attention.mojo`), imported as `cpu_attention`
+- Mojo backend (optional): a **separate repository**, `cpu-attention`
+  (sibling checkout at `../cpu-attention`), imported as `cpu_attention`
   exactly like `flash_attn`.  Its kernel lives in a self-contained `pixi` env
   (`cpu_attention/_mojo`, ~1.2 GB, `mojo` only — no `max` package) and
   parallelizes with `GOMP_parallel` on **torch's own OpenMP pool**, linking
   `libgomp` (`-Xlinker -lgomp`): Linux-only, and libgomp must be loadable at
   `.so` load time (torch ships/loads one; the pixi env's conda-forge copy is on
-  the library's RUNPATH).  Setup: `uv pip install -e ../cpu-attention.mojo
-  --no-deps`, then `cd ../cpu-attention.mojo/cpu_attention/_mojo && pixi run
+  the library's RUNPATH).  Setup: `uv pip install -e ../cpu-attention
+  --no-deps`, then `cd ../cpu-attention/cpu_attention/_mojo && pixi run
   build` -> `cpu_attention/_C.so`; `CPU_ATTENTION_LIB` overrides the path.
   Both the `.so` and the Python package are built for this box (`mojo build`
   targets the host CPU), so rebuild rather than copying between machines.
@@ -125,7 +125,7 @@ fastencdec/
     context.py         device-agnostic per-step Context read by the attention ops
     loader.py          HF checkpoint -> model weights (concatenates fused q/k/v)
 csrc/                  vendored vLLM CPU attention kernels (+ bindings.cpp)
-../cpu-attention.mojo  SEPARATE REPO: the Mojo kernel + flash-attn-shaped Python API
+../cpu-attention  SEPARATE REPO: the Mojo kernel + flash-attn-shaped Python API
   cpu_attention/       package: _kernel.py, ops.py, flash_attn_interface.py, _C.so
   cpu_attention/_mojo/ pixi env, kernel (src/attention.mojo), extension (src/_C.mojo),
                        standalone parity test (tests/test_attention.mojo)
@@ -279,11 +279,11 @@ PYTHONPATH=. $P tests/test_parity.py
 PYTHONPATH=. $P tests/test_attn_backend.py
 
 # cpu_attention backend vs the SDPA path (same tiny BART; skips when the library
-# is not installed: uv pip install -e ../cpu-attention.mojo --no-deps)
-(cd ../cpu-attention.mojo/cpu_attention/_mojo && pixi run build)
+# is not installed: uv pip install -e ../cpu-attention --no-deps)
+(cd ../cpu-attention/cpu_attention/_mojo && pixi run build)
 PYTHONPATH=. $P tests/test_cpu_attention.py
-(cd ../cpu-attention.mojo/cpu_attention/_mojo && pixi run test)  # standalone, no torch
-PYTHONPATH=. $P ../cpu-attention.mojo/tests/test_flash_api.py    # flash-shaped API
+(cd ../cpu-attention/cpu_attention/_mojo && pixi run test)  # standalone, no torch
+PYTHONPATH=. $P ../cpu-attention/tests/test_flash_api.py    # flash-shaped API
 
 # token-by-token parity vs HF on the real checkpoints (fp32 exact; bf16 same length).
 # fp32 needs ~8 GB above loading both engines: each (model, beams) phase runs in
@@ -374,7 +374,7 @@ hand-edit or guess.**
 | batch=8, beams=1, fp32 | 8978 | 228.2 | 25289 | 80.9 | 2.82x |
 
 The Mojo backend's per-box numbers (Ryzen, Granite Rapids, Graviton 5) live in
-`../cpu-attention.mojo/README.md`; the table below is the default (`auto` = vendored C++) path.
+`../cpu-attention/README.md`; the table below is the default (`auto` = vendored C++) path.
 
 Mean of two runs with a cold Inductor cache (`/tmp/torchinductor_*` and
 `~/.cache/torch_extensions` removed first).  This recording is the frozen
@@ -643,7 +643,7 @@ on this box with the same kind of workload.
   — `ninja` is now in the `cpu` extra for exactly this reason, and a bare
   `uv sync` without it is the usual cause.
 - **Mojo kernel (`attn_backend="mojo"`, opt-in).** The kernel lives in the
-  `cpu-attention.mojo` repo (`cpu_attention/_mojo/src/attention.mojo`) and is
+  `cpu-attention` repo (`cpu_attention/_mojo/src/attention.mojo`) and is
   imported as `cpu_attention`, exactly like `flash_attn`.  `attention.mojo` ports
   the hot path of the x86 `VEC` kernel: paged self-attention (scatter K/V, then
   attend), cross-attention over the staged encoder cache, and
@@ -716,7 +716,7 @@ on this box with the same kind of workload.
   tile fixed.  (3) The compiled path is gated by `attention.uses_custom_ops` and
   `ModelRunner.compiled_backend`, so overriding the backend after compile falls
   back to eager.  (4) Build with `pixi run build` in
-  `../cpu-attention.mojo/cpu_attention/_mojo` (see that repo's `README.md` and
+  `../cpu-attention/cpu_attention/_mojo` (see that repo's `README.md` and
   `AGENTS.md` for the port's own handover: Mojo
   language traps, the `LANES`/intrinsic gating, measured fixed costs and the
   per-box tables); without the `.so` the backend is unavailable and `auto` is
@@ -963,7 +963,7 @@ on this box with the same kind of workload.
 - After changes: run `python -m compileall fastencdec`,
   `tests/test_parity.py`, `tests/test_attn_backend.py`,
   `tests/test_cpu_attention.py` (when the `cpu_attention` library is installed),
-  `../cpu-attention.mojo/tests/test_flash_api.py`,
+  `../cpu-attention/tests/test_flash_api.py`,
   `tests/test_florence2.py`, `tests/test_beam.py`,
   `uvx ruff check` / `uvx ruff format --check`, and
   `benchmarks/benchmark.py --scenarios '256->256'`.

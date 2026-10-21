@@ -55,7 +55,7 @@ def _paged_backend(device, dtype, head_dim, block_size) -> str:
         if cpu_attention is None:
             raise RuntimeError(
                 "attn_backend='mojo' needs the cpu_attention library "
-                "(pip install -e ../cpu-attention.mojo)"
+                "(pip install -e ../cpu-attention)"
             )
         if cpu_attention.supported(dtype, block_size, head_dim):
             return "mojo"

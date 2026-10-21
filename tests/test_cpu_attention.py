@@ -7,7 +7,7 @@ guard), but with ``attn_backend="mojo"`` on the tiny BART model whose
 ``head_dim`` (32) the kernel supports. Skips when the shared library is not
 built.
 
-Run with:  PYTHONPATH=.:../cpu-attention.mojo python tests/test_cpu_attention.py
+Run with:  PYTHONPATH=.:../cpu-attention python tests/test_cpu_attention.py
 """
 
 import os

@@ -30,7 +30,7 @@ def self_attention(
     if cpu_attention is None:
         raise RuntimeError(
             "attn_backend='mojo' needs the cpu_attention library "
-            "(pip install -e ../cpu-attention.mojo)"
+            "(pip install -e ../cpu-attention)"
         )
     ctx = get_context()
     return cpu_attention.self_attention(
@@ -68,7 +68,7 @@ def cross_attention(
     if cpu_attention is None:
         raise RuntimeError(
             "attn_backend='mojo' needs the cpu_attention library "
-            "(pip install -e ../cpu-attention.mojo)"
+            "(pip install -e ../cpu-attention)"
         )
     staged = get_context().cross_staged
     if staged is None:
