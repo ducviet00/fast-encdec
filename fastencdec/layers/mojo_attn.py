@@ -103,18 +103,18 @@ def _physical_cores() -> int:
 
 
 def _workers(num_tasks: int, pages: int = 1) -> int:
-    """Workers for one call: inline for tiny work, else torch's pool capped at cores.
+    """Workers for one call: the physical-core cap, inline only for tiny work.
 
-    A call pays ~6 us of fork-join warm and ~140 us cold (the pool is asleep
-    between decode steps), while the work is ``num_tasks * pages`` KV positions.
-    Below ~64-128 positions per call that fixed cost dominates: measured cold at
-    batch 1 / ctx 128, one worker (inline, 0.36 us dispatch) is 2.1x faster than
-    8 (124 vs 265 us), while at batch 1 / ctx 256 the two are level, so the rule
-    only inlines genuinely tiny calls. Above it the pool wins by ~num_workers, so keep it. The cap
-    at the *physical* core count matters on SMT boxes (8 workers on a 4-core
-    Xeon: 1.5x slower at ctx 1024 and unstable at batch 8), and a parent
-    ``OMP_NUM_THREADS`` larger than the core count would oversubscribe the
-    fork-join. ``FASTENCDEC_MOJO_WORKERS`` overrides everything.
+    The kernel dispatches on torch's own OpenMP pool (``GOMP_parallel``), so a
+    fork-join costs ~2.4 us warm and ~2.7 us with a 1 ms gap -- there is no
+    sleeping second pool to wake, which is why the pool now wins almost
+    everywhere: measured cold, one worker (inline, 0.36 us) beats 8 only up to
+    ~32 KV positions per call (24.5 vs 31.0 us at batch 1 / ctx 64), while at
+    batch 1 / ctx 128 the pool is already 1.3x faster and at batch 8 / ctx 256
+    it is 8x. The cap at the *physical* core count matters on SMT boxes (8
+    workers on a 4-core Xeon: 1.5x slower at ctx 1024); torch already sizes its
+    pool that way, so it only bites when a parent sets a larger
+    ``OMP_NUM_THREADS``. ``FASTENCDEC_MOJO_WORKERS`` overrides everything.
     """
     if _OVERRIDE:
         return max(1, min(int(_OVERRIDE), num_tasks))
