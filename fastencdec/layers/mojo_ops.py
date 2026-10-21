@@ -5,10 +5,14 @@ so they can read the per-step Context and call the kernel while Dynamo sees a
 single op (see ``TORCH_COMPILE_FREEZING.md``).
 """
 
-import cpu_attention
 import torch
 
 from ..utils.context import get_context
+
+try:  # the Mojo backend is an optional, separately installed library
+    import cpu_attention
+except ImportError:  # pragma: no cover - exercised by installing without it
+    cpu_attention = None
 
 
 @torch.library.custom_op(
