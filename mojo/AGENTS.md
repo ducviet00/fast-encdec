@@ -259,7 +259,12 @@ i.e. attention 29.8-49.6 + interference +39.2 against 90.7 + 25.9.
    backend's 90.7-167, and 8x128 end to end 344 → **392-396 tok/s** (C++:
    364-377). The backend is now faster end to end on the laptop.
 4. **Do not re-try**: a private thread pool in any form, including a spin
-   (`GOMP_parallel` is the answer, §9.3); software prefetch of the next page's K/V (3 strides,
+   (`GOMP_parallel` is the answer, §9.3) — and note `max.algorithm.parallelize`
+   never had an OpenMP backend to select: it enqueues on AsyncRT's own
+   `CPUDevice` work queue (`std::thread` + semaphore, `WorkQueueType` is only
+   `kSingleThread`/`kThreadPool`), `libAsyncRTMojoBindings.so`/`libmax.so` contain
+   no `GOMP_*`/`omp_*`/`__kmpc` symbols, and the only knob is
+   `MODULAR_THREAD_BUSY_WAIT_US`; software prefetch of the next page's K/V (3 strides,
    neutral-to-worse — the pages are 4 KB sequential streams), `GROUP` 2/8,
    6/8 workers (`GROUP` beyond 4 registers-spills; >physical threads oversubscribes
    the fork-join), AMX.
