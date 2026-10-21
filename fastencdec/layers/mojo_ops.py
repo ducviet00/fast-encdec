@@ -5,10 +5,10 @@ so they can read the per-step Context and call the kernel while Dynamo sees a
 single op (see ``TORCH_COMPILE_FREEZING.md``).
 """
 
+import cpu_attention
 import torch
 
 from ..utils.context import get_context
-from . import mojo_attn
 
 
 @torch.library.custom_op(
@@ -23,8 +23,13 @@ def self_attention(
     scale: float,
 ) -> torch.Tensor:
     """Write K/V and run attention over the paged cache with the Mojo kernel."""
+    if cpu_attention is None:
+        raise RuntimeError(
+            "attn_backend='mojo' needs the cpu_attention library "
+            "(pip install -e ../cpu-attention.mojo)"
+        )
     ctx = get_context()
-    return mojo_attn.self_attention(
+    return cpu_attention.self_attention(
         query,
         key,
         value,
@@ -56,11 +61,16 @@ def cross_attention(
     scale: float,
 ) -> torch.Tensor:
     """Run cross-attention over the staged encoder K/V for decoder layer ``layer_idx``."""
+    if cpu_attention is None:
+        raise RuntimeError(
+            "attn_backend='mojo' needs the cpu_attention library "
+            "(pip install -e ../cpu-attention.mojo)"
+        )
     staged = get_context().cross_staged
     if staged is None:
         raise RuntimeError("cross-attention cache is not staged for this step")
     k_cache, v_cache, block_table, cache_seqlens = staged[layer_idx]
-    return mojo_attn.cross_attention(
+    return cpu_attention.cross_attention(
         query, k_cache, v_cache, block_table, cache_seqlens, scale
     )
 

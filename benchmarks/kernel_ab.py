@@ -11,7 +11,7 @@ help?): the kernel table is best-of-N per column and this laptop's clock moves
         [--threads N] [--workers N]
 
 ``--threads 0`` keeps torch's default (physical cores). ``--workers 0`` keeps the
-kernel's own rule (`mojo_attn._workers`: torch's pool capped at the physical core
+kernel's own rule (`cpu_attention.num_workers`: torch's pool capped at the physical core
 count); any other value pins it, which is how the worker sweeps were run.
 """
 
@@ -22,9 +22,10 @@ import time
 
 sys.path.insert(0, "/home/ducviet00/fast-encdec")
 
+import cpu_attention
 import torch
 
-from fastencdec.layers import attention, cpu_attn, mojo_attn
+from fastencdec.layers import attention, cpu_attn
 
 HEADS, DIM, BLOCK = 16, 64, 32
 
@@ -53,12 +54,12 @@ def self_case(batch, ctx, dtype, workers):
     vc = torch.randn(shape, dtype=dtype)
     scale = DIM**-0.5
     if workers:  # 0 keeps the kernel's own physical-core rule
-        mojo_attn._OVERRIDE = str(workers)
+        cpu_attention.set_num_workers(workers)
     return {
         "vllm": lambda: cpu_attn.self_attention(
             q, k, v, kc, vc, slots, blocks, lens, scale
         ),
-        "mojo": lambda: mojo_attn.self_attention(
+        "mojo": lambda: cpu_attention.self_attention(
             q, k, v, kc, vc, slots, blocks, lens, scale
         ),
     }
@@ -77,10 +78,10 @@ def cross_case(batch, ctx, dtype, workers):
     q = torch.randn(batch, HEADS, DIM, dtype=dtype)
     scale = DIM**-0.5
     if workers:  # 0 keeps the kernel's own physical-core rule
-        mojo_attn._OVERRIDE = str(workers)
+        cpu_attention.set_num_workers(workers)
     return {
         "vllm": lambda: cpu_attn.cross_attention(q, *staged["vllm"], scale),
-        "mojo": lambda: mojo_attn.cross_attention(q, *staged["mojo"], scale),
+        "mojo": lambda: cpu_attention.cross_attention(q, *staged["mojo"], scale),
     }
 
 
@@ -100,11 +101,11 @@ def main():
     host = os.uname().nodename
     pinned = args.workers
     if pinned:
-        mojo_attn._OVERRIDE = str(pinned)
-    workers = mojo_attn._workers(1024)
+        cpu_attention.set_num_workers(pinned)
+    workers = cpu_attention.num_workers(1024)
     print(
         f"{host} {platform.machine()} cpus={os.cpu_count()} "
-        f"physical={mojo_attn._physical_cores()} "
+        f"physical={cpu_attention.physical_cores()} "
         f"torch_threads={torch.get_num_threads()} mojo_workers={workers}"
         f"{' (pinned)' if pinned else ''}, {args.dtype}"
     )

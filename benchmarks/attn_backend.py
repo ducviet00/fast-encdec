@@ -13,7 +13,7 @@ Two sections:
 
 The implementations are:
   vllm  -- the vendored vLLM CPU kernel (`csrc/`), the engine's default;
-  mojo  -- the Mojo port (`mojo/src/attention.mojo`), skipped when its shared
+  mojo  -- the cpu_attention library, skipped when it is not installed
            library is not built;
   sdpa  -- PyTorch's `scaled_dot_product_attention` (its own kernel choice);
   eager -- PyTorch SDPA pinned to `SDPBackend.MATH`, i.e. the naive
@@ -28,10 +28,11 @@ import argparse
 import sys
 import time
 
+import cpu_attention
 import torch
 
 from fastencdec.config import default_block_size
-from fastencdec.layers import attention, cpu_attn, mojo_attn
+from fastencdec.layers import attention, cpu_attn
 from fastencdec.utils.context import set_context
 
 HEADS, HEAD_DIM = 16, 64  # bart-large-cnn
@@ -123,7 +124,7 @@ def _time_self(variant, num_seqs, ctx_len, block_size, dtype, scale, iters):
         num_seqs, ctx_len, block_size, dtype
     )
     if variant in ("vllm", "mojo"):
-        attn = cpu_attn if variant == "vllm" else mojo_attn
+        attn = cpu_attn if variant == "vllm" else cpu_attention
         run = lambda: attn.self_attention(
             q, k, v, k_cache, v_cache, slots, blocks, lens, scale
         )
@@ -137,7 +138,7 @@ def _time_self(variant, num_seqs, ctx_len, block_size, dtype, scale, iters):
 def _time_cross(variant, num_seqs, enc_len, block_size, dtype, scale, iters):
     q, kv_cache, request_ids, staged = _cross_case(num_seqs, enc_len, block_size, dtype)
     if variant in ("vllm", "mojo"):
-        attn = cpu_attn if variant == "vllm" else mojo_attn
+        attn = cpu_attn if variant == "vllm" else cpu_attention
         k_cache, v_cache, block_table, cache_seqlens = staged[variant]
         run = lambda: attn.cross_attention(
             q, k_cache, v_cache, block_table, cache_seqlens, scale
@@ -153,7 +154,7 @@ def kernel_section(dtype, block_size, iters):
         f"\n== kernel: decoder attention ops in isolation ({dtype}, "
         f"heads={HEADS} head_dim={HEAD_DIM}, block_size={block_size}) =="
     )
-    variants = [v for v in VARIANTS if v != "mojo" or mojo_attn.module() is not None]
+    variants = [v for v in VARIANTS if v != "mojo" or cpu_attention.is_available()]
     header = (
         f"{'op':<26} "
         + " ".join(f"{v:>10}" for v in variants)

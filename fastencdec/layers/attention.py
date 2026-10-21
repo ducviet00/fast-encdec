@@ -2,7 +2,12 @@ import torch
 import torch.nn.functional as F
 
 from ..utils.context import get_context
-from . import cpu_attn, cpu_ops, flash_attn, mojo_attn, mojo_ops
+from . import cpu_attn, cpu_ops, flash_attn, mojo_ops
+
+try:  # the Mojo backend is an optional, separately installed library
+    import cpu_attention
+except ImportError:  # pragma: no cover - exercised by installing without it
+    cpu_attention = None
 
 _BACKENDS = ("auto", "vllm", "flash", "sdpa", "mojo")
 # Backends whose ops are opaque custom ops: they read the per-step Context and
@@ -47,7 +52,12 @@ def _paged_backend(device, dtype, head_dim, block_size) -> str:
             return "flash"
         return "flash" if flash_attn.module() is not None else "sdpa"
     if device.type == "cpu" and _PREFER == "mojo":
-        if mojo_attn.supported(dtype, block_size, head_dim):
+        if cpu_attention is None:
+            raise RuntimeError(
+                "attn_backend='mojo' needs the cpu_attention library "
+                "(pip install -e ../cpu-attention.mojo)"
+            )
+        if cpu_attention.supported(dtype, block_size, head_dim):
             return "mojo"
         raise RuntimeError(
             f"the Mojo attention kernel does not support head_dim={head_dim} "
@@ -99,7 +109,7 @@ def _store(key, value, k_cache, v_cache, slot_mapping, block_size, backend):
     if backend == "vllm":
         cpu_attn.reshape_and_cache(key, value, k_cache, v_cache, slot_mapping)
     elif backend == "mojo":
-        mojo_attn.reshape_and_cache(key, value, k_cache, v_cache, slot_mapping)
+        cpu_attention.reshape_and_cache(key, value, k_cache, v_cache, slot_mapping)
     else:
         store_kvcache(
             key,
