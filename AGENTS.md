@@ -719,6 +719,11 @@ on this box with the same kind of workload.
   avx512bf16 here), so rebuild per machine.  (6) `mojo run` cannot execute the
   kernel (the JIT cannot resolve `GOMP_parallel`/`omp_get_thread_num`); use
   `pixi run test`, which builds a binary with `-Xlinker -lgomp` and runs it.
+  (7) The public API mirrors flash-attn (`flash_attn_with_kvcache`,
+  `flash_attn_func`; unsupported features raise `NotImplementedError`) but keeps
+  the head-major cache layout, and the engine's hot path calls the thin
+  `self_attention`/`cross_attention` aliases because the checked wrapper costs
+  ~4% end to end at 24 calls per step (`check_inputs=False` ~2%).
 - **CPU page size (`block_size`).** `block_size=None` picks the smallest page the
   device's best kernel accepts (`fastencdec.config.default_block_size`): 256 on
   CUDA, **32 on x86**, 16 on aarch64.  `csrc`'s full-width AVX-512 kernel

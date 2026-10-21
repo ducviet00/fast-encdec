@@ -53,6 +53,92 @@ PYTHONPATH=. .venv/bin/python benchmarks/attn_backend.py --mode kernel
 PYTHONPATH=. .venv/bin/python benchmarks/benchmark.py --backend mojo --scenarios '256->256'
 ```
 
+## API
+
+The public entry points mirror `flash_attn`:
+
+```python
+flash_attn_with_kvcache(
+    q,
+    k_cache,
+    v_cache,
+    k=None,
+    v=None,
+    qv=None,
+    rotary_cos=None,
+    rotary_sin=None,
+    cache_seqlens=None,
+    cache_batch_idx=None,
+    cache_leftpad=None,
+    page_table=None,
+    cu_seqlens_q=None,
+    cu_seqlens_k_new=None,
+    max_seqlen_q=None,
+    rotary_seqlens=None,
+    q_descale=None,
+    k_descale=None,
+    v_descale=None,
+    softmax_scale=None,
+    causal=False,
+    window_size=(-1, -1),
+    attention_chunk=0,
+    softcap=0.0,
+    rotary_interleaved=True,
+    scheduler_metadata=None,
+    num_splits=0,
+    pack_gqa=None,
+    sm_margin=0,
+    return_softmax_lse=False,
+    block_table=None,
+    slot_mapping=None,
+    check_inputs=True,
+)
+flash_attn_func(
+    q,
+    k,
+    v,
+    dropout_p=0.0,
+    softmax_scale=None,
+    causal=False,
+    window_size=(-1, -1),
+    softcap=0.0,
+    alibi_slopes=None,
+    deterministic=False,
+    return_attn_probs=False,
+)
+```
+
+Every flash-attn argument is accepted; what the kernel cannot do raises
+`NotImplementedError` instead of being silently ignored: `qv`, `rotary_*`,
+`cache_leftpad`, `cu_seqlens_*`, `max_seqlen_q`, `*_descale`, `window_size`,
+`softcap`, `attention_chunk`, `return_softmax_lse`, `seqlen > 1` (the kernel
+decodes one query token per sequence), and any `flash_attn_func` call with more
+than one query token. The tuning hints (`num_splits`, `pack_gqa`, `sm_margin`,
+`scheduler_metadata`, `rotary_interleaved`) are accepted and ignored, and
+`deterministic` is a no-op because the forward pass always is.
+
+Deliberate differences from flash-attn:
+
+* the cache is this backend's head-major
+  `[num_blocks, nheads_k, page_block_size, headdim]` (`attention.self_cache_shape`),
+  not flash's page-major layout — K is stored transposed inside the page, which
+  is exactly what the bf16 dot products read, so the two are not
+  interchangeable;
+* `causal` is accepted and has no effect: one query at the last cached position
+  keeps every key under the bottom-right-aligned mask;
+* with `k`/`v`, they are written at `cache_seqlens` (the length *before* the
+  write, flash's convention); passing `slot_mapping` writes them at those slots
+  and reads `cache_seqlens` as the length *after* the write, which is what the
+  engine's per-step Context holds.
+
+`check_inputs=False` skips the argument validation. The engine's per-layer path
+calls the thin aliases `self_attention(...)` / `cross_attention(...)` (the same
+kernel call, geometry already checked by the runner): the checked entry point
+costs ~4% end to end at the engine's 24 calls per decode step, ~2% with
+`check_inputs=False`, so the aliases stay on the hot path. `flash_attn_func`
+with one query token stages the K/V into a temporary paged cache (a real dense
+multi-token kernel is not ported; the BART encoder keeps its SDPA path).
+
 ## Design
 
 * **Parallelism: one task per (sequence, head), on torch's own pool.** The work

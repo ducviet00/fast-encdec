@@ -231,6 +231,16 @@ i.e. attention 29.8-49.6 + interference +39.2 against 90.7 + 25.9.
 
 - Backend name `mojo`, opt-in; `auto` still resolves to the vendored C++ kernel
   so all recorded baselines keep their meaning.
+- **Public API mirrors flash-attn**: `flash_attn_with_kvcache(...)` and
+  `flash_attn_func(...)` take flash's full argument list; anything the kernel
+  cannot do (`qv`, `rotary_*`, `window_size`, `softcap`, `cache_leftpad`,
+  `cu_seqlens_*`, `*_descale`, `return_softmax_lse`, `seqlen > 1`, dense
+  multi-token) raises `NotImplementedError` rather than being ignored, and the
+  tuning hints are no-ops.  The cache layout stays ours (head-major, K
+  transposed in the page), not flash's page-major one, and `causal` has no
+  effect with one query token.  The engine's per-layer path calls the thin
+  aliases `self_attention`/`cross_attention` instead: the checked wrapper costs
+  ~4% end to end at 24 calls/step (~2% with `check_inputs=False`), measured.
 - `attention.uses_custom_ops(backend)` gates the frozen-compile path (the ops are
   `torch.library.custom_op` with `mutates_args={"k_cache","v_cache"}` so Dynamo
   never traces the kernel or the `Context` reads).
