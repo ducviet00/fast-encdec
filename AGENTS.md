@@ -79,6 +79,17 @@ placeholders; the decoder is unchanged.
   cpu` (the project `.venv`, torch from the PyTorch CPU index) or `--extra
   cu130` for CUDA.  `uv lock --check` and `uv sync --extra cpu --dry-run`
   both pass.
+- Mojo backend (optional): a **separate repository**, `cpu-attention`
+  (sibling checkout at `../cpu-attention`), imported as `cpu_attention`
+  exactly like `flash_attn`.  Its kernel builds with the PyPI `mojo` wheel
+  (uv's `build` extra — no pixi/conda env) and parallelizes with
+  `GOMP_parallel` on **torch's own OpenMP pool**: Linux-only, with the libgomp
+  symbols resolved when the `.so` loads (the package imports torch first, which
+  brings `libgomp.so.1` in).  Setup: `uv pip install -e ../cpu-attention
+  --no-deps`, then `cd ../cpu-attention && uv run --extra build python
+  scripts/build.py` -> `cpu_attention/_C.so`; `CPU_ATTENTION_LIB` overrides the
+  path.  `mojo build` targets the host CPU, so rebuild rather than copying
+  between machines.
 
 ## 3. Layout
 
@@ -101,6 +112,8 @@ fastencdec/
   layers/
     attention.py       device-agnostic attention ops (encoder/self/cross) + dispatch
     cpu_attn.py        JIT build + wrapper for the vendored vLLM CPU kernels
+    cpu_ops.py         opaque custom ops for the vLLM CPU kernel (compile-safe)
+    mojo_ops.py        opaque custom ops for the cpu_attention library
     flash_attn.py      lazy loader for the kernels-community/flash-attn2 kernel (CUDA)
     logits_processor.py  pure-torch LogitsProcessor (built once per generate)
     sampler.py         greedy / multinomial sampling (Sampler nn.Module)
@@ -111,6 +124,12 @@ fastencdec/
     context.py         device-agnostic per-step Context read by the attention ops
     loader.py          HF checkpoint -> model weights (concatenates fused q/k/v)
 csrc/                  vendored vLLM CPU attention kernels (+ bindings.cpp)
+../cpu-attention  SEPARATE REPO: the Mojo kernel + flash-attn-shaped Python API
+  cpu_attention/       package: _kernel.py, ops.py, flash_attn_interface.py, _C.so
+  cpu_attention/_mojo/ kernel (src/attention.mojo), extension (src/_C.mojo),
+                       standalone parity test (tests/test_attention.mojo)
+  scripts/build.py     uv-driven build (_C.so + the standalone test)
+  AGENTS.md            the port's handover: ISA gating, Mojo gotchas, costs, per-box numbers
 examples/summarize.py
 examples/florence2.py
 benchmarks/benchmark.py
@@ -127,6 +146,7 @@ tests/test_attn_backend.py
 tests/test_florence2.py
 tests/test_beam.py
 tests/test_gpu_flash.py
+tests/test_cpu_attention.py
 ```
 
 ## 4. How a step works
@@ -182,7 +202,7 @@ out of the compiled graph.
    `BartLearnedPositionalEmbedding` adds the `+2` BART offset internally.
 3. **Paged self-attn cache.** `layers/attention.py` picks the layout the active
    kernel wants -- head-major `[num_blocks, heads, block_size, head_dim]` (vLLM
-   CPU / SDPA) or page-major `[num_blocks, block_size, heads, head_dim]`
+   CPU / Mojo / SDPA) or page-major `[num_blocks, block_size, heads, head_dim]`
    (FlashAttention-2) -- in the single place both the op and the runner go
    through, `attention.self_cache_shape`. A token at sequence position `p` lives
    in `block_tables[i, p // block_size]` at offset `p % block_size` (flat slot
@@ -258,6 +278,13 @@ PYTHONPATH=. $P tests/test_parity.py
 # vendored vLLM kernel vs the SDPA path (tiny BART with head_dim=32)
 PYTHONPATH=. $P tests/test_attn_backend.py
 
+# cpu_attention backend vs the SDPA path (same tiny BART; skips when the library
+# is not installed: uv pip install -e ../cpu-attention --no-deps)
+(cd ../cpu-attention && uv run --extra build python scripts/build.py)
+PYTHONPATH=. $P tests/test_cpu_attention.py
+(cd ../cpu-attention && uv run --extra build python scripts/build.py --tests)
+PYTHONPATH=. $P ../cpu-attention/tests/test_flash_api.py    # flash-shaped API
+
 # token-by-token parity vs HF on the real checkpoints (fp32 exact; bf16 same length).
 # fp32 needs ~8 GB above loading both engines: each (model, beams) phase runs in
 # its own subprocess, and fp32 KV budgets are snapped down to fit an 11 GB box.
@@ -303,8 +330,9 @@ HF_HUB_OFFLINE=1 ~/vllm024/bin/python benchmarks/benchmark_vllm.py --engine vllm
 python benchmarks/benchmark_vllm.py --compare ours.json vllm.json
 
 # Florence-2 benchmark (real image; caption / detection / segmentation /
-# phrase-grounding tasks, EOS-stopped)
+# phrase-grounding tasks, EOS-stopped); --backend picks the attention kernel
 PYTHONPATH=. $P benchmarks/benchmark_florence2.py
+PYTHONPATH=. $P benchmarks/benchmark_florence2.py --backend mojo
 PYTHONPATH=. $P benchmarks/benchmark_florence2.py --device cuda
 
 # decode throughput (nano-vllm-style: N requests, fixed enc length + output)
@@ -312,8 +340,13 @@ PYTHONPATH=. $P benchmarks/throughput.py --requests 128 --enc-len 512 --max-toke
 PYTHONPATH=. $P benchmarks/throughput.py --requests 32 --enc-len 512 --max-tokens 256 --no-cudagraph
 PYTHONPATH=. $P benchmarks/throughput.py --requests 64 --enc-len 512 --max-tokens 256
 
-# attention implementation: vendored vLLM CPU kernel vs SDPA vs eager
+# attention implementation: vendored vLLM CPU kernel vs Mojo vs SDPA vs eager
 PYTHONPATH=. $P benchmarks/attn_backend.py                    # kernel + end-to-end
+
+# drift-controlled A/B of the two paged kernels (alternating rounds, median ratio)
+# -- use this to decide whether a kernel change helped; --threads/--workers pin the
+# per-box knobs (0 = torch default / the kernel's physical-core rule)
+PYTHONPATH=. $P benchmarks/kernel_ab.py
 PYTHONPATH=. $P benchmarks/attn_backend.py --mode kernel      # ops only, no weights
 PYTHONPATH=. $P benchmarks/attn_backend.py --mode e2e --device cuda
 
@@ -335,10 +368,13 @@ hand-edit or guess.**
 
 | config | ours ms | ours tok/s | hf ms | hf tok/s | speedup |
 |---|---:|---:|---:|---:|---:|
-| batch=1, beams=1, bf16 | 3728 | 68.7 | 5913 | 43.3 | 1.59x |
-| batch=8, beams=1, bf16 | 5271 | 388.5 | 9022 | 227.0 | 1.71x |
-| batch=8, beams=4, bf16 | 8030 | 255.1 | 31767 | 64.5 | 3.96x |
-| batch=8, beams=1, fp32 | 8942 | 229.0 | 24943 | 82.1 | 2.79x |
+| batch=1, beams=1, bf16 | 3586 | 71.4 | 5554 | 46.4 | 1.55x |
+| batch=8, beams=1, bf16 | 5325 | 384.6 | 8863 | 231.1 | 1.67x |
+| batch=8, beams=4, bf16 | 8044 | 254.6 | 31632 | 64.8 | 3.93x |
+| batch=8, beams=1, fp32 | 8978 | 228.2 | 25289 | 80.9 | 2.82x |
+
+The Mojo backend's per-box numbers (Ryzen, Granite Rapids, Graviton 5) live in
+`../cpu-attention/README.md`; the table below is the default (`auto` = vendored C++) path.
 
 Mean of two runs with a cold Inductor cache (`/tmp/torchinductor_*` and
 `~/.cache/torch_extensions` removed first).  This recording is the frozen
@@ -606,6 +642,93 @@ on this box with the same kind of workload.
   silently degrades to SDPA and gets *slower than HF* (0.75-0.94x) with no error
   — `ninja` is now in the `cpu` extra for exactly this reason, and a bare
   `uv sync` without it is the usual cause.
+- **Mojo kernel (`attn_backend="mojo"`, opt-in).** The kernel lives in the
+  `cpu-attention` repo (`cpu_attention/_mojo/src/attention.mojo`) and is
+  imported as `cpu_attention`, exactly like `flash_attn`.  `attention.mojo` ports
+  the hot path of the x86 `VEC` kernel: paged self-attention (scatter K/V, then
+  attend), cross-attention over the staged encoder cache, and
+  `reshape_and_cache`.  It keeps vLLM's page layout (one token is a column of
+  the K page, V row-major) and fp32 accumulation, so the cache tensors and
+  `stage_cross_kv` are shared.  Supported: `head_dim` 32/64/128, fp32/bf16,
+  `block_size` a multiple of 16 (tile 32 on 32-aligned pages, else 16; a page
+  holds `block_size / tile` tiles, so the group loop walks tiles and resolves
+  (page, offset) per tile — walking *pages* instead silently scored only the
+  first 32 positions of every page, which was a real bug for block 48/64/128/256
+  and is now covered by `tests/test_attention.mojo`), and — like the engine —
+  exactly one query token per sequence, which makes the causal mask the cache
+  tail.  Not ported: chunked prefill, sliding windows, ALiBi,
+  softcap, attention sinks, FP8 KV cache, the `VEC16`/NEON/AMX/RVV/VSX paths, and
+  vLLM's work-item scheduler.  Parallelism is one task per (sequence, head),
+  dispatched with `GOMP_parallel` **on torch's own OpenMP pool** (libgomp; no
+  second pool, no spin): a task owns one head's cache slice end to end, so there
+  is no KV split, scratch buffer or reduction.  Two optimizations carry the performance, both measured
+  on this box: four pages are scored before one online-softmax step (per-page
+  softmax bookkeeping is 4x the max/exp/rescale work at short contexts, and
+  vLLM amortizes the same way over its L2-sized tile), and Q@K^T runs as
+  AVX512-BF16 dot products (`llvm.x86.avx512bf16.dpbf16ps.512`, compile-time
+  gated on `CompilationTarget`, fp32 broadcast-FMA elsewhere) — 1.87x on the QK
+  phase, with K stored as `[head_dim/2, block_size, 2]` pairs so a
+  `(k[2d], k[2d+1])` pair of one position is contiguous, and `scale` applied to
+  the logits instead of pre-scaling Q.  bf16 products are exact in fp32, so bf16
+  output stays bit-identical to the C++ kernel.  On aarch64 (`NEON_DOT`,
+  compile-time) P@V is a dot product too: `bfdot` contracts two adjacent
+  positions, so V is stored position-paired (`[block_size/2, head_dim, 2]`,
+  next to the QK paired K page) and the probabilities are rounded to bf16 like
+  `csrc`'s ARM `prob_buffer_t` — that is the one place the port gives up
+  bit-exactness, and only on ARM (≤1e-3 vs the fp32 reference; x86 stays 0.0).
+  That is what makes the target row fast there: on Graviton 5 the port is
+  0.50 `self` and 0.49 `cross` at b8/ctx256 (**2.04x faster than `csrc/`**),
+  0.61 at b8/1024, 0.96 at b32/1024 (memory roofline).  Measured against `csrc/` per call, each side
+  including its own Python entry point, bf16/16 pages, across runs on this box:
+  self 0.73-0.97x, cross 0.86-0.98x at ctx>=1024 and 1.07-1.30x at ctx<=256, so
+  the per-layer self+cross aggregate (what the engine runs) is 0.87-0.97x —
+  ahead everywhere except the batch-1/short-context cross call.  The residual there is MAX's thread handoff: with no
+  Python wrapper on either side the per-KV-position slopes are identical
+  (0.102 vs 0.100 us) and the whole gap is a flat ~6-9 us of dispatch
+  (`parallelize` costs ~9 us when the caller is a Python thread; OMP's region is
+  ~2-3 us).  On the 4-physical-core Granite Rapids box the same kernel is
+  bandwidth-bound instead (133 GB/s L3 / 62-70 GB/s DRAM, measured with a
+  shared-page-set trick) and beats `csrc/` on *every* row at 4 threads:
+  self 0.67/0.94/0.86, cross 0.72 (b8/enc256) and 0.90 (b8/enc1024) — prefetching
+  K/V, GROUP 2/8 and 6/8 workers were all neutral-to-worse there, and
+  `block_size=128` is worth ~9% at ctx=1024 (a config knob, not a kernel one).
+  `_workers()` is capped at the *physical* core count (sysfs topology, cached)
+  with a `FASTENCDEC_MOJO_WORKERS` override (torch already sizes its pool that
+  way; the cap only bites when a parent sets a larger `OMP_NUM_THREADS`).  The
+  dispatch is the win: `GOMP_parallel` costs 2.4 us warm and 2.7 us with a 1 ms
+  gap, against 6.3 us / 103-140 us for a private pool (MAX's `parallelize` or a
+  hand-rolled pthread one) that has to be woken at the engine's 0.8-1.5 ms call
+  spacing — and the spin workaround for that cost 4.5% end to end, so it is
+  gone with the `max` package.  Effect at b8/ctx256: the attention call is
+  29.8 us against the C++ backend's 90.7 (cold, 0.8 ms of GEMMs between calls),
+  and 8x128 end to end went 344 -> **392-396 tok/s** against the C++ backend's
+  364-377 — i.e. **faster end to end on this laptop** (b1x128: 74.5 vs 71.1).
+  A call runs **inline** (one worker, no region) only when
+  `num_tasks * pages <= 32` (24.5 vs 31.0 us at b1/ctx64): with libgomp the pool
+  wins from b1/ctx128 up (1.3x, and 8x at b8/ctx256), the opposite of the
+  private-pool rule, whose inline threshold existed only to dodge a 140 us wake.
+  Traps when touching it: (1) `q`/`k`/`v` are chunks of the fused
+  `qkv_proj` output, so the kernel takes token strides explicitly
+  (`3 * d_model`, not `num_heads * head_dim`); assuming contiguity silently
+  gives every sequence sequence 0's output.  (2) A 32-wide value cannot live in
+  a `tile`-generic function even in dead code (Mojo type-checks `comptime if`
+  arms), which is why the dot path is a separate `_attention_head_dot` with the
+  tile fixed.  (3) The compiled path is gated by `attention.uses_custom_ops` and
+  `ModelRunner.compiled_backend`, so overriding the backend after compile falls
+  back to eager.  (4) Build with `uv run --extra build python scripts/build.py`
+  in `../cpu-attention` (see that repo's `README.md` and
+  `AGENTS.md` for the port's own handover: Mojo
+  language traps, the `LANES`/intrinsic gating, measured fixed costs and the
+  per-box tables); without the `.so` the backend is unavailable and `auto` is
+  unaffected.  (5) `mojo build` targets the host CPU (`znver4` +
+  avx512bf16 here), so rebuild per machine.  (6) `mojo run` cannot execute the
+  kernel (the JIT cannot resolve `GOMP_parallel`/`omp_get_thread_num`); use
+  `scripts/build.py --tests`, which builds a binary and runs it.
+  (7) The public API mirrors flash-attn (`flash_attn_with_kvcache`,
+  `flash_attn_func`; unsupported features raise `NotImplementedError`) but keeps
+  the head-major cache layout, and the engine's hot path calls the thin
+  `self_attention`/`cross_attention` aliases because the checked wrapper costs
+  ~4% end to end at 24 calls per step (`check_inputs=False` ~2%).
 - **CPU page size (`block_size`).** `block_size=None` picks the smallest page the
   device's best kernel accepts (`fastencdec.config.default_block_size`): 256 on
   CUDA, **32 on x86**, 16 on aarch64.  `csrc`'s full-width AVX-512 kernel
@@ -839,6 +962,8 @@ on this box with the same kind of workload.
   `transformers` reference.)
 - After changes: run `python -m compileall fastencdec`,
   `tests/test_parity.py`, `tests/test_attn_backend.py`,
+  `tests/test_cpu_attention.py` (when the `cpu_attention` library is installed),
+  `../cpu-attention/tests/test_flash_api.py`,
   `tests/test_florence2.py`, `tests/test_beam.py`,
   `uvx ruff check` / `uvx ruff format --check`, and
   `benchmarks/benchmark.py --scenarios '256->256'`.

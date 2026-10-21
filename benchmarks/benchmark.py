@@ -184,6 +184,11 @@ def main():
         help="0 = device default (256 cuda, 32 x86 cpu, 16 aarch64)",
     )
     ap.add_argument("--scenarios", default="", help="comma list, default all")
+    ap.add_argument(
+        "--backend",
+        default="auto",
+        help="attention backend for the engine (auto, vllm, mojo, sdpa)",
+    )
     ap.add_argument("--warmup", type=int, default=1)
     ap.add_argument("--repeats", type=int, default=1)
     ap.add_argument("--json", default=None, help="write raw results to a JSON file")
@@ -206,7 +211,8 @@ def main():
 
     print("# fast-encdec benchmark\n", flush=True)
     print(
-        f"model={args.model}  device={args.device}  threads={torch.get_num_threads()}",
+        f"model={args.model}  device={args.device}  "
+        f"threads={torch.get_num_threads()}  backend={args.backend}",
         flush=True,
     )
 
@@ -229,6 +235,7 @@ def main():
                 block_size=block_size,
                 dtype=dtype,
                 device=args.device,
+                attn_backend=args.backend,
             )
             for label, batch, beams, _ in configs:
                 dt, toks = timed(

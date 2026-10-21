@@ -78,8 +78,11 @@ class ModelRunner:
             compile
             and self.device.type == "cpu"
             and self.dtype in (torch.float32, torch.bfloat16)
-            and self.attn_backend == "vllm"
+            and attention.uses_custom_ops(self.attn_backend)
         )
+        # The compiled graph embeds the ops of the backend it was built with, so
+        # a later override to a different kernel must fall back to eager.
+        self.compiled_backend = self.attn_backend if self.compile_decoder else None
         self.decode_step = None
         self.encode_fn = self.model.encode
         self.mm_step = None
@@ -238,19 +241,19 @@ class ModelRunner:
         backend = attention.backend(
             self.device, self.dtype, self.head_dim, self.block_size
         )
-        if backend == "vllm":
+        if attention.uses_custom_ops(backend):
             # Stage the paged encoder K/V outside the compiled graph; the opaque
             # cross-attention op reads it from the Context at call time.
             fields["cross_staged"] = attention.stage_cross(
-                self.decoder_layers, fields["request_ids"]
+                self.decoder_layers, fields["request_ids"], backend
             )
         set_context(**fields)
-        # The compiled graph holds the vLLM op, so it is only valid while the ops
-        # still resolve to vLLM.  A backend override after this runner compiled
-        # (a benchmark comparing backends, or a second engine setting a new
-        # preference) must run this step eagerly: the SDPA path also reads the
-        # per-step Context, which must stay out of the graph.
-        if self.decode_step is None or backend != "vllm":
+        # The compiled graph holds one backend's ops, so it is only valid while
+        # the ops still resolve to that backend.  An override after this runner
+        # compiled (a benchmark comparing backends, or a second engine setting a
+        # new preference) must run this step eagerly: the SDPA path also reads
+        # the per-step Context, which must stay out of the graph.
+        if self.decode_step is None or backend != self.compiled_backend:
             return self.model(input_ids, positions)
         with self._inductor_ctx():
             # model.forward is decoder + lm head, so freezing packs both.
