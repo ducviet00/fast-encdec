@@ -81,16 +81,15 @@ placeholders; the decoder is unchanged.
   both pass.
 - Mojo backend (optional): a **separate repository**, `cpu-attention`
   (sibling checkout at `../cpu-attention`), imported as `cpu_attention`
-  exactly like `flash_attn`.  Its kernel lives in a self-contained `pixi` env
-  (`cpu_attention/_mojo`, ~1.2 GB, `mojo` only — no `max` package) and
-  parallelizes with `GOMP_parallel` on **torch's own OpenMP pool**, linking
-  `libgomp` (`-Xlinker -lgomp`): Linux-only, and libgomp must be loadable at
-  `.so` load time (torch ships/loads one; the pixi env's conda-forge copy is on
-  the library's RUNPATH).  Setup: `uv pip install -e ../cpu-attention
-  --no-deps`, then `cd ../cpu-attention/cpu_attention/_mojo && pixi run
-  build` -> `cpu_attention/_C.so`; `CPU_ATTENTION_LIB` overrides the path.
-  Both the `.so` and the Python package are built for this box (`mojo build`
-  targets the host CPU), so rebuild rather than copying between machines.
+  exactly like `flash_attn`.  Its kernel builds with the PyPI `mojo` wheel
+  (uv's `build` extra — no pixi/conda env) and parallelizes with
+  `GOMP_parallel` on **torch's own OpenMP pool**: Linux-only, with the libgomp
+  symbols resolved when the `.so` loads (the package imports torch first, which
+  brings `libgomp.so.1` in).  Setup: `uv pip install -e ../cpu-attention
+  --no-deps`, then `cd ../cpu-attention && uv run --extra build python
+  scripts/build.py` -> `cpu_attention/_C.so`; `CPU_ATTENTION_LIB` overrides the
+  path.  `mojo build` targets the host CPU, so rebuild rather than copying
+  between machines.
 
 ## 3. Layout
 
@@ -127,8 +126,9 @@ fastencdec/
 csrc/                  vendored vLLM CPU attention kernels (+ bindings.cpp)
 ../cpu-attention  SEPARATE REPO: the Mojo kernel + flash-attn-shaped Python API
   cpu_attention/       package: _kernel.py, ops.py, flash_attn_interface.py, _C.so
-  cpu_attention/_mojo/ pixi env, kernel (src/attention.mojo), extension (src/_C.mojo),
+  cpu_attention/_mojo/ kernel (src/attention.mojo), extension (src/_C.mojo),
                        standalone parity test (tests/test_attention.mojo)
+  scripts/build.py     uv-driven build (_C.so + the standalone test)
   AGENTS.md            the port's handover: ISA gating, Mojo gotchas, costs, per-box numbers
 examples/summarize.py
 examples/florence2.py
@@ -280,9 +280,9 @@ PYTHONPATH=. $P tests/test_attn_backend.py
 
 # cpu_attention backend vs the SDPA path (same tiny BART; skips when the library
 # is not installed: uv pip install -e ../cpu-attention --no-deps)
-(cd ../cpu-attention/cpu_attention/_mojo && pixi run build)
+(cd ../cpu-attention && uv run --extra build python scripts/build.py)
 PYTHONPATH=. $P tests/test_cpu_attention.py
-(cd ../cpu-attention/cpu_attention/_mojo && pixi run test)  # standalone, no torch
+(cd ../cpu-attention && uv run --extra build python scripts/build.py --tests)
 PYTHONPATH=. $P ../cpu-attention/tests/test_flash_api.py    # flash-shaped API
 
 # token-by-token parity vs HF on the real checkpoints (fp32 exact; bf16 same length).
@@ -715,15 +715,15 @@ on this box with the same kind of workload.
   arms), which is why the dot path is a separate `_attention_head_dot` with the
   tile fixed.  (3) The compiled path is gated by `attention.uses_custom_ops` and
   `ModelRunner.compiled_backend`, so overriding the backend after compile falls
-  back to eager.  (4) Build with `pixi run build` in
-  `../cpu-attention/cpu_attention/_mojo` (see that repo's `README.md` and
+  back to eager.  (4) Build with `uv run --extra build python scripts/build.py`
+  in `../cpu-attention` (see that repo's `README.md` and
   `AGENTS.md` for the port's own handover: Mojo
   language traps, the `LANES`/intrinsic gating, measured fixed costs and the
   per-box tables); without the `.so` the backend is unavailable and `auto` is
   unaffected.  (5) `mojo build` targets the host CPU (`znver4` +
   avx512bf16 here), so rebuild per machine.  (6) `mojo run` cannot execute the
   kernel (the JIT cannot resolve `GOMP_parallel`/`omp_get_thread_num`); use
-  `pixi run test`, which builds a binary with `-Xlinker -lgomp` and runs it.
+  `scripts/build.py --tests`, which builds a binary and runs it.
   (7) The public API mirrors flash-attn (`flash_attn_with_kvcache`,
   `flash_attn_func`; unsupported features raise `NotImplementedError`) but keeps
   the head-major cache layout, and the engine's hot path calls the thin
