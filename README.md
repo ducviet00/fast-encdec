@@ -8,7 +8,7 @@ A small, readable inference engine for **BART** and **Florence-2**, in the spiri
 * 🚀 **Fast offline inference** - up to 5.0x faster than `transformers.generate` on CPU and 4.2x on a GPU (beam search drives the CPU wins; greedy is 1.1-3.5x on CPU and 2.7-4.0x on GPU)
 * 📖 **Readable codebase** - paged KV cache, continuous batching and beam search in plain PyTorch
 * 🧩 **Two models, one engine** - BART for summarisation, Florence-2 for vision-language tasks
-* ⚡ **CPU and CUDA** - vendored vLLM CPU attention kernel; FlashAttention-2 and a CUDA graph on GPU
+* ⚡ **CPU and CUDA** - [cpu-attention](https://github.com/ducviet00/cpu-attention) kernels on CPU; [FlashAttention-2](https://github.com/Dao-AILab/flash-attention) and a CUDA graph on GPU
 
 ## Installation
 
@@ -16,6 +16,12 @@ A small, readable inference engine for **BART** and **Florence-2**, in the spiri
 git clone https://github.com/ducviet00/fast-encdec && cd fast-encdec
 uv sync --extra cpu      # or --extra cu130 for CUDA 13
 ```
+
+The `cpu` extra builds [cpu-attention](https://github.com/ducviet00/cpu-attention)
+from git (Linux, a C toolchain; the Mojo compiler is fetched for the build only),
+and `cu130` builds [flash-attn](https://github.com/Dao-AILab/flash-attention)
+(needs `nvcc`, or a prebuilt wheel matching your torch).  Without them the engine
+falls back to PyTorch SDPA, which is much slower.
 
 ## Quick Start
 
@@ -63,7 +69,7 @@ parsed = llm.processor.post_process_generation(
   cached length of each sequence, so mixed lengths waste nothing.
 * **Beam search** runs on the same cache, ranked by length-penalised score.
 * **Device-agnostic attention.** The model calls three attention ops; each picks
-  its kernel from the device, dtype and head dim (vLLM CPU kernel, SDPA or
+  its kernel from the device, dtype and head dim (cpu-attention, SDPA or
   FlashAttention-2).
 
 ## Benchmark
@@ -120,7 +126,7 @@ cell is the baseline, not the engine.
 
 Each cell is the average of two independent runs, and every run writes its raw
 results with `--json`, so the numbers can be re-derived rather than trusted.  On
-CPU the engine runs the vendored vLLM attention kernel behind two opaque
+CPU the engine runs the cpu-attention kernels behind opaque
 `torch.library.custom_op`s, which makes the decoder + lm head and the encoder
 trace as **frozen `torch.compile` graphs**: Inductor's freezing pass packs every
 GEMM into oneDNN's blocked layouts — the same op a manual weight prepack used to
@@ -139,6 +145,75 @@ with the CPU work: across recordings its own milliseconds stay flat to ~1%
 (e.g. `512->128, batch=1`: 378 -> 381 ms) while the `transformers` baseline on
 the 4-vCPU box moves 4-8%, which is what shifts the L4 ratios by up to ~0.2 —
 including between two runs of the same commit (3.87x vs 4.11x).
+
+**GCP matrix, torch 2.15 (cpu-attention, current engine)**
+
+c4a-standard-8 (Axion / Neoverse-V2, 8 cores), c4-standard-8 (Xeon 8581C, 4
+cores / 8 threads, AMX) and c4d-standard-8 (AMD EPYC 9B45 Turin, 4 cores / 8
+threads, no AMX), torch 2.15.0+cpu, transformers 5.22.1, one spot VM each,
+`benchmarks/benchmark.py` and `benchmarks/benchmark_florence2.py`, mean of two
+runs, bf16 unless noted.  Cells are the speedup vs `transformers`, with ours /
+HF tokens/s; † marks a cell whose two runs differ by more than 10%.
+
+| point | config | c4a (Axion) | c4 (Xeon 8581C) | c4d (Turin) |
+|---|---|---:|---:|---:|
+| 128->512 | batch=1 | 1.26x (118 / 94) | 1.20x (79 / 66) | 1.23x (85 / 69) |
+| 128->512 | batch=8 | 1.91x (580 / 303) | 1.66x (460 / 278) | 2.13x (508 / 239) |
+| 128->512 | batch=8, beams=4 | 2.12x (282 / 133) | 3.04x (259 / 85) | 4.73x (321 / 68) |
+| 128->512 | batch=8, fp32 | 1.50x (347 / 231) | 1.78x (236 / 133) | 2.00x (275 / 138) |
+| 512->128 | batch=1 | 0.95x (84 / 88) | 0.84x (54 / 63) | 1.15x (67 / 58) † |
+| 512->128 | batch=8 | 1.64x (398 / 243) | 1.41x (347 / 247) | 1.78x (303 / 170) † |
+| 512->128 | batch=8, beams=4 | 2.02x (234 / 116) | 4.72x (207 / 44) | 5.82x (236 / 40) |
+| 512->128 | batch=8, fp32 | 1.09x (167 / 154) | 1.21x (129 / 107) | 1.64x (141 / 86) |
+| 256->256 | batch=1 | 1.15x (112 / 97) | 1.09x (71 / 65) † | 1.33x (86 / 65) |
+| 256->256 | batch=8 | 1.87x (547 / 293) | 1.52x (438 / 288) | 1.84x (453 / 247) |
+| 256->256 | batch=8, beams=4 | 2.15x (282 / 131) | 2.70x (254 / 94) | 4.22x (310 / 73) |
+| 256->256 | batch=8, fp32 | 1.37x (304 / 222) | 1.61x (217 / 135) | 1.88x (245 / 131) |
+| Florence-2 | batch=1 | 1.98x (37 / 19) | 3.14x (45 / 14) | 2.75x (33 / 12) |
+| Florence-2 | batch=8 | 1.36x (149 / 110) | 2.23x (177 / 79) | 2.19x (155 / 71) |
+| Florence-2 | batch=8, beams=4 | 2.17x (131 / 61) | 4.23x (144 / 34) | 4.26x (117 / 27) |
+| Florence-2 | batch=8, fp32 | 1.22x (78 / 64) | 1.87x (67 / 36) | 1.47x (45 / 31) |
+
+Batch=8 and beam search lead everywhere (1.4-2.1x greedy, 2.0-5.8x beams;
+`transformers`' beam reorder is costliest on the x86 boxes).  On torch 2.15 the
+weakest point is the encoder-heavy `512->128, batch=1`, which trails
+`transformers` on c4a and c4: 2.15 sped up `transformers`' one-row GEMMs (see
+below), so a single short decode has little left to win.  The table above this
+one (Xeon 6975P-C, Graviton 5, ...) is a torch 2.14 recording and is not
+directly comparable.
+
+**GCP c4a-standard-8 (Axion / Neoverse-V2, 8 cores) - cpu-attention, and torch 2.14 vs 2.15**
+
+`benchmarks/benchmark.py`, bf16 unless noted, tokens/s, each cell the mean of two
+interleaved runs on one spot VM (`transformers` from all four runs).  "old" is
+the previous engine (vendored vLLM `csrc/cpu` kernel); "new" uses cpu-attention
+for the decoder self/cross-attention and the encoder.
+
+| point | config | torch 2.14: HF | old | new | new vs HF | torch 2.15: HF | new | new vs HF |
+|---|---|---:|---:|---:|---:|---:|---:|---:|
+| 128->512 | batch=1 | 31 | 89 | 97 | 3.17x | 97 | 129 | 1.34x |
+| 128->512 | batch=8 | 304 | 551 | 589 | 1.93x | 303 | 584 | 1.91x |
+| 128->512 | batch=8, beams=4 | 131 | 278 | 290 | 2.22x | 131 | 291 | 2.21x |
+| 128->512 | batch=8, fp32 | 229 | 334 | 344 | 1.49x | 228 | 347 | 1.52x |
+| 512->128 | batch=1 | 31 | 83 | 80 | 2.58x | 93 | 101 | 1.08x |
+| 512->128 | batch=8 | 239 | 372 | 395 | 1.64x | 243 | 398 | 1.63x |
+| 512->128 | batch=8, beams=4 | 113 | 222 | 233 | 2.08x | 116 | 236 | 2.03x |
+| 512->128 | batch=8, fp32 | 151 | 177 | 184 | 1.21x | 153 | 175 | 1.14x |
+| 256->256 | batch=1 | 31 | 89 | 92 | 2.96x | 100 | 122 | 1.21x |
+| 256->256 | batch=8 | 292 | 519 | 529 | 1.82x | 290 | 538 | 1.87x |
+| 256->256 | batch=8, beams=4 | 130 | 273 | 283 | 2.18x | 130 | 287 | 2.23x |
+| 256->256 | batch=8, fp32 | 218 | 291 | 294 | 1.33x | 219 | 302 | 1.38x |
+
+On torch 2.14 the c4a ratios reproduce the Graviton 5 column above (batch=8
+within +-0.15, batch=1 0.2-0.4 lower), and cpu-attention is +2-7% over the
+vendored kernel on nearly every row.  Torch 2.15 changes the batch=1 baseline,
+not the engine: on aarch64 a one-row bf16 GEMM no longer goes through oneDNN,
+which in 2.14 re-packed the whole weight on every call, so `transformers`
+batch=1 triples (31 -> 93-100 tok/s) and the batch=1 ratio falls to 1.1-1.3x.
+The engine's own batch=1 graph is compiled without freezing on aarch64 + torch
+>= 2.15 (a packed weight would keep that GEMM on oneDNN), which is worth
+1.29-1.39x there; batch=8 is unchanged.  `512->128, batch=1` is the noisy cell
+(runs read 116/86 tok/s).
 
 **vs vLLM (NVIDIA L4)**
 
@@ -289,7 +364,7 @@ length always matches.
 ```bash
 python tests/test_parity.py        # vs transformers, tiny random BART
 python tests/test_florence2.py     # vs transformers, tiny random Florence-2
-python tests/test_attn_backend.py  # vLLM CPU kernel vs SDPA (compiled path)
+python tests/test_attn_backend.py  # cpu-attention vs SDPA (compiled path)
 python tests/test_gpu_flash.py     # FlashAttention-2 vs SDPA (CUDA only)
 ```
 

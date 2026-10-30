@@ -174,7 +174,7 @@ def main():
     from fastencdec.layers import flash_attn
 
     if flash_attn.module() is None:
-        print("SKIP: kernels-community/flash-attn2 unavailable")
+        print("SKIP: flash_attn (Dao-AILab flash-attention) unavailable")
         return
     device = "cuda"
     ok = paged_parity(device)

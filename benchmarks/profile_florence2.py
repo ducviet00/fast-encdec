@@ -8,9 +8,8 @@ HuggingFace can be compared op for op.
     PYTHONPATH=. python benchmarks/profile_florence2.py --engine ours --device cuda --out gpu.txt
 
 Notes:
-* The vendored vLLM CPU attention kernel is a raw pybind op, not a dispatcher op,
-  so ``torch.profiler`` does not see it -- our decoder attention time shows up as
-  the wall-clock gap between ``self CPU`` and ``wall``, not as a row.
+* The cpu-attention kernels run inside the ``fastencdec::cpu_*`` custom ops, so
+  our CPU attention time shows up under those op names.
 * ``wall`` is the profiled run (the profiler adds overhead); use
   ``florence2_tasks.py`` for clean timings.
 """

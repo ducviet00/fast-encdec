@@ -1,3 +1,4 @@
+import platform
 from collections import defaultdict
 from contextlib import nullcontext
 
@@ -10,6 +11,21 @@ from .cudagraph import DecodeGraphRunner
 # Number of compiled runners in this process; each one costs Dynamo cache entries
 # (a new weight set and the batch-1 specialization), and the limit is per frame.
 _COMPILED_RUNNERS = 0
+
+# On aarch64, torch >= 2.15 runs a one-row GEMM outside oneDNN, straight from the
+# plain weight, while a packed weight keeps it on oneDNN, so the batch-1 decode
+# graph is compiled without freezing (which is what packs).  Older torch reorders
+# a plain weight inside oneDNN on every call, so there packing wins at batch 1
+# too; on x86 batch 1 ties either way.  (Per-graph `cpp.weight_prepack` does
+# not work: Inductor registers its packing patterns once per process.)
+_UNFROZEN_SINGLE_ROW = (
+    platform.machine().lower()
+    in (
+        "arm64",
+        "aarch64",
+    )
+    and torch.torch_version.TorchVersion(torch.__version__) >= "2.15"
+)
 
 
 class ModelRunner:
@@ -68,7 +84,7 @@ class ModelRunner:
         The paged attention ops are opaque custom ops, so Inductor traces the
         decoder + lm head as one graph and freezing packs every GEMM. The SDPA
         fallback reads the per-step Context and must not be compiled, hence the
-        ``vllm`` gate. See ``TORCH_COMPILE_FREEZING.md``.
+        ``cpu`` gate. See ``TORCH_COMPILE_FREEZING.md``.
 
         ``compile=False`` is a full opt-out: it leaves the decoder, the encoder
         and the vision tower eager. ``compile_mm_encoder`` only narrows the
@@ -78,7 +94,7 @@ class ModelRunner:
             compile
             and self.device.type == "cpu"
             and self.dtype in (torch.float32, torch.bfloat16)
-            and self.attn_backend == "vllm"
+            and self.attn_backend == "cpu"
         )
         self.decode_step = None
         self.encode_fn = self.model.encode
@@ -165,7 +181,7 @@ class ModelRunner:
         num_new = len(seq.token_ids) - seq.num_cached_tokens
         if num_new != 1:
             # The attention ops assume one query token per sequence per step
-            # (the kernel's query_start_loc is arange(num_seqs + 1)), so a
+            # (one query row per sequence in every kernel), so a
             # longer decoder prompt cannot be prefilled in one step.  LLMEngine
             # rejects it up front; this catches a hand-built Sequence too.
             raise ValueError(
@@ -238,26 +254,29 @@ class ModelRunner:
         backend = attention.backend(
             self.device, self.dtype, self.head_dim, self.block_size
         )
-        if backend == "vllm":
+        if backend == "cpu":
             # Stage the paged encoder K/V outside the compiled graph; the opaque
             # cross-attention op reads it from the Context at call time.
             fields["cross_staged"] = attention.stage_cross(
                 self.decoder_layers, fields["request_ids"]
             )
         set_context(**fields)
-        # The compiled graph holds the vLLM op, so it is only valid while the ops
-        # still resolve to vLLM.  A backend override after this runner compiled
+        # The compiled graph holds the cpu-attention ops, so it is only valid
+        # while the ops still resolve to them.  A backend override after this runner compiled
         # (a benchmark comparing backends, or a second engine setting a new
         # preference) must run this step eagerly: the SDPA path also reads the
         # per-step Context, which must stay out of the graph.
-        if self.decode_step is None or backend != "vllm":
+        if self.decode_step is None or backend != "cpu":
             return self.model(input_ids, positions)
-        with self._inductor_ctx():
+        # Batch 1 is its own graph (Dynamo's 0/1 specialization), so it can be
+        # compiled without the packed weights the batched graph uses.
+        freeze = len(seqs) > 1 or not _UNFROZEN_SINGLE_ROW
+        with self._inductor_ctx(freeze):
             # model.forward is decoder + lm head, so freezing packs both.
             return self.decode_step(input_ids, positions)
 
-    def _inductor_ctx(self):
+    def _inductor_ctx(self, freeze=True):
         """Patch Inductor freezing on for compiled calls (packing at compile)."""
         if self.compile_decoder:
-            return torch._inductor.config.patch(freezing=True)
+            return torch._inductor.config.patch(freezing=freeze)
         return nullcontext()

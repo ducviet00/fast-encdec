@@ -1,4 +1,4 @@
-"""Attention-implementation benchmark: vendored vLLM CPU kernel vs SDPA vs eager.
+"""Attention-implementation benchmark: cpu-attention kernels vs SDPA vs eager.
 
 Two sections:
 
@@ -6,13 +6,13 @@ Two sections:
   (16 heads x head_dim 64) driven through a synthetic Context: paged
   self-attention at decode shapes, and cross-attention over a cached encoder.
   Reports microseconds per op call for the three implementations.
-* ``e2e`` -- the whole engine (``attn_backend="vllm"`` / ``"sdpa"``, and SDPA
+* ``e2e`` -- the whole engine (``attn_backend="cpu"`` / ``"sdpa"``, and SDPA
   forced to PyTorch's math kernel for "eager") against HuggingFace
   (``attn_implementation="sdpa"`` / ``"eager"``), on a standard workload and a
   decode-heavy (attention-dominated) one.
 
 The three implementations are:
-  vllm  -- the vendored vLLM CPU kernel (`csrc/`), the engine's default;
+  cpu   -- the cpu-attention kernels (the `cpu-attention` package), the default;
   sdpa  -- PyTorch's `scaled_dot_product_attention` (its own kernel choice);
   eager -- PyTorch SDPA pinned to `SDPBackend.MATH`, i.e. the naive
            matmul/softmax/matmul attention, and HF's `eager` implementation.
@@ -35,7 +35,7 @@ from fastencdec.utils.context import set_context
 HEADS, HEAD_DIM = 16, 64  # bart-large-cnn
 MODEL = "facebook/bart-large-cnn"
 DECODE = {"length_penalty": 2.0, "no_repeat_ngram_size": 3}
-VARIANTS = ("vllm", "sdpa", "eager")
+VARIANTS = ("cpu", "sdpa", "eager")
 
 
 def _timed(fn, iters: int, warmup: int = 5) -> float:
@@ -52,7 +52,7 @@ def _timed(fn, iters: int, warmup: int = 5) -> float:
 
 def _call(variant, fn):
     """Run ``fn`` under the variant's backend (``eager`` pins SDPA to math)."""
-    attention.set_backend("vllm" if variant == "vllm" else "sdpa")
+    attention.set_backend("cpu" if variant == "cpu" else "sdpa")
     if variant == "eager":
         from torch.nn.attention import SDPBackend, sdpa_kernel
 
@@ -88,14 +88,13 @@ def _self_case(num_seqs, ctx_len, block_size, dtype):
         torch.randn(num_seqs, HEADS, HEAD_DIM, dtype=dtype),
         torch.zeros(shape, dtype=dtype),
         torch.zeros(shape, dtype=dtype),
-        slots,
         blocks,
         lens,
     )
 
 
 def _cross_case(num_seqs, enc_len, block_size, dtype):
-    """Dense query + per-request encoder K/V, plus the vLLM staged paged cache."""
+    """Dense query + per-request encoder K/V, plus the staged paged cache."""
     kv_cache = {
         i: (
             torch.randn(HEADS, enc_len, HEAD_DIM, dtype=dtype),
@@ -104,7 +103,7 @@ def _cross_case(num_seqs, enc_len, block_size, dtype):
         for i in range(num_seqs)
     }
     request_ids = list(range(num_seqs))
-    staged = attention.stage_cross_kv(kv_cache, request_ids, block_size, "vllm")
+    staged = attention.stage_cross_kv(kv_cache, request_ids, block_size, "cpu")
     return (
         torch.randn(num_seqs, HEADS, HEAD_DIM, dtype=dtype),
         kv_cache,
@@ -114,12 +113,12 @@ def _cross_case(num_seqs, enc_len, block_size, dtype):
 
 
 def _time_self(variant, num_seqs, ctx_len, block_size, dtype, scale, iters):
-    q, k, v, k_cache, v_cache, slots, blocks, lens = _self_case(
+    q, k, v, k_cache, v_cache, blocks, lens = _self_case(
         num_seqs, ctx_len, block_size, dtype
     )
-    if variant == "vllm":
+    if variant == "cpu":
         run = lambda: cpu_attn.self_attention(
-            q, k, v, k_cache, v_cache, slots, blocks, lens, scale
+            q, k, v, k_cache, v_cache, blocks, lens, scale
         )
     else:
         run = lambda: attention.decoder_self_attention(
@@ -130,7 +129,7 @@ def _time_self(variant, num_seqs, ctx_len, block_size, dtype, scale, iters):
 
 def _time_cross(variant, num_seqs, enc_len, block_size, dtype, scale, iters):
     q, kv_cache, request_ids, staged = _cross_case(num_seqs, enc_len, block_size, dtype)
-    if variant == "vllm":
+    if variant == "cpu":
         k_cache, v_cache, block_table, cache_seqlens = staged
         run = lambda: cpu_attn.cross_attention(
             q, k_cache, v_cache, block_table, cache_seqlens, scale
@@ -149,14 +148,14 @@ def kernel_section(dtype, block_size, iters):
     header = (
         f"{'op':<26} "
         + " ".join(f"{v:>10}" for v in VARIANTS)
-        + f" {'vllm vs eager':>14}"
+        + f" {'cpu vs eager':>14}"
     )
     print(header)
     print("-" * len(header))
     print(
         "note: on CPU the sdpa/eager columns are our per-sequence fallback loop\n"
         "      (CUDA uses the batched one), so they include that Python overhead;\n"
-        "      the vllm column calls the kernel entry point directly, so it does\n"
+        "      the cpu column calls the kernel entry point directly, so it does\n"
         "      not pay the op's backend resolution and Context read;\n"
         "      the e2e section compares against HF's batched sdpa/eager instead."
     )
@@ -175,7 +174,7 @@ def kernel_section(dtype, block_size, iters):
         print(
             f"{label:<26} "
             + " ".join(f"{times[v]:>9.1f}u" for v in VARIANTS)
-            + f" {times['eager'] / times['vllm']:>13.1f}x"
+            + f" {times['eager'] / times['cpu']:>13.1f}x"
         )
     attention.set_backend("auto")
 
