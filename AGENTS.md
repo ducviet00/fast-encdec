@@ -663,8 +663,15 @@ on this box with the same kind of workload.
   smaller page is a cheaper copy).  The same `num_blocks` budget now covers
   twice the KV tokens (and uses twice the memory).
 - **CUDA / FlashAttention-2.** `device="cuda"` needs Dao-AILab's `flash-attn`
-  package (the `cu130` extra; it builds from source with `nvcc` unless a
-  prebuilt wheel matches the installed torch/CUDA/C++ ABI). Flash runs fp16/bf16 only, with
+  package (the `cu130` extra).  Its official wheels stop at torch 2.8, so on
+  this project's torch it builds from source, and **2.8.3 does not build as
+  released**: its `setup.py` hardcodes `-std=c++17`, while torch 2.14's headers
+  need C++20 (`std::strong_ordering` in `c10/util/intrusive_ptr.h`).  What worked
+  on the L4 (g2-standard-32, CUDA 13.0 toolkit from NVIDIA's apt repo, 17m53s):
+  `sed -i 's/-std=c++17/-std=c++20/g' setup.py` in the sdist, then
+  `CUDA_HOME=/usr/local/cuda-13.0 FLASH_ATTN_CUDA_ARCHS=80
+  FLASH_ATTENTION_FORCE_BUILD=TRUE MAX_JOBS=24 uv pip install
+  --no-build-isolation .` (sm80 kernels run on the L4's sm89). Flash runs fp16/bf16 only, with
   `head_dim ∈ {32,64,96,128,160,192,224,256}`, and its **paged** kernel needs a
   block size divisible by 256 — hence the CUDA default `block_size` of 256. So
   fp32, an unsupported head dim (e.g. the tiny-random-BART `head_dim=4`), or an

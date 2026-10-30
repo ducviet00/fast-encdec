@@ -182,6 +182,31 @@ below), so a single short decode has little left to win.  The table above this
 one (Xeon 6975P-C, Graviton 5, ...) is a torch 2.14 recording and is not
 directly comparable.
 
+**L4: Dao-AILab flash-attn vs the old hub kernel (GCP g2-standard-32 spot, NVIDIA L4)**
+
+torch 2.14.1+cu130, `flash-attn` 2.8.3.post2 built from source for sm80 (see the
+CUDA gotcha in `AGENTS.md`), bf16 unless noted, mean of two interleaved runs per
+tree.  "old" is the previous engine on `kernels-community/flash-attn2`; both use
+the decode CUDA graph.
+
+| point | config | old ms | new ms | new vs old | new vs HF |
+|---|---|---:|---:|---:|---:|
+| 128->512 | batch=1 | 1484 | 1482 | 1.00x | 4.01x |
+| 128->512 | batch=8 | 1897 | 1896 | 1.00x | 3.19x |
+| 128->512 | batch=8, beams=4 | 4365 | 4402 | 0.99x | 2.06x |
+| 512->128 | batch=1 | 380 | 378 | 1.01x | 4.00x |
+| 512->128 | batch=8 | 583 | 570 | 1.02x | 2.73x |
+| 512->128 | batch=8, beams=4 | 967 | 956 | 1.01x | 2.81x |
+| 256->256 | batch=1 | 752 | 776 | 0.97x | 3.89x |
+| 256->256 | batch=8 | 988 | 978 | 1.01x | 3.14x |
+| 256->256 | batch=8, beams=4 | 2086 | 2061 | 1.01x | 2.26x |
+
+The two kernels are the same FlashAttention-2 code, so the swap is neutral
+(`256->256, batch=1` has one 805 ms outlier run against 746).  fp32 stays at
+0.51-0.55x vs `transformers` on both (no FlashAttention-2 fp32 path).
+Florence-2 on the same box: 2.83x (batch=1), 3.79x (batch=8), 4.23x (beams=4),
+0.83x (fp32).
+
 **GCP c4a-standard-8 (Axion / Neoverse-V2, 8 cores) - cpu-attention, and torch 2.14 vs 2.15**
 
 `benchmarks/benchmark.py`, bf16 unless noted, tokens/s, each cell the mean of two
