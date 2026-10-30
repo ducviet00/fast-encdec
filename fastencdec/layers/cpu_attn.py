@@ -76,7 +76,7 @@ def self_attention(
         k=key.unsqueeze(1),
         v=value.unsqueeze(1),
         cache_seqlens=context_lens - 1,
-        page_table=block_table,
+        block_table=block_table,
         softmax_scale=scale,
     )
     return out.squeeze(1)
@@ -89,7 +89,7 @@ def cross_attention(query, k_cache, v_cache, block_table, cache_seqlens, scale):
         k_cache,
         v_cache,
         cache_seqlens=cache_seqlens,
-        page_table=block_table,
+        block_table=block_table,
         softmax_scale=scale,
     )
     return out.squeeze(1)
