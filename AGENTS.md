@@ -45,11 +45,10 @@ placeholders; the decoder is unchanged.
   backend (`"cpu"`) for the decoder self/cross-attention *and* the dense
   encoder self-attention, wrapped by `fastencdec/layers/cpu_attn.py`; the
   pure-PyTorch SDPA loop is the fallback.  On CUDA,
-  [`flash-attn`](https://github.com/Dao-AILab/flash-attention) (BSD-3, the
-  `cu130` extra), imported by `fastencdec/layers/flash_attn.py`.  (The
-  vendored vLLM `csrc/cpu` kernel and the `kernels-community/flash-attn2` hub
-  kernel they replaced are gone.)  Do not add *other* external kernels
-  without explicit approval.
+  `kernels-community/flash-attn2` (BSD-3), fetched by
+  `fastencdec/layers/flash_attn.py` through the `kernels` package (the `cu130`
+  extra).  (The vendored vLLM `csrc/cpu` kernel that cpu-attention replaced is
+  gone.)  Do not add *other* external kernels without explicit approval.
 
 ## 2. Environment
 
@@ -84,8 +83,8 @@ placeholders; the decoder is unchanged.
   cu130` for CUDA.  **`uv lock` currently fails**: cpu-attention's own
   `pyproject.toml` pins `torch` to the PyTorch CPU index in `[tool.uv.sources]`,
   and uv applies a git dependency's sources, which collides with the `cu130`
-  extra's index.  Removing that table in cpu-attention makes this project lock
-  (flash-attn 2.8.3 included); until then `uv.lock` is the pre-switch one.
+  extra's index.  Removing that table in cpu-attention makes this project
+  lock; until then `uv.lock` is the pre-switch one.
 
 ## 3. Layout
 
@@ -109,7 +108,7 @@ fastencdec/
     attention.py       device-agnostic attention ops (encoder/self/cross) + dispatch
     cpu_attn.py        wrapper over the cpu-attention kernels (CPU)
     cpu_ops.py         opaque torch.library custom ops around cpu_attn (compiled path)
-    flash_attn.py      lazy loader for Dao-AILab's flash_attn package (CUDA)
+    flash_attn.py      lazy loader for the kernels-community/flash-attn2 kernel (CUDA)
     logits_processor.py  pure-torch LogitsProcessor (built once per generate)
     sampler.py         greedy / multinomial sampling (Sampler nn.Module)
   models/
@@ -662,33 +661,37 @@ on this box with the same kind of workload.
   Emerald).  aarch64 is unaffected (16 is already enough for `"neon"`, and a
   smaller page is a cheaper copy).  The same `num_blocks` budget now covers
   twice the KV tokens (and uses twice the memory).
-- **CUDA / FlashAttention-2.** `device="cuda"` needs Dao-AILab's `flash-attn`
-  package (the `cu130` extra).  Its official wheels stop at torch 2.8, so on
-  this project's torch it builds from source, and **2.8.3 does not build as
-  released**: its `setup.py` hardcodes `-std=c++17`, while torch 2.14's headers
-  need C++20 (`std::strong_ordering` in `c10/util/intrusive_ptr.h`).  What worked
-  on the L4 (g2-standard-32, CUDA 13.0 toolkit from NVIDIA's apt repo, 17m53s):
-  `sed -i 's/-std=c++17/-std=c++20/g' setup.py` in the sdist, then
-  `CUDA_HOME=/usr/local/cuda-13.0 FLASH_ATTN_CUDA_ARCHS=80
-  FLASH_ATTENTION_FORCE_BUILD=TRUE MAX_JOBS=24 uv pip install
-  --no-build-isolation .` (sm80 kernels run on the L4's sm89). Flash runs fp16/bf16 only, with
+- **CUDA / FlashAttention-2.** `device="cuda"` needs the `kernels` package; the
+  `kernels-community/flash-attn2` wheel is downloaded once (`get_kernel`, tries
+  `version=3` then `2` then unversioned) and cached under the HF cache dir, so
+  the first CUDA run needs network. Flash runs fp16/bf16 only, with
   `head_dim ∈ {32,64,96,128,160,192,224,256}`, and its **paged** kernel needs a
   block size divisible by 256 — hence the CUDA default `block_size` of 256. So
   fp32, an unsupported head dim (e.g. the tiny-random-BART `head_dim=4`), or an
   explicit `block_size=16` on CUDA silently demote `"auto"` to SDPA (`"flash"`
-  raises instead).  So does an unavailable *kernel*: if `import flash_attn`
-  fails, `flash_attn.module()` is `None`, `"auto"` runs SDPA and the decode
+  raises instead).  So does an unavailable *kernel*: with `HF_HUB_OFFLINE=1`
+  and a cold ``kernels`` cache, `get_kernel` fails even though the Hub is
+  reachable, `flash_attn.module()` is `None`, `"auto"` runs SDPA and the decode
   CUDA graph switches off with it — on the L4, `batch=8, beams=1, bf16` then
   measured 347 tok/s where the flash path gives 1817.  Check
   `flash_attn.module()` before trusting CUDA numbers, exactly as
-  `cpu_attn.module()` gates the CPU ones.
+  `cpu_attn.module()` gates the CPU ones.  (The L4's `ours`-side runs must
+  therefore go ONLINE: `get_kernel` fails under `HF_HUB_OFFLINE=1` even with
+  the kernel snapshots cached in `~/.cache/huggingface/kernels`, so unset that
+  variable for the ours engine and keep it set for the vLLM side.)
   The backend uses `flash_attn_with_kvcache` (page-major cache
   read through the block table) for self- and cross-attention: the dedicated
   decode kernel is ~3x cheaper per call than `flash_attn_varlen_func`, which
   matters because GPU decode here is launch-bound. The BART encoder
   self-attention uses `flash_attn_func`. There is no per-backend flag: the ops
   in `layers/attention.py` choose the kernel from the tensor device/dtype/shape,
-  and `attention.set_backend` only overrides that for tests.
+  and `attention.set_backend` only overrides that for tests.  Dao-AILab's
+  `flash-attn` package was tried as a replacement and measured identical on the
+  L4 (0.97-1.02x on every `benchmark.py` row, same box, interleaved runs) — the
+  hub kernel is a build of the same code — but 2.8.3 has no wheel past torch
+  2.8 and does not build against torch 2.14 as released (its `setup.py`
+  hardcodes `-std=c++17`; torch's headers need C++20), so the prebuilt hub
+  kernel stays.
 - **GPU decode is KV-bandwidth-bound.** Every step re-reads each sequence's
   key/value cache, so `flash_fwd_splitkv_kernel` is ~2/3 of all CUDA time (true
   for nano-vllm too). At batch ≥ 32 the engine is GPU-bound (eager ≈ CUDA-graph);
@@ -871,8 +874,8 @@ on this box with the same kind of workload.
 
 - Keep it small and readable; match the existing file structure and naming.
 - Minimal comments; docstrings brief and direct. No dead code.
-- Pure PyTorch plus `cpu-attention` (CPU) and `flash-attn` (CUDA), both
-  approved. No new third-party dependencies without discussion. (`Pillow` was
+- Pure PyTorch plus `cpu-attention` (CPU) and the `kernels-community/flash-attn2`
+  hub kernel (CUDA), both approved. No new third-party dependencies without discussion. (`Pillow` was
   approved for Florence-2 image processing; the DaViT vision tower and projector
   are vendored in `fastencdec/models/florence2.py`, an optimized copy of the
   `transformers` reference.)

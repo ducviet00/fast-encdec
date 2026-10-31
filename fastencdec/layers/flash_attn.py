@@ -1,7 +1,8 @@
-"""Lazy loader for Dao-AILab's FlashAttention-2 (the ``flash_attn`` package)."""
+import contextlib
 
 import torch
 
+KERNEL_ID = "kernels-community/flash-attn2"
 _HEAD_DIMS = {32, 64, 96, 128, 160, 192, 224, 256}
 _FLOAT_DTYPES = {torch.float16, torch.bfloat16}
 
@@ -15,14 +16,16 @@ def supported(dtype: torch.dtype, head_dim: int) -> bool:
 
 
 def _load():
-    """Import ``flash_attn`` when a CUDA device is present, or return None."""
-    if not torch.cuda.is_available():
-        return None
+    """Fetch the prebuilt FlashAttention-2 kernel from the HuggingFace kernels hub."""
     try:
-        import flash_attn
+        from kernels import get_kernel
     except Exception:  # noqa: BLE001
         return None
-    return flash_attn
+    for version in (3, 2, None):
+        kwargs = {} if version is None else {"version": version}
+        with contextlib.suppress(Exception):
+            return get_kernel(KERNEL_ID, **kwargs)
+    return None
 
 
 def module():
@@ -40,8 +43,8 @@ def require():
     mod = module()
     if mod is None:
         raise RuntimeError(
-            "FlashAttention-2 requested but the flash_attn package could not be "
-            "imported; install flash-attn (https://github.com/Dao-AILab/"
-            "flash-attention) on a CUDA machine, or use attn_backend='auto'/'sdpa'."
+            "FlashAttention-2 requested but the kernels-community/flash-attn2 "
+            "kernel could not be loaded; install the 'kernels' package and a "
+            "CUDA GPU, or use attn_backend='auto'/'sdpa'."
         )
     return mod

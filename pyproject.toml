@@ -20,7 +20,9 @@ cpu = [
 cu130 = [
   "torch>=2.11.0",
   "torchvision>=0.26.0",
-  "flash-attn>=2.7",
+  # Fetches the prebuilt kernels-community/flash-attn2 kernel on first CUDA use;
+  # without it the engine silently falls back to the slow SDPA path.
+  "kernels",
 ]
 
 [tool.uv]
@@ -42,10 +44,9 @@ torchvision = [
   { index = "pytorch-cu130", extra = "cu130" },
 ]
 
-# Both kernels build against (and link) the torch the project runs with.
+# cpu-attention builds against (and links) the torch the project runs with.
 [tool.uv.extra-build-dependencies]
 cpu-attention = [{ requirement = "torch", match-runtime = true }]
-flash-attn = [{ requirement = "torch", match-runtime = true }]
 
 [[tool.uv.index]]
 name = "pytorch-cpu"
