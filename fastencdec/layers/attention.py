@@ -4,14 +4,14 @@ import torch.nn.functional as F
 from ..utils.context import get_context
 from . import cpu_attn, cpu_ops, flash_attn
 
-_BACKENDS = ("auto", "vllm", "flash", "sdpa")
+_BACKENDS = ("auto", "cpu", "flash", "sdpa")
 _PREFER = "auto"
 # Per-step gather index for the SDPA fallback, memoized by Context identity.
 _DERIVED: tuple = (None, None, None)
 
 
 def set_backend(name: str) -> None:
-    """Override the attention backend ('auto', 'vllm', 'flash', or 'sdpa')."""
+    """Override the attention backend ('auto', 'cpu', 'flash', or 'sdpa')."""
     if name not in _BACKENDS:
         raise ValueError(f"attn_backend must be one of {_BACKENDS}, got {name!r}")
     global _PREFER
@@ -22,8 +22,8 @@ def _paged_backend(device, dtype, head_dim, block_size) -> str:
     """Resolve the active paged attention backend for (device, dtype, head_dim, block_size)."""
     if _PREFER == "flash" and device.type != "cuda":
         raise RuntimeError("FlashAttention-2 requires a CUDA device")
-    if _PREFER == "vllm" and device.type != "cpu":
-        raise RuntimeError("the vendored vLLM attention kernel is CPU-only")
+    if _PREFER == "cpu" and device.type != "cpu":
+        raise RuntimeError("the cpu-attention kernels are CPU-only")
     if _PREFER == "sdpa":
         return "sdpa"
     if device.type == "cuda":
@@ -38,22 +38,23 @@ def _paged_backend(device, dtype, head_dim, block_size) -> str:
             flash_attn.require()
             return "flash"
         return "flash" if flash_attn.module() is not None else "sdpa"
-    if device.type == "cpu" and _PREFER in ("auto", "vllm"):
-        isa = cpu_attn.select_isa(dtype, block_size, head_dim)
-        if isa is not None and (_PREFER == "vllm" or cpu_attn.module() is not None):
-            if _PREFER == "vllm":
-                cpu_attn.require()
-            return "vllm"
-        if _PREFER == "vllm":
-            raise RuntimeError(
-                f"vLLM CPU attention does not support head_dim={head_dim} "
-                f"block_size={block_size} dtype={dtype}"
-            )
+    if device.type == "cpu" and _PREFER in ("auto", "cpu"):
+        if not cpu_attn.supported(dtype, head_dim, block_size):
+            if _PREFER == "cpu":
+                raise RuntimeError(
+                    f"cpu-attention does not support head_dim={head_dim} "
+                    f"block_size={block_size} dtype={dtype}"
+                )
+            return "sdpa"
+        if _PREFER == "cpu":
+            cpu_attn.require()
+            return "cpu"
+        return "cpu" if cpu_attn.module() is not None else "sdpa"
     return "sdpa"
 
 
 def backend(device, dtype, head_dim, block_size) -> str:
-    """Return the paged kernel name ('flash', 'vllm', or 'sdpa') for the given configuration."""
+    """Return the paged kernel name ('flash', 'cpu', or 'sdpa') for the given configuration."""
     return _paged_backend(torch.device(device), dtype, head_dim, block_size)
 
 
@@ -81,7 +82,7 @@ def store_kvcache(key, value, k_cache, v_cache, slot_mapping, block_size, page_m
 
 def _store(key, value, k_cache, v_cache, slot_mapping, block_size, backend):
     """Scatter new key/value into the paged cache using the fastest path for backend."""
-    if backend == "vllm":
+    if backend == "cpu":
         cpu_attn.reshape_and_cache(key, value, k_cache, v_cache, slot_mapping)
     else:
         store_kvcache(
@@ -95,40 +96,58 @@ def _store(key, value, k_cache, v_cache, slot_mapping, block_size, backend):
         )
 
 
-def _dense_flash(query) -> bool:
-    """Return True if dense encoder self-attention should use FlashAttention-2."""
+def _dense_backend(query) -> str:
+    """Return the kernel for dense encoder self-attention ('flash', 'cpu', or 'sdpa')."""
     if _PREFER == "sdpa":
-        return False
+        return "sdpa"
+    dtype, head_dim = query.dtype, query.shape[-1]
     if not query.is_cuda:
         if _PREFER == "flash":
             raise RuntimeError("FlashAttention-2 requires a CUDA device")
-        return False
-    if not flash_attn.supported(query.dtype, query.shape[-1]):
+        if not cpu_attn.supported(dtype, head_dim):
+            if _PREFER == "cpu":
+                raise RuntimeError(
+                    f"cpu-attention does not support {dtype} head_dim={head_dim}"
+                )
+            return "sdpa"
+        if _PREFER == "cpu":
+            cpu_attn.require()
+            return "cpu"
+        return "cpu" if cpu_attn.module() is not None else "sdpa"
+    if _PREFER == "cpu":
+        raise RuntimeError("the cpu-attention kernels are CPU-only")
+    if not flash_attn.supported(dtype, head_dim):
         if _PREFER == "flash":
             raise RuntimeError(
-                f"FlashAttention-2 does not support {query.dtype} head_dim="
-                f"{query.shape[-1]}"
+                f"FlashAttention-2 does not support {dtype} head_dim={head_dim}"
             )
-        return False
+        return "sdpa"
     if _PREFER == "flash":
         flash_attn.require()
-    return flash_attn.module() is not None
+    return "flash" if flash_attn.module() is not None else "sdpa"
 
 
 def encoder_self_attention(query, key, value, scale=None):
-    """Run dense non-causal self-attention [B, H, S, D] for the encoder."""
-    if _dense_flash(query):
-        out = flash_attn.require().flash_attn_func(
-            query.transpose(1, 2).contiguous(),
-            key.transpose(1, 2).contiguous(),
-            value.transpose(1, 2).contiguous(),
-            causal=False,
-            softmax_scale=scale,
+    """Run dense non-causal self-attention over [B, S, H, D] for the encoder."""
+    backend = _dense_backend(query)
+    if backend == "flash":
+        return flash_attn.require().flash_attn_func(
+            query, key, value, causal=False, softmax_scale=scale
         )
-        return out.transpose(1, 2)
-    return F.scaled_dot_product_attention(
-        query, key, value, is_causal=False, scale=scale
+    if scale is None:
+        scale = query.shape[-1] ** -0.5
+    if backend == "cpu":
+        # Opaque custom op: Dynamo cannot trace the kernel's native entry.
+        return cpu_ops.dense_attention(query, key, value, scale)
+    # .contiguous() avoids the ~20x slower non-contiguous BF16 SDPA path on aarch64.
+    out = F.scaled_dot_product_attention(
+        query.transpose(1, 2).contiguous(),
+        key.transpose(1, 2).contiguous(),
+        value.transpose(1, 2).contiguous(),
+        is_causal=False,
+        scale=scale,
     )
+    return out.transpose(1, 2)
 
 
 def _key_slot_ids(ctx, block_size):
@@ -177,7 +196,7 @@ def decoder_self_attention(query, key, value, k_cache, v_cache, scale, block_siz
         )
         return out.squeeze(1)
 
-    if backend == "vllm":
+    if backend == "cpu":
         # Opaque custom op: the kernel path reads Context and mutates the caches,
         # so torch.compile never traces it.
         return cpu_ops.self_attention(query, key, value, k_cache, v_cache, scale)
@@ -262,11 +281,11 @@ def _stage(layer, request_ids, backend, block_size):
 
 
 def stage_cross(layers, request_ids):
-    """Stage every decoder layer's encoder K/V for the vLLM CPU kernel."""
+    """Stage every decoder layer's encoder K/V for the CPU kernel."""
     staged = []
     for layer in layers:
         attn = layer.encoder_attn
-        staged.append(_stage(attn, request_ids, "vllm", attn.block_size))
+        staged.append(_stage(attn, request_ids, "cpu", attn.block_size))
     return staged
 
 
@@ -274,7 +293,7 @@ def decoder_cross_attention(query, layer, scale, block_size):
     """Run decoder cross-attention against the layer's cached per-request encoder K/V."""
     ctx = get_context()
     backend = _paged_backend(query.device, query.dtype, query.shape[2], block_size)
-    if backend == "vllm":
+    if backend == "cpu":
         # Opaque custom op: the staged tensors come from the per-step Context, so
         # neither they nor the kernel calls enter the compiled graph.
         return cpu_ops.cross_attention(query, layer.layer_idx, scale)

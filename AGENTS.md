@@ -34,19 +34,21 @@ placeholders; the decoder is unchanged.
 
 ### Non-goals / do not add without discussion
 
-- No flash-attn **outside** the CUDA backend: CPU stays pure PyTorch + the
-  vendored vLLM kernel.
+- CPU stays pure PyTorch + the `cpu-attention` kernels; CUDA stays PyTorch +
+  FlashAttention-2.
 - No quantization, prefix caching or chunked prefill.  The decode CUDA graph is
   **on by default** on CUDA with the FlashAttention-2 backend (`Config.use_cudagraph`;
   ignored elsewhere) — see `engine/cudagraph.py`.  The CPU path never uses it.
-- **Vendored vLLM CPU attention kernel.** `csrc/cpu` is a copy of vLLM's
-  `csrc/cpu` attention implementation (Apache-2.0, see `csrc/LICENSE`), built
-  on first use by `fastencdec/layers/cpu_attn.py`. It is the default CPU
-  decoder self/cross-attention backend when it compiles; the pure-PyTorch SDPA
-  loop is the fallback. Do not add *other* external kernels without explicit
-  approval. On CUDA the only external kernel is
+- **External kernels: two, both approved.** On CPU,
+  [`cpu-attention`](https://github.com/ducviet00/cpu-attention) (Mojo kernels
+  with flash-attn's API; the `cpu` extra builds it from git) is the default
+  backend (`"cpu"`) for the decoder self/cross-attention *and* the dense
+  encoder self-attention, wrapped by `fastencdec/layers/cpu_attn.py`; the
+  pure-PyTorch SDPA loop is the fallback.  On CUDA,
   `kernels-community/flash-attn2` (BSD-3), fetched by
-  `fastencdec/layers/flash_attn.py`.
+  `fastencdec/layers/flash_attn.py` through the `kernels` package (the `cu130`
+  extra).  (The vendored vLLM `csrc/cpu` kernel that cpu-attention replaced is
+  gone.)  Do not add *other* external kernels without explicit approval.
 
 ## 2. Environment
 
@@ -68,8 +70,9 @@ placeholders; the decoder is unchanged.
   unreachable); check the host is alive before trusting its numbers.  Each has the repo at `~/fast-encdec` and `car.jpg` at
   `/tmp/fastencdec/florence2_bench.jpg`.  Copy with
   `tar czf - ... | ssh box 'tar xzf - -C ~/fast-encdec'` — and all three needed
-  `gcc g++ make ninja-build python3-dev` before `csrc/` would build (torch's
-  cpp_extension shells out to ninja, and the Python headers must be present).
+  `gcc g++ make python3-dev` before `cpu-attention` would build (`uv pip install
+  --no-build-isolation git+https://github.com/ducviet00/cpu-attention.git` in a
+  venv that has torch and `mojo==1.2.0`; ~15 s on c4a-standard-8).
   Sync the whole tree, not just `benchmarks/`: a stale `fastencdec/` package
   silently keeps producing numbers.
 - HF models are cached locally (`facebook/bart-large-cnn`,
@@ -77,8 +80,11 @@ placeholders; the decoder is unchanged.
   `florence-community/Florence-2-base`, `hf-internal-testing/tiny-random-Florence2ForConditionalGeneration`).
 - Run from the repo root with `PYTHONPATH=.`, or install it: `uv sync --extra
   cpu` (the project `.venv`, torch from the PyTorch CPU index) or `--extra
-  cu130` for CUDA.  `uv lock --check` and `uv sync --extra cpu --dry-run`
-  both pass.
+  cu130` for CUDA.  **`uv lock` currently fails**: cpu-attention's own
+  `pyproject.toml` pins `torch` to the PyTorch CPU index in `[tool.uv.sources]`,
+  and uv applies a git dependency's sources, which collides with the `cu130`
+  extra's index.  Removing that table in cpu-attention makes this project
+  lock; until then `uv.lock` is the pre-switch one.
 
 ## 3. Layout
 
@@ -100,7 +106,8 @@ fastencdec/
     cudagraph.py       decode-only CUDA-graph capture/replay (on by default on CUDA)
   layers/
     attention.py       device-agnostic attention ops (encoder/self/cross) + dispatch
-    cpu_attn.py        JIT build + wrapper for the vendored vLLM CPU kernels
+    cpu_attn.py        wrapper over the cpu-attention kernels (CPU)
+    cpu_ops.py         opaque torch.library custom ops around cpu_attn (compiled path)
     flash_attn.py      lazy loader for the kernels-community/flash-attn2 kernel (CUDA)
     logits_processor.py  pure-torch LogitsProcessor (built once per generate)
     sampler.py         greedy / multinomial sampling (Sampler nn.Module)
@@ -110,7 +117,6 @@ fastencdec/
   utils/
     context.py         device-agnostic per-step Context read by the attention ops
     loader.py          HF checkpoint -> model weights (concatenates fused q/k/v)
-csrc/                  vendored vLLM CPU attention kernels (+ bindings.cpp)
 examples/summarize.py
 examples/florence2.py
 benchmarks/benchmark.py
@@ -138,8 +144,8 @@ ModelRunner.run(seqs)
     _encode(fresh)                # batched encoder (grouped by length/image shape) -> dense cross-attn K/V
     _prepare(seqs)                # input_ids/positions/slot_mapping; ensure blocks/CoW
     set_context(...)              # Context: context_lens, block_tables, slot_mapping,
-                                  #   request_ids, cross_staged (vLLM CPU path only)
-    decoder forward               # ops dispatch to vLLM-CPU / flash-attn2-CUDA / SDPA
+                                  #   request_ids, cross_staged (cpu-attention path only)
+    decoder forward               # ops dispatch to cpu-attention / flash-attn2-CUDA / SDPA
                                   # (or, with use_cudagraph, replay a captured decode graph)
     compute_logits                # one row per sequence (one new token each)
 LLMEngine.step()                  # sample (greedy) or beam-expand; append; free finished
@@ -161,8 +167,8 @@ what keeps decode from being launch/sync-bound (see the L4 beam rows).
 `decoder_self_attention` (paged growing cache) and `decoder_cross_attention`
 (fixed per-request encoder K/V).  Each op reads `utils/context.py` and picks its
 own kernel; the runner and the model never name a backend
-(`attention.set_backend` only overrides the choice for tests).  For the vLLM
-CPU path the runner stages each layer's dense encoder K/V into a paged cache
+(`attention.set_backend` only overrides the choice for tests).  For the
+cpu-attention path the runner stages each layer's dense encoder K/V into a paged cache
 before the forward (`attention.stage_cross` -> `Context.cross_staged`); the
 opaque cross-attention op reads that per-step state at call time, so it stays
 out of the compiled graph.
@@ -181,8 +187,8 @@ out of the compiled graph.
 2. **Positions** are absolute indices into `token_ids` (0-based).
    `BartLearnedPositionalEmbedding` adds the `+2` BART offset internally.
 3. **Paged self-attn cache.** `layers/attention.py` picks the layout the active
-   kernel wants -- head-major `[num_blocks, heads, block_size, head_dim]` (vLLM
-   CPU / SDPA) or page-major `[num_blocks, block_size, heads, head_dim]`
+   kernel wants -- head-major `[num_blocks, heads, block_size, head_dim]`
+   (cpu-attention / SDPA; cpu-attention also stores K transposed inside the page) or page-major `[num_blocks, block_size, heads, head_dim]`
    (FlashAttention-2) -- in the single place both the op and the runner go
    through, `attention.self_cache_shape`. A token at sequence position `p` lives
    in `block_tables[i, p // block_size]` at offset `p % block_size` (flat slot
@@ -194,9 +200,9 @@ out of the compiled graph.
    decode has `query_len == 1 < context_len` (attend to every cached key). This
    **assumes a sequence is prefilled exactly once, when its cache is empty**. Do
    not add chunked prefill or preemption/recompute without updating the mask
-   logic. The vLLM kernel takes it as a per-sequence `dynamic_causal` (1 =
-   prefill), computed in `cpu_attn.self_attention` from `context_lens == 1`, so
-   mixed prefill/decode batches still work. The flash
+   logic. cpu-attention needs no mask: its single query sits at the last cached
+   position (`cache_seqlens = context_lens - 1` before the append), so mixed
+   prefill/decode batches work as is. The flash
    path passes `causal=True` to its paged decode kernel: the bottom-right-aligned
    mask gives the same result.
 5. **Cross-attention is dense, not paged.** Each `BartDecoderCrossAttention`
@@ -204,11 +210,11 @@ out of the compiled graph.
    `[num_heads, enc_len, head_dim]`, filled once in `_encode`, shared by all
    beams of a request (`Context.request_ids`) and freed in
    `ModelRunner.clear_request`. It does not count against `num_blocks`. SDPA
-   reads it directly. The vLLM and flash kernels stage it into a paged cache --
-   head-major for vLLM, page-major for flash -- memoized on the layer as
+   reads it directly. The cpu-attention and flash kernels stage it into a paged
+   cache -- head-major for cpu-attention, page-major for flash -- memoized on the layer as
    `layer.cross_staged`, keyed by `(backend, tuple(request_ids))`, so it is
    rebuilt only when the active request set changes and beams never duplicate
-   K/V. On the CPU vLLM path `ModelRunner.run` stages it into
+   K/V. On the cpu-attention path `ModelRunner.run` stages it into
    `Context.cross_staged` (a list indexed by decoder layer) before the forward;
    the opaque cross op reads that at call time, so the tensors never enter the
    compiled graph.
@@ -255,7 +261,7 @@ export HF_HUB_OFFLINE=1                        # the models are cached; the
 # unit / parity (tiny random BART; greedy + beam vs HF)
 PYTHONPATH=. $P tests/test_parity.py
 
-# vendored vLLM kernel vs the SDPA path (tiny BART with head_dim=32)
+# cpu-attention vs the SDPA path (tiny BART with head_dim=32)
 PYTHONPATH=. $P tests/test_attn_backend.py
 
 # token-by-token parity vs HF on the real checkpoints (fp32 exact; bf16 same length).
@@ -312,7 +318,7 @@ PYTHONPATH=. $P benchmarks/throughput.py --requests 128 --enc-len 512 --max-toke
 PYTHONPATH=. $P benchmarks/throughput.py --requests 32 --enc-len 512 --max-tokens 256 --no-cudagraph
 PYTHONPATH=. $P benchmarks/throughput.py --requests 64 --enc-len 512 --max-tokens 256
 
-# attention implementation: vendored vLLM CPU kernel vs SDPA vs eager
+# attention implementation: cpu-attention vs SDPA vs eager
 PYTHONPATH=. $P benchmarks/attn_backend.py                    # kernel + end-to-end
 PYTHONPATH=. $P benchmarks/attn_backend.py --mode kernel      # ops only, no weights
 PYTHONPATH=. $P benchmarks/attn_backend.py --mode e2e --device cuda
@@ -335,10 +341,15 @@ hand-edit or guess.**
 
 | config | ours ms | ours tok/s | hf ms | hf tok/s | speedup |
 |---|---:|---:|---:|---:|---:|
-| batch=1, beams=1, bf16 | 3728 | 68.7 | 5913 | 43.3 | 1.59x |
-| batch=8, beams=1, bf16 | 5271 | 388.5 | 9022 | 227.0 | 1.71x |
-| batch=8, beams=4, bf16 | 8030 | 255.1 | 31767 | 64.5 | 3.96x |
-| batch=8, beams=1, fp32 | 8942 | 229.0 | 24943 | 82.1 | 2.79x |
+| batch=1, beams=1, bf16 | 3527 | 72.6 | 5870 | 43.6 | 1.66x |
+| batch=8, beams=1, bf16 | 4942 | 414.4 | 8981 | 228.0 | 1.82x |
+| batch=8, beams=4, bf16 | 7681 | 266.6 | 31660 | 64.7 | 4.12x |
+| batch=8, beams=1, fp32 | — | — | — | — | — |
+
+The fp32 row was not re-recorded with cpu-attention: the laptop had ~6 GB free
+and the fp32 phase (~7.5 GB RSS) was OOM-killed under a 6 GB cap in both runs.
+Run it when the box has the memory (the previous recording, vendored kernel,
+read 8942 / 24943 ms, 2.79x).
 
 Mean of two runs with a cold Inductor cache (`/tmp/torchinductor_*` and
 `~/.cache/torch_extensions` removed first).  This recording is the frozen
@@ -352,8 +363,8 @@ compiles too and verifies token-exact vs HF
 two runs read 3691/3765 ms there), so only the within-run speedup is meaningful;
 the `beams=4` win over HF (4x) is the stable feature of the table.
 
-Built with the vendored kernel — if `csrc/` fails to build (no `ninja`, see the
-gotcha) `auto` falls back to SDPA and the compiled gate turns off with it, so
+Recorded with the vendored vLLM kernel, before the switch to `cpu-attention`.
+If `cpu-attention` is not installed `auto` falls back to SDPA and the compiled gate turns off with it, so
 every row reads like the old unpacked-eager numbers (0.75-1.38x), which is why
 `cpu_attn.module()` is worth checking before trusting any CPU number.  This
 laptop still has the largest *speedup* at these points (8 cores, high clocks,
@@ -496,9 +507,9 @@ on this box with the same kind of workload.
 - **BF16 vs FP32**: BF16 ≈ 2× on GEMM-heavy work via oneDNN; attention is
   FP32-accumulate in both.
 - **CPU GEMM packing: frozen `torch.compile`, on by default (CPU, fp32/bf16,
-  when the vendored kernel is active).** There is no manual prepack anymore.
+  when `cpu-attention` is active).** There is no manual prepack anymore.
   When `compile_decoder` holds (`compile` + `device.type == "cpu"` + dtype
-  float32/bfloat16 + `backend == "vllm"`), the runner `torch.compile`s **two
+  float32/bfloat16 + `backend == "cpu"`), the runner `torch.compile`s **two
   graphs**: `model.forward` (decoder + lm head, one graph — lm-head GEMMs pack
   too) via opaque attention custom ops, and `model.encode` for the encoder
   (vision tower included for Florence-2).  (`Config.compile=False` /
@@ -514,7 +525,7 @@ on this box with the same kind of workload.
   (`compile_fx.py`: freezing needs `not torch.is_grad_enabled()`, so forwards
   run under `torch.no_grad()`).  Two rules: (1) the CPU SDPA fallback is NOT
   compiled — it reads the per-step `Context` globals, which tracing would bake
-  in — so if `csrc/` cannot build, CPU is plain unpacked eager and
+  in — so without `cpu-attention`, CPU is plain unpacked eager and
   *slower than HF* (0.75-0.94x SDPA-loop penalty; check `cpu_attn.module()`);
   (2) shapes must stay dynamic: a static graph **duplicates every frozen weight
   per compiled shape** (measured +0.74 GB bf16 / +1.6 GB fp32 per artifact for
@@ -537,6 +548,26 @@ on this box with the same kind of workload.
   graph without running the trace** — no trace-time side effects allowed; see
   the FX-cache gotcha), and parallel workers are capped at 4 to avoid a GB-scale
   compile memory spike on small boxes.
+- **torch 2.15 on aarch64: batch 1 is compiled without freezing.**  In torch
+  2.14 an eager one-row bf16 GEMM on aarch64 goes through oneDNN, which reorders
+  the whole weight into its blocked layout on *every call* (`ONEDNN_VERBOSE`:
+  1.5 ms reorder + 0.3 ms matmul for `[1x1024]x[1024x4096]`); 2.15 skips oneDNN
+  for one row (0.22 ms, no reorder).  That tripled `transformers`' batch=1 on
+  c4a (31 -> 93-100 tok/s) and made the frozen, packed batch-1 decode graph the
+  slow path (9.7 ms/step vs 6.3 unfrozen).  `ModelRunner` therefore compiles the
+  batch-1 decode graph with `freezing=False` when `_UNFROZEN_SINGLE_ROW`
+  (aarch64 + torch >= 2.15); every other graph stays frozen and packed (batch=8
+  packed is still +30%).  Batch 1 is its own graph anyway (the 0/1
+  specialization), so this costs no extra Dynamo entries.  Two traps: (1)
+  toggling `cpp.weight_prepack` per graph does **not** work — Inductor's
+  `freezing_patterns.lazy_init` registers the packing patterns once per
+  process from the first compile's config, so the first graph's choice sticks
+  for all later ones; `freezing` is read on every compile, which is why the
+  gate toggles that.  (2) On x86 (Xeon 8581C, torch 2.15) batch 1 ties across
+  packed/unpacked/eager (2.15 only moves M=1 from AMX to `avx512_core_bf16`, no
+  per-call reorder on either version), so the gate is aarch64-only; on torch
+  2.14 an unfrozen batch-1 graph would pay the per-call reorder, so it is
+  version-gated too.
 - **Dynamo's `recompile_limit` is a budget, not a formality.** A compiled frame
   keeps at most `recompile_limit` (default 8) cache entries, then Dynamo logs
   `hit config.recompile_limit` and runs the frame **eager** — no error, just the
@@ -586,12 +617,16 @@ on this box with the same kind of workload.
   Inductor's BF16 fusion shifts outputs, so greedy tokens can diverge from HF;
   pass `compile_mm_encoder=False` for exact parity or to avoid the per-shape
   compile latency (it compiles once per image shape on first use).
-- **Attention backend.** `attn_backend="auto"` uses the vendored vLLM kernel
-  when it compiles (the default), else SDPA. The kernel only handles
-  `head_dim ∈ {32,48,64,80,96,112,128,160,192,224,256,512}`; other shapes (e.g.
-  the tiny-random-BART test model, `head_dim=4`) fall back to SDPA. The first
-  use compiles `csrc/` (~1-3 min) and caches the `.so` under torch's extensions
-  dir; a missing compiler downgrades `"auto"` to SDPA but makes `"vllm"` fail.
+- **Attention backend.** `attn_backend="auto"` uses `cpu-attention` on CPU when
+  it is installed (the default), else SDPA. The kernels take fp32/bf16 only,
+  `head_dim ∈ {32,64,128}`, a page size that is a multiple of 16, and MHA; other
+  shapes (e.g. the tiny-random-BART test model, `head_dim=4`) fall back to SDPA.
+  A missing package downgrades `"auto"` to SDPA but makes `"cpu"` fail.  The
+  paged cache is the library's own head-major layout with K transposed inside
+  the page, so only `cpu-attention` writes it (`reshape_and_cache` for the
+  staged cross cache, `flash_attn_with_kvcache(k=, v=)` for the self cache);
+  SDPA cannot read it, which is fine because the backend is fixed per engine.
+  The figures below were measured with the old vendored vLLM kernel:
   `benchmarks/attn_backend.py` measures what the kernel is worth: at the default
   page size on the four CPU boxes (bf16) it is **~4-75x faster per decoder op**
   than the SDPA/"eager" fallbacks (75x at batch=8/ctx=256 on the 8-core laptop,
@@ -602,13 +637,14 @@ on this box with the same kind of workload.
   The CPU SDPA fallback is itself slower than HF (0.75-0.94x) because it attends
   one sequence at a time (CUDA uses the batched path), so `"auto"` resolving to
   the kernel matters a lot.  **Check `cpu_attn.module()` before trusting CPU
-  numbers**: if `csrc/` cannot build (no `ninja`, no Python headers) the engine
-  silently degrades to SDPA and gets *slower than HF* (0.75-0.94x) with no error
-  — `ninja` is now in the `cpu` extra for exactly this reason, and a bare
-  `uv sync` without it is the usual cause.
+  numbers**: if `cpu-attention` is not installed (a bare `uv sync` without the
+  `cpu` extra) the engine silently degrades to SDPA and gets *slower than HF*
+  (0.75-0.94x) with no error.
 - **CPU page size (`block_size`).** `block_size=None` picks the smallest page the
   device's best kernel accepts (`fastencdec.config.default_block_size`): 256 on
-  CUDA, **32 on x86**, 16 on aarch64.  `csrc`'s full-width AVX-512 kernel
+  CUDA, **32 on x86**, 16 on aarch64.  `cpu-attention` specializes 16 and 32
+  (and 48/64) at compile time.  The history below is the old vendored vLLM
+  kernel's, whose full-width AVX-512 kernel
   (`select_isa` → `"vec"`) only engages when `block_size % 32 == 0`, so the
   old x86 default of 16 silently ran the half-width `"vec16"` one and left ~10%
   of the attention kernel unused (`benchmarks/attn_backend.py --mode kernel` on
@@ -649,7 +685,13 @@ on this box with the same kind of workload.
   matters because GPU decode here is launch-bound. The BART encoder
   self-attention uses `flash_attn_func`. There is no per-backend flag: the ops
   in `layers/attention.py` choose the kernel from the tensor device/dtype/shape,
-  and `attention.set_backend` only overrides that for tests.
+  and `attention.set_backend` only overrides that for tests.  Dao-AILab's
+  `flash-attn` package was tried as a replacement and measured identical on the
+  L4 (0.97-1.02x on every `benchmark.py` row, same box, interleaved runs) — the
+  hub kernel is a build of the same code — but 2.8.3 has no wheel past torch
+  2.8 and does not build against torch 2.14 as released (its `setup.py`
+  hardcodes `-std=c++17`; torch's headers need C++20), so the prebuilt hub
+  kernel stays.
 - **GPU decode is KV-bandwidth-bound.** Every step re-reads each sequence's
   key/value cache, so `flash_fwd_splitkv_kernel` is ~2/3 of all CUDA time (true
   for nano-vllm too). At batch ≥ 32 the engine is GPU-bound (eager ≈ CUDA-graph);
@@ -734,9 +776,9 @@ on this box with the same kind of workload.
   instead of the per-step memo.
 - **CPU: frozen `torch.compile` IS the packing path (always on).** The decode
   (decoder + lm head via the model's `forward`) and BART-encode graphs trace as one
-  graph each because the vLLM CPU attention branches are opaque
-  `torch.library.custom_op`s (`fastencdec::cpu_vllm_self_attention`,
-  `::cpu_vllm_cross_attention`, in `layers/attention.py`, `register_fake`
+  graph each because the CPU attention branches are opaque
+  `torch.library.custom_op`s (`fastencdec::cpu_self_attention`,
+  `::cpu_cross_attention`, `::cpu_dense_attention`, in `layers/cpu_ops.py`, `register_fake`
   impls, `mutates_args` covering the self caches) — Dynamo never traces the
   pybind module, the Context reads, or the cross staging, so it is **one graph,
   zero breaks** and Inductor freezing (patched on around every compiled call via
@@ -817,8 +859,8 @@ on this box with the same kind of workload.
   intentional for simplicity).
 - On **CPU** the SDPA fallback attends one sequence at a time, because the
   batched block-diagonal path (`_sdpa_paged_batched`) is only taken on CUDA;
-  a batched CPU path would help there (this is why the vendored vLLM kernel
-  matters so much on CPU).
+  a batched CPU path would help there (this is why `cpu-attention` matters so
+  much on CPU).
 - **T5** (encoder-decoder like BART, so the paged cache + continuous batching
   carry over): `T5LayerNorm` is RMS-without-mean, T5 v1.1 has a gated FFN
   (`T5DenseGatedActDense`) and T5 uses a relative-position bias instead of
@@ -832,8 +874,8 @@ on this box with the same kind of workload.
 
 - Keep it small and readable; match the existing file structure and naming.
 - Minimal comments; docstrings brief and direct. No dead code.
-- Pure PyTorch plus the vendored vLLM CPU attention kernel in `csrc/` (approved;
-  Apache-2.0). No new third-party dependencies without discussion. (`Pillow` was
+- Pure PyTorch plus `cpu-attention` (CPU) and the `kernels-community/flash-attn2`
+  hub kernel (CUDA), both approved. No new third-party dependencies without discussion. (`Pillow` was
   approved for Florence-2 image processing; the DaViT vision tower and projector
   are vendored in `fastencdec/models/florence2.py`, an optimized copy of the
   `transformers` reference.)

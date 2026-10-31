@@ -1,14 +1,13 @@
-"""Kernel-vs-SDPA parity for the vendored vLLM CPU attention backend.
+"""Kernel-vs-SDPA parity for the cpu-attention CPU backend.
 
 Builds a tiny BART whose ``head_dim`` the kernel supports (32) and checks that
 greedy and beam decoding match the pure-PyTorch path token for token, for a
 batch of mixed encoder lengths, both dtypes (fp32 and bf16) and both CPU page
-sizes (16 = the 16-wide ``vec16`` kernel, 32 = the full-width ``vec`` one).
-With backend ``vllm`` every decode runs the frozen
+sizes (16 and 32).  With backend ``cpu`` every decode runs the frozen
 torch.compile path (the compiled runner is the CPU default), so this also
 checks that the compiled graph matches eager SDPA.  The random model emits the
 same token everywhere, so the second check is on the first-step logits.  Skips
-silently when the extension cannot build (no compiler / unsupported machine).
+when the ``cpu-attention`` package is not installed.
 
 Run with:  PYTHONPATH=. python tests/test_attn_backend.py
 """
@@ -133,7 +132,7 @@ def mixed_batch(model, requests, block_size, dtype):
         (torch.randint(3, VOCAB, (11,)).tolist(), [1], None),
     ]
     ref = mixed_batch_logits(model, "sdpa", extra, block_size, dtype)
-    got = mixed_batch_logits(model, "vllm", extra, block_size, dtype)
+    got = mixed_batch_logits(model, "cpu", extra, block_size, dtype)
     diff = max((a - b).abs().max().item() for a, b in zip(ref, got))
     ok = len(ref) == len(got) and diff <= 1e-3
     print(
@@ -150,7 +149,7 @@ def backend_switch(model, requests, block_size, dtype):
         block_size=block_size,
         max_num_seqs=8,
         dtype=dtype,
-        attn_backend="vllm",
+        attn_backend="cpu",
     )
     engine = LLMEngine(model, config, eos_token_id=EOS)
     if not engine.runner.compile_decoder:
@@ -184,13 +183,13 @@ def compile_off(model, requests, block_size, dtype):
         block_size=block_size,
         max_num_seqs=8,
         dtype=dtype,
-        attn_backend="vllm",
+        attn_backend="cpu",
         compile=False,
     )
     engine = LLMEngine(model, config, eos_token_id=EOS)
     params = SamplingParams(max_tokens=6, temperature=0.0)
     eager = [engine.results[i] for i in engine.generate(requests, params)]
-    compiled = decode(model, "vllm", requests, params, block_size, dtype)
+    compiled = decode(model, "cpu", requests, params, block_size, dtype)
     ok = (
         not engine.runner.compile_decoder
         and engine.runner.decode_step is None
@@ -207,7 +206,7 @@ def long_prompt_rejected(model, requests, block_size, dtype):
         block_size=block_size,
         max_num_seqs=8,
         dtype=dtype,
-        attn_backend="vllm",
+        attn_backend="cpu",
     )
     engine = LLMEngine(model, config, eos_token_id=EOS)
     params = SamplingParams(max_tokens=2, temperature=0.0)
@@ -224,8 +223,8 @@ def long_prompt_rejected(model, requests, block_size, dtype):
 
 
 def main():
-    if cpu_attn.select_isa(torch.float32, 32, 32) is None:
-        print("SKIP: no kernel for this machine")
+    if cpu_attn.module() is None:
+        print("SKIP: cpu-attention unavailable")
         return
     model = build_model()
     torch.manual_seed(1)
@@ -238,27 +237,26 @@ def main():
     for dtype in (torch.float32, torch.bfloat16):
         model_dt = build_model().to(dtype) if dtype != torch.float32 else model
         for block_size in (16, 32):
-            isa = cpu_attn.select_isa(dtype, block_size, 32)
             for beams in (1, 2):
                 params = SamplingParams(max_tokens=10, num_beams=beams, temperature=0.0)
                 ref = decode(model_dt, "sdpa", requests, params, block_size, dtype)
-                got = decode(model_dt, "vllm", requests, params, block_size, dtype)
+                got = decode(model_dt, "cpu", requests, params, block_size, dtype)
                 for i, (want, have) in enumerate(zip(ref, got)):
                     status = "OK" if want == have else "MISMATCH"
                     failures += status == "MISMATCH"
                     print(
-                        f"[{status}] dtype={dtype} isa={isa} block_size={block_size} "
+                        f"[{status}] dtype={dtype} block_size={block_size} "
                         f"beams={beams} seq={i}: {have}"
                     )
             # Tokens are degenerate on this random model; the logits are not.
             ref = first_step_logits(model_dt, "sdpa", requests, block_size, dtype)
-            got = first_step_logits(model_dt, "vllm", requests, block_size, dtype)
+            got = first_step_logits(model_dt, "cpu", requests, block_size, dtype)
             diff = (ref - got).abs().max().item()
             tol = 1e-3 if dtype == torch.float32 else 0.5
             status = "OK" if diff <= tol else "MISMATCH"
             failures += status == "MISMATCH"
             print(
-                f"[{status}] dtype={dtype} isa={isa} block_size={block_size} "
+                f"[{status}] dtype={dtype} block_size={block_size} "
                 f"logits max|diff|={diff:.2e} (tol {tol})"
             )
     failures += mixed_batch(model, requests, 32, torch.float32)

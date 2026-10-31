@@ -78,14 +78,11 @@ class BartEncoderSelfAttention(_BartAttentionBase):
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Project QKV, run dense encoder self-attention, and project output."""
         shape = (*hidden_states.shape[:-1], -1, self.head_dim)
-        # .contiguous() avoids the ~20x slower non-contiguous BF16 SDPA path on aarch64.
         q, k, v = (
-            t.reshape(shape).transpose(1, 2).contiguous()
-            for t in self.qkv_proj(hidden_states).chunk(3, dim=-1)
+            t.reshape(shape) for t in self.qkv_proj(hidden_states).chunk(3, dim=-1)
         )
-        out = encoder_self_attention(q, k, v)
-        out = out.transpose(1, 2).reshape(*hidden_states.shape[:-1], -1).contiguous()
-        return self.out_proj(out)
+        out = encoder_self_attention(q, k, v, self.scaling)
+        return self.out_proj(out.reshape(*hidden_states.shape[:-1], -1))
 
 
 class BartDecoderSelfAttention(_BartAttentionBase):

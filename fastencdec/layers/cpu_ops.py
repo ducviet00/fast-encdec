@@ -1,4 +1,4 @@
-"""Opaque torch.compile ops for the vendored vLLM CPU attention kernel.
+"""Opaque torch.compile ops for the ``cpu-attention`` kernels.
 
 The op bodies run at call time, not at trace time, so they can read the
 per-step Context and call the kernel while Dynamo sees a single op (see
@@ -12,7 +12,7 @@ from . import cpu_attn
 
 
 @torch.library.custom_op(
-    "fastencdec::cpu_vllm_self_attention", mutates_args={"k_cache", "v_cache"}
+    "fastencdec::cpu_self_attention", mutates_args={"k_cache", "v_cache"}
 )
 def self_attention(
     query: torch.Tensor,
@@ -22,7 +22,7 @@ def self_attention(
     v_cache: torch.Tensor,
     scale: float,
 ) -> torch.Tensor:
-    """Write K/V and run causal self-attention with the vLLM CPU kernel."""
+    """Write K/V and run causal self-attention with the CPU kernel."""
     ctx = get_context()
     return cpu_attn.self_attention(
         query,
@@ -30,7 +30,6 @@ def self_attention(
         value,
         k_cache,
         v_cache,
-        ctx.slot_mapping,
         ctx.block_tables,
         ctx.context_lens,
         scale,
@@ -49,7 +48,7 @@ def _self_attention_fake(
     return torch.empty_like(query)
 
 
-@torch.library.custom_op("fastencdec::cpu_vllm_cross_attention", mutates_args={})
+@torch.library.custom_op("fastencdec::cpu_cross_attention", mutates_args={})
 def cross_attention(
     query: torch.Tensor,
     layer_idx: int,
@@ -70,3 +69,18 @@ def _cross_attention_fake(
     query: torch.Tensor, layer_idx: int, scale: float
 ) -> torch.Tensor:
     return torch.empty_like(query)
+
+
+@torch.library.custom_op("fastencdec::cpu_dense_attention", mutates_args={})
+def dense_attention(
+    query: torch.Tensor, key: torch.Tensor, value: torch.Tensor, scale: float
+) -> torch.Tensor:
+    """Run dense non-causal attention over [B, S, H, D] with the CPU kernel."""
+    return cpu_attn.dense_attention(query, key, value, scale)
+
+
+@dense_attention.register_fake
+def _dense_attention_fake(
+    query: torch.Tensor, key: torch.Tensor, value: torch.Tensor, scale: float
+) -> torch.Tensor:
+    return query.new_empty(query.shape)

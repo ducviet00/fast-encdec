@@ -3,12 +3,12 @@ from dataclasses import dataclass
 
 import torch
 
-_BACKENDS = ("auto", "vllm", "flash", "sdpa")
+_BACKENDS = ("auto", "cpu", "flash", "sdpa")
 
 
 def default_block_size(device) -> int:
     """Return the optimal KV page size for the target device's attention kernel."""
-    # FlashAttention-2 needs >=256; CPU AVX-512 'vec' needs 32; ARM NEON needs 16.
+    # FlashAttention-2's paged kernel needs a multiple of 256; cpu-attention of 16.
     if str(device).startswith("cuda"):
         return 256
     return 16 if platform.machine().lower() in ("arm64", "aarch64") else 32

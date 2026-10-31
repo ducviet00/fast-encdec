@@ -13,13 +13,16 @@ dependencies = ["transformers", "Pillow"]
 cpu = [
   "torch>=2.11.0",
   "torchvision>=0.26.0",
-  # torch.utils.cpp_extension shells out to ninja to build csrc/ on first use;
-  # without it the engine silently falls back to the slow SDPA path.
-  "ninja>=1.11",
+  # The CPU attention kernels; without them the engine silently falls back to
+  # the slow SDPA path.
+  "cpu-attention",
 ]
 cu130 = [
   "torch>=2.11.0",
   "torchvision>=0.26.0",
+  # Fetches the prebuilt kernels-community/flash-attn2 kernel on first CUDA use;
+  # without it the engine silently falls back to the slow SDPA path.
+  "kernels",
 ]
 
 [tool.uv]
@@ -31,6 +34,7 @@ conflicts = [
 ]
 
 [tool.uv.sources]
+cpu-attention = { git = "https://github.com/ducviet00/cpu-attention.git" }
 torch = [
   { index = "pytorch-cpu", extra = "cpu" },
   { index = "pytorch-cu130", extra = "cu130" },
@@ -39,6 +43,10 @@ torchvision = [
   { index = "pytorch-cpu", extra = "cpu" },
   { index = "pytorch-cu130", extra = "cu130" },
 ]
+
+# cpu-attention builds against (and links) the torch the project runs with.
+[tool.uv.extra-build-dependencies]
+cpu-attention = [{ requirement = "torch", match-runtime = true }]
 
 [[tool.uv.index]]
 name = "pytorch-cpu"
